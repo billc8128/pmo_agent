@@ -276,59 +276,125 @@ func extractUserPrompt(raw json.RawMessage) (string, bool, error) {
 	return "", false, nil
 }
 
-// summarizeToolUse renders a tool_use block as a one-line summary,
-// matching the spec §4.4 examples:
+// summarizeToolUse renders a tool_use block as a structured one-line
+// hint that gives downstream summarizers (the LLM behind agent_summary)
+// enough information to describe what was actually done — not just the
+// tool name, but the action's target.
 //
-//	[Tool: bash] ls -la ~/Desktop
-//	[Tool: edit] foo.ts (lines 12-15)
+// Format (chosen so the LLM can parse it without help):
 //
-// We don't try hard to extract the most relevant input field per tool;
-// we render up to 2 short scalar inputs in declaration order. Tool
-// inputs that look like long text are truncated to 80 chars.
+//	[Bash] command=git commit -m "feat: ..." | description=commit milestone work
+//	[Edit] path=daemon/internal/watcher/watcher.go
+//	[Read] path=docs/specs/2026-04-29-mvp-design.md
+//	[Write] path=backend/supabase/migrations/0002_summarize_trigger.sql
+//	[Grep] pattern=fsnotify | path=internal/
+//	[WebFetch] url=https://example.com
+//	[Task] description=Refactor watcher to polling
+//	[TodoWrite] todos=(N items)
+//
+// Tool name is shown as-is (no "Tool:" prefix — saves tokens, looks
+// cleaner). Up to 3 useful input fields are surfaced in order of
+// "most likely to identify what happened". Long values are truncated
+// at 120 chars (we previously had 80 — too aggressive when commands
+// like `git commit -m "..."` carry the actual intent).
 func summarizeToolUse(b contentBlock) string {
 	var inputs map[string]any
 	if len(b.Input) > 0 {
 		_ = json.Unmarshal(b.Input, &inputs)
 	}
-	hint := briefInputHint(inputs)
-	if hint == "" {
-		return fmt.Sprintf("[Tool: %s]", b.Name)
+	hints := structuredHints(b.Name, inputs)
+	if len(hints) == 0 {
+		return fmt.Sprintf("[%s]", b.Name)
 	}
-	return fmt.Sprintf("[Tool: %s] %s", b.Name, hint)
+	return fmt.Sprintf("[%s] %s", b.Name, strings.Join(hints, " | "))
 }
 
-func briefInputHint(in map[string]any) string {
+// structuredHints picks up to 3 input fields likely to describe the
+// action. Per-tool overrides come first (so we know "Bash → command"
+// is more salient than "Bash → description"), then a generic fallback.
+func structuredHints(toolName string, in map[string]any) []string {
 	if len(in) == 0 {
-		return ""
+		return nil
 	}
-	// Prefer common, human-meaningful keys when present.
-	preferred := []string{"command", "file_path", "path", "pattern", "query", "url", "description"}
-	for _, k := range preferred {
-		if v, ok := in[k]; ok {
-			if s := scalarToString(v); s != "" {
-				return fmt.Sprintf("%s=%s", k, truncate(s, 80))
+
+	// Per-tool field priority. Each list is "most-salient first".
+	// Tools not listed here fall through to the generic preferred list.
+	perTool := map[string][]string{
+		"Bash":           {"command", "description"},
+		"Edit":           {"file_path", "old_string"},
+		"Write":          {"file_path"},
+		"Read":           {"file_path"},
+		"Grep":           {"pattern", "path", "glob"},
+		"Glob":           {"pattern"},
+		"WebFetch":       {"url", "prompt"},
+		"WebSearch":      {"query"},
+		"Task":           {"description", "subagent_type"},
+		"TodoWrite":      {"_todo_count"}, // synthetic, see below
+		"NotebookEdit":   {"notebook_path", "new_source"},
+		"BashOutput":     {"bash_id"},
+		"KillShell":      {"shell_id"},
+		"ExitPlanMode":   {"plan"},
+		"SlashCommand":   {"command"},
+		"AskUserQuestion": {"questions"},
+	}
+	priority, ok := perTool[toolName]
+	if !ok {
+		priority = []string{"command", "file_path", "path", "pattern", "query", "url", "description"}
+	}
+
+	out := make([]string, 0, 3)
+	used := make(map[string]bool)
+
+	// Synthetic field for TodoWrite: count of todos.
+	if toolName == "TodoWrite" {
+		if v, ok := in["todos"]; ok {
+			if arr, ok := v.([]any); ok {
+				return []string{fmt.Sprintf("todos=(%d items)", len(arr))}
 			}
 		}
 	}
-	// Otherwise: first scalar input, alphabetical for determinism.
-	keys := make([]string, 0, len(in))
-	for k := range in {
-		keys = append(keys, k)
+
+	// Walk priority order first.
+	for _, k := range priority {
+		if len(out) >= 3 {
+			break
+		}
+		v, ok := in[k]
+		if !ok {
+			continue
+		}
+		if s := scalarToString(v); s != "" {
+			out = append(out, fmt.Sprintf("%s=%s", k, truncate(s, 120)))
+			used[k] = true
+		}
 	}
-	// no sort import: simple selection sort for tiny n
-	for i := 0; i < len(keys); i++ {
-		for j := i + 1; j < len(keys); j++ {
-			if keys[j] < keys[i] {
-				keys[i], keys[j] = keys[j], keys[i]
+
+	// Fill remaining slots from any other scalar inputs, alphabetical.
+	if len(out) < 3 {
+		keys := make([]string, 0, len(in))
+		for k := range in {
+			if !used[k] {
+				keys = append(keys, k)
+			}
+		}
+		// tiny n; selection sort to avoid the sort import bloat
+		for i := 0; i < len(keys); i++ {
+			for j := i + 1; j < len(keys); j++ {
+				if keys[j] < keys[i] {
+					keys[i], keys[j] = keys[j], keys[i]
+				}
+			}
+		}
+		for _, k := range keys {
+			if len(out) >= 3 {
+				break
+			}
+			if s := scalarToString(in[k]); s != "" {
+				out = append(out, fmt.Sprintf("%s=%s", k, truncate(s, 120)))
 			}
 		}
 	}
-	for _, k := range keys {
-		if s := scalarToString(in[k]); s != "" {
-			return fmt.Sprintf("%s=%s", k, truncate(s, 80))
-		}
-	}
-	return ""
+	return out
 }
 
 func scalarToString(v any) string {

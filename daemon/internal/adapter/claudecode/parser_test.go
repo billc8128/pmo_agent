@@ -52,8 +52,8 @@ func TestParse_ToolUseAccumulatesBeforeFinal(t *testing.T) {
 		t.Fatalf("want 1 turn, got %d", len(turns))
 	}
 	resp := turns[0].AgentResponseFull
-	if !strings.Contains(resp, "[Tool: Bash]") {
-		t.Errorf("response should contain tool summary; got %q", resp)
+	if !strings.Contains(resp, "[Bash]") {
+		t.Errorf("response should contain tool tag; got %q", resp)
 	}
 	if !strings.Contains(resp, "command=ls -la") {
 		t.Errorf("response should render command input; got %q", resp)

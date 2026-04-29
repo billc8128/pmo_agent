@@ -109,19 +109,43 @@ async function summarizeViaOpenRouter(text: string): Promise<string> {
         {
           role: "system",
           content:
-            "You write headlines, not replies. The user will paste a transcript " +
-            "of an AI assistant's response between <response> tags. Your job: " +
-            "write ONE short sentence (under 20 words) describing what that " +
-            "assistant did or concluded. Never address the user. Never continue " +
-            "the conversation. Output ONLY the headline — no quotes, no preface, " +
-            "no markdown, no labels. Match the language of the response.",
+            // The summary is a public timeline entry — readers scan many
+            // of them in a row, so we want the dense, changelog-style.
+            "You write timeline entries summarizing what an AI coding " +
+            "assistant did in one turn. The input includes prose AND " +
+            "bracketed tool calls like [Bash], [Edit], [Read], [Write], " +
+            "[Grep], [Task]. Tool calls show what was actually executed " +
+            "(commands, file paths, search patterns) — treat them as " +
+            "first-class evidence of what was done, not noise.\n\n" +
+            "Write a dense, concrete summary (1–3 short clauses, ≤40 " +
+            "words total) that captures: (a) the substantive result or " +
+            "decision, and (b) at least one specific action taken — a " +
+            "command run, a file edited, a bug found, a decision made. " +
+            "Use semicolons or em-dashes to separate clauses. Mention " +
+            "specific file names, commands, or numbers when present. " +
+            "Avoid generic verbs like 'helped', 'discussed', 'addressed'.\n\n" +
+            "Hard rules:\n" +
+            "1. ALWAYS produce a summary, even if the response is " +
+            "short or has no tool calls. Brief responses get brief " +
+            "summaries (e.g. '确认进入下一步' or 'Acknowledged; " +
+            "starting next step'). NEVER refuse, NEVER ask for more " +
+            "context, NEVER reply 'I need more information' — just " +
+            "summarize whatever is there in one short clause.\n" +
+            "2. PARAPHRASE — do not copy or quote sentences from the " +
+            "input verbatim, even when the input is itself a list or " +
+            "bullet structure. Compress to your own words.\n" +
+            "3. Never address the user ('you', '你'). Never continue " +
+            "the conversation. Output ONLY the summary — no quotes, " +
+            "no preface, no markdown headers, no labels.\n" +
+            "4. Match the dominant language of the response (Chinese " +
+            "if mostly Chinese, English if mostly English).",
         },
         {
           role: "user",
           content: `<response>\n${trimmed}\n</response>`,
         },
       ],
-      max_tokens: 80,
+      max_tokens: 200,
       // Keep summaries deterministic-ish so re-runs don't drift.
       temperature: 0.2,
     }),
