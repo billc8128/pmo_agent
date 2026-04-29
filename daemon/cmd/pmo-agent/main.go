@@ -68,7 +68,3 @@ func exit(err error) {
 }
 
 // Subcommands are implemented in sibling files: login.go, start.go, status.go.
-// Each one lands as its Milestone 1.x ships.
-
-func runStart(args []string) error  { return fmt.Errorf("start: not implemented (milestone 1.5)") }
-func runStatus(args []string) error { return fmt.Errorf("status: not implemented (milestone 1.6)") }

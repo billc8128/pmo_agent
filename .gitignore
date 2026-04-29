@@ -29,3 +29,6 @@ web/.vercel/
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local state (per-machine)
+.claude/
