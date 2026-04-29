@@ -1,36 +1,58 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# pmo_agent — web
 
-## Getting Started
+The Next.js front-end for `pmo_agent`. Renders the public timeline at
+`/u/:handle`. See `../docs/specs/2026-04-29-mvp-design.md` §6 for the
+product spec.
 
-First, run the development server:
+## Local development
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install        # once
+npm run dev        # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+You need `web/.env.local` with:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```
+NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon-key>
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Both are also configured as Vercel env vars (`vercel env ls`).
 
-## Learn More
+## Deployment
 
-To learn more about Next.js, take a look at the following resources:
+The live site is `https://pmo-agent-sigma.vercel.app`, deployed to a
+Vercel project named `pmo-agent` under team `superlion8s-projects`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+To deploy from a fresh checkout:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+vercel link --project pmo-agent     # connects this dir to the project
+vercel deploy --prod                # builds and ships
+```
 
-## Deploy on Vercel
+The `.vercel/` directory created by `vercel link` is gitignored on
+purpose — every contributor links their own checkout.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Stack
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Next.js 16 (App Router, Turbopack default)
+- React 19.2 canary
+- Tailwind CSS v4 (no config; theme in `app/globals.css`)
+- `@supabase/supabase-js` for both server- and client-side data
+  fetching (anon key only; RLS enforces public-read / authenticated-write)
+- `react-markdown` + `remark-gfm` + `rehype-highlight` for rendering
+  `agent_response_full` safely (no raw HTML)
+
+## Architecture
+
+```
+/                      — landing page (static)
+/u/[handle]            — Server Component: SSR fetches profile + turns
+   ├ TurnCard          — Client Component: expand toggle
+   │   └ ResponseMarkdown — Client Component: react-markdown render
+   └ TimelineClient    — Client Component: 10s polling for new turns
+```
+
+Per spec §6.2: no realtime/websockets in MVP. Polling is intentional.
