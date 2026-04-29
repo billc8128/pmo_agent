@@ -1,0 +1,29 @@
+# env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Supabase
+backend/supabase/.branches/
+backend/supabase/.temp/
+backend/supabase/.env
+
+# Go (daemon)
+daemon/bin/
+daemon/dist/
+*.test
+*.out
+
+# Node / Next.js (web)
+node_modules/
+web/.next/
+web/out/
+web/.vercel/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
