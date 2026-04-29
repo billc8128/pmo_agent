@@ -13,6 +13,8 @@ backend/supabase/.env
 # Go (daemon)
 daemon/bin/
 daemon/dist/
+daemon/pmo-agent
+daemon/cc-dump
 *.test
 *.out
 
