@@ -14,7 +14,10 @@ import { PatManager } from './pat-manager';
 
 export const dynamic = 'force-dynamic';
 
-export default async function MePage() {
+export default async function MePage(props: PageProps<'/me'>) {
+  const sp = await props.searchParams;
+  const next = typeof sp.next === 'string' ? sp.next : '';
+
   const sb = await serverComponentClient();
 
   const {
@@ -22,7 +25,8 @@ export default async function MePage() {
   } = await sb.auth.getUser();
 
   if (!user) {
-    redirect('/login');
+    const loginNext = next ? `/me?next=${encodeURIComponent(next)}` : '/me';
+    redirect(`/login?next=${encodeURIComponent(loginNext)}`);
   }
 
   // Try to load the profile. RLS on profiles allows public select.
@@ -53,10 +57,18 @@ export default async function MePage() {
             userId={user.id}
             email={user.email ?? null}
             suggestedHandle={suggested}
+            next={next}
           />
         </div>
       </main>
     );
+  }
+
+  // If the caller asked us to send them onward (e.g. /cli-auth flow
+  // sent us here to finish onboarding), honor it now that we have a
+  // profile.
+  if (next && next.startsWith('/')) {
+    redirect(next);
   }
 
   // Load tokens, newest first.

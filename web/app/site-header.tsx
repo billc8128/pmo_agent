@@ -1,13 +1,33 @@
-// SiteHeader is the single nav bar that appears on every page. We
-// keep it as a Server Component so anonymous visitors get full SSR
-// without JS hydration overhead. It does NOT show a "you're logged
-// in" indicator — that would force every public page to depend on a
-// session lookup, which is the wrong tradeoff for a public-by-default
-// app. /me is the place where session state matters.
+// SiteHeader is the single nav bar that appears on every page.
+//
+// It is an async Server Component that consults the session cookie:
+//   - Anonymous: shows "Discover" + "Sign in".
+//   - Authenticated: shows "Discover" + the user's @handle (linking
+//     to /me) + a "Sign out" form.
+//
+// We tolerate the per-page session lookup because the header is the
+// only place the session-aware difference matters; the rest of the
+// pages remain RLS-driven.
 
 import Link from 'next/link';
+import { serverComponentClient } from '@/lib/supabase-server';
 
-export function SiteHeader() {
+export async function SiteHeader() {
+  const sb = await serverComponentClient();
+  const {
+    data: { user },
+  } = await sb.auth.getUser();
+
+  let handle: string | null = null;
+  if (user) {
+    const { data } = await sb
+      .from('profiles')
+      .select('handle')
+      .eq('id', user.id)
+      .maybeSingle();
+    handle = data?.handle ?? null;
+  }
+
   return (
     <header className="border-b border-zinc-200 bg-white/80 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/80">
       <div className="mx-auto flex max-w-3xl items-center justify-between px-4 py-3">
@@ -19,8 +39,23 @@ export function SiteHeader() {
         </Link>
         <nav className="flex items-center gap-1 text-xs">
           <NavLink href="/discover">Discover</NavLink>
-          <NavLink href="/login">Sign in</NavLink>
-          <NavLink href="/me">My account</NavLink>
+          {user ? (
+            <>
+              <NavLink href="/me">
+                {handle ? `@${handle}` : 'My account'}
+              </NavLink>
+              <form action="/auth/signout" method="post">
+                <button
+                  type="submit"
+                  className="rounded px-2 py-1 text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                >
+                  Sign out
+                </button>
+              </form>
+            </>
+          ) : (
+            <NavLink href="/login">Sign in</NavLink>
+          )}
         </nav>
       </div>
     </header>

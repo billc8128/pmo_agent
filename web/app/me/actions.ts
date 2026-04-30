@@ -2,18 +2,24 @@
 
 // Server actions for /me. All of these run with the user's session
 // (RLS enforces ownership).
+//
+// PAT minting lives in app/cli-auth/actions.ts because the only way
+// to create a token is via the daemon's pmo-agent login flow.
 
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
-import { createHash, randomBytes } from 'node:crypto';
 import { serverActionClient } from '@/lib/supabase-server';
 
 const HANDLE_RE = /^[a-z0-9_-]{2,32}$/;
 
 // createProfile: called from the onboarding form on first /me visit.
+// If the caller passed `next`, redirect there after success (used by
+// the /cli-auth flow when a fresh signup needs to finish onboarding
+// before binding a daemon).
 export async function createProfile(formData: FormData) {
   const handle = String(formData.get('handle') ?? '').trim().toLowerCase();
   const displayName = String(formData.get('display_name') ?? '').trim();
+  const next = String(formData.get('next') ?? '').trim();
 
   if (!HANDLE_RE.test(handle)) {
     throw new Error(
@@ -38,7 +44,7 @@ export async function createProfile(formData: FormData) {
     }
     throw new Error(`failed to create profile: ${error.message}`);
   }
-  redirect('/me');
+  redirect(next && next.startsWith('/') ? next : '/me');
 }
 
 // updateProfile: edit handle / display_name from the /me dashboard.
@@ -69,47 +75,6 @@ export async function updateProfile(formData: FormData) {
     throw new Error(`failed to update profile: ${error.message}`);
   }
   revalidatePath('/me');
-}
-
-// createToken: mints a fresh PAT and returns the plaintext ONCE.
-//
-// Returns { plaintext, label }. The caller is responsible for showing
-// the plaintext to the user and never persisting it. The DB only ever
-// sees the SHA-256 hash, mirroring the daemon's expectations.
-export async function createToken(label: string): Promise<{
-  plaintext: string;
-  label: string;
-}> {
-  const cleanLabel = label.trim().slice(0, 64) || 'daemon';
-
-  const sb = await serverActionClient();
-  const {
-    data: { user },
-  } = await sb.auth.getUser();
-  if (!user) throw new Error('not signed in');
-
-  // 24 random bytes → 32 base64url chars. Prefixed with "pmo_" for
-  // grep-ability and so secret scanners (GitHub, TruffleHog) can
-  // identify accidental leaks.
-  const rawBytes = randomBytes(24);
-  const tail = rawBytes
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  const plaintext = `pmo_${tail}`;
-  const tokenHash = createHash('sha256').update(plaintext).digest('hex');
-
-  const { error } = await sb.from('tokens').insert({
-    user_id: user.id,
-    token_hash: tokenHash,
-    label: cleanLabel,
-  });
-  if (error) {
-    throw new Error(`failed to mint token: ${error.message}`);
-  }
-  revalidatePath('/me');
-  return { plaintext, label: cleanLabel };
 }
 
 // revokeToken: soft-revoke by stamping revoked_at. Active daemon

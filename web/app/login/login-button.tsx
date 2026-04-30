@@ -2,19 +2,22 @@
 
 import { authedBrowserClient } from '@/lib/supabase-browser';
 
-export function LoginButton() {
+export function LoginButton({ next }: { next: string }) {
   async function signIn() {
     const sb = authedBrowserClient();
+    // Pass `next` through the OAuth round-trip via a query string on
+    // /auth/callback. The callback route then redirects there.
+    const callback = new URL('/auth/callback', window.location.origin);
+    callback.searchParams.set('next', next);
     const { error } = await sb.auth.signInWithOAuth({
       provider: 'google',
       options: {
-        redirectTo: `${window.location.origin}/auth/callback`,
+        redirectTo: callback.toString(),
       },
     });
     if (error) {
       alert(`Sign-in failed: ${error.message}`);
     }
-    // On success, Supabase has already redirected the browser.
   }
 
   return (

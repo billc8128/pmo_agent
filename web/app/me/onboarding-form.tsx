@@ -7,10 +7,12 @@ export function OnboardingForm({
   userId,
   email,
   suggestedHandle,
+  next,
 }: {
   userId: string;
   email: string | null;
   suggestedHandle: string;
+  next?: string;
 }) {
   const [handle, setHandle] = useState(suggestedHandle);
   const [displayName, setDisplayName] = useState('');
@@ -31,6 +33,7 @@ export function OnboardingForm({
   return (
     <form action={onSubmit} className="flex flex-col gap-4">
       <input type="hidden" name="user_id" value={userId} />
+      {next ? <input type="hidden" name="next" value={next} /> : null}
 
       <label className="flex flex-col gap-1">
         <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
