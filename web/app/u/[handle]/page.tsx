@@ -23,8 +23,7 @@ import { loadProjectSummaries } from '@/lib/project-summaries';
 import { DateRangeChips, ViewToggle } from '../../_components/view-tabs';
 import { DateGroupedTimeline } from '../../_components/date-grouped-timeline';
 import { DateNav, MobileDateScroll } from '../../_components/date-nav';
-import { ProjectGroupedTimeline } from '../../_components/project-grouped-timeline';
-import { ProjectNav, MobileProjectScroll } from '../../_components/project-nav';
+import { ProjectGrid } from '../../_components/project-grid';
 import { ProjectFilterBadge } from '../../_components/project-filter-badge';
 
 export const dynamic = 'force-dynamic';
@@ -71,6 +70,10 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
   const summaries = await loadProjectSummaries(turns);
   const basePath = `/u/${handle}`;
 
+  // Once a project filter is active, "By project" doesn't make sense —
+  // we're already scoped to one project. Force the view back to time.
+  const effectiveView = projectFilter ? 'time' : view;
+
   return (
     <main className="mx-auto max-w-6xl px-4 py-8 sm:py-12">
       <header className="mb-6">
@@ -83,7 +86,12 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
       </header>
 
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
-        <ViewToggle basePath={basePath} searchParams={sp} view={view} />
+        {projectFilter ? (
+          // Filtered to one project — view toggle has nothing to switch to.
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">Timeline</span>
+        ) : (
+          <ViewToggle basePath={basePath} searchParams={sp} view={effectiveView} />
+        )}
         <DateRangeChips basePath={basePath} searchParams={sp} range={range} />
       </div>
 
@@ -95,8 +103,8 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
         <p className="text-zinc-500 dark:text-zinc-400">
           No turns in this view.
         </p>
-      ) : view === 'project' ? (
-        <ProjectView turns={turns} summaries={summaries} />
+      ) : effectiveView === 'project' ? (
+        <ProjectView turns={turns} summaries={summaries} basePath={basePath} sp={sp} />
       ) : (
         <TimeView turns={turns} summaries={summaries} />
       )}
@@ -126,18 +134,35 @@ function TimeView({
 function ProjectView({
   turns,
   summaries,
+  basePath,
+  sp,
 }: {
   turns: Turn[];
   summaries: Map<string, string | null>;
+  basePath: string;
+  sp: Record<string, string | string[] | undefined>;
 }) {
   const projects = groupByProjectAndDay(turns);
+  // Drill into ?project=<root>: this filters to a single project,
+  // which auto-switches to time view (handled by effectiveView above).
+  // We strip view=project from the link so the URL is clean.
+  const buildDrillHref = (root: string) => {
+    const merged: Record<string, string> = {};
+    for (const [k, v] of Object.entries(sp)) {
+      if (typeof v === 'string') merged[k] = v;
+    }
+    delete merged.view; // back to default time view, scoped by project filter
+    merged.project = root;
+    if (merged.range === 'all') delete merged.range;
+    const qs = new URLSearchParams(merged).toString();
+    return qs ? `${basePath}?${qs}` : basePath;
+  };
   return (
-    <div className="grid grid-cols-1 gap-8 md:grid-cols-[12rem_minmax(0,1fr)]">
-      <ProjectNav projects={projects} />
-      <div>
-        <MobileProjectScroll projects={projects} />
-        <ProjectGroupedTimeline projects={projects} profileById={null} summaries={summaries} />
-      </div>
-    </div>
+    <ProjectGrid
+      projects={projects}
+      profileById={null}
+      summaries={summaries}
+      buildDrillHref={buildDrillHref}
+    />
   );
 }
