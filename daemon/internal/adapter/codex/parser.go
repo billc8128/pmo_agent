@@ -85,9 +85,13 @@ func ParseFile(path string) ([]adapter.Turn, error) {
 // fallbackSessionID is used if session_meta is missing.
 func Parse(r io.Reader, fallbackSessionID string) ([]adapter.Turn, error) {
 	sc := bufio.NewScanner(r)
-	// Codex outputs can be large (long tool args + agent text). 8 MiB
-	// per-line ceiling.
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	// Codex jsonl can have very large single lines: a single
+	// response_item with a big function_call_output (file dumps,
+	// long search results) or a reasoning block can exceed 8 MiB.
+	// 64 MiB is enough for everything we've seen in real transcripts;
+	// the buffer grows on demand so this is a ceiling, not a fixed
+	// allocation.
+	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 
 	sm := &stateMachine{fallbackSession: fallbackSessionID}
 	for sc.Scan() {

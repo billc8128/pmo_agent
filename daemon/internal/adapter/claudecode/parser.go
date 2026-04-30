@@ -89,9 +89,11 @@ func ParseFile(path string) ([]adapter.Turn, error) {
 // (unusual but defensive).
 func Parse(r io.Reader, fallbackSessionID string) ([]adapter.Turn, error) {
 	sc := bufio.NewScanner(r)
-	// CC entries can be large (assistant text + tool inputs); bump the
-	// per-line buffer ceiling to 4 MiB.
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	// CC entries can be large (assistant text + tool inputs).
+	// 64 MiB ceiling matches the codex parser; we hit pathological
+	// 4-MiB+ entries occasionally and the higher cap costs nothing
+	// (the buffer grows on demand).
+	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 
 	sm := &stateMachine{fallbackSession: fallbackSessionID}
 	for sc.Scan() {
