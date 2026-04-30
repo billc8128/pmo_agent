@@ -25,10 +25,11 @@ export function TurnCard({ turn }: { turn: Turn }) {
     day: 'numeric',
   });
 
-  const agentLabel = turn.agent === 'claude_code' ? 'CC' : turn.agent;
+  const agentLabel = turn.agent === 'claude_code' ? 'CC' : turn.agent === 'codex' ? 'CDX' : turn.agent;
   const projectName = turn.project_path
     ? turn.project_path.split('/').filter(Boolean).pop() ?? turn.project_path
     : null;
+  const deviceLabel = turn.device_label?.trim() || null;
 
   return (
     <article className="rounded-lg border border-zinc-200 bg-white px-5 py-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
@@ -45,6 +46,17 @@ export function TurnCard({ turn }: { turn: Turn }) {
           <>
             <span aria-hidden="true">·</span>
             <span className="font-mono text-[11px]">{projectName}</span>
+          </>
+        )}
+        {deviceLabel && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span
+              className="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+              title={`uploaded by ${deviceLabel}`}
+            >
+              {deviceLabel}
+            </span>
           </>
         )}
       </div>

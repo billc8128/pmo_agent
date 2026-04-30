@@ -69,10 +69,13 @@ Deno.serve(async (req) => {
   const tokenPlain = m[1];
 
   // 2. Hash and look up. RLS-enabled table, but service_role bypasses RLS.
+  //    We pull the token's `label` too so we can stamp the device on
+  //    each turn — visible on the public timeline so multi-machine
+  //    users can tell which laptop / desktop a turn came from.
   const tokenHash = await sha256Hex(tokenPlain);
   const { data: tokenRow, error: tokenErr } = await admin
     .from("tokens")
-    .select("id, user_id, revoked_at")
+    .select("id, user_id, label, revoked_at")
     .eq("token_hash", tokenHash)
     .maybeSingle();
 
@@ -118,6 +121,7 @@ Deno.serve(async (req) => {
         agent_response_full: p.agent_response_full,
         user_message_at: p.user_message_at,
         agent_response_at: p.agent_response_at,
+        device_label: tokenRow.label ?? null,
       },
       { onConflict: "user_id,agent,agent_session_id,turn_index", ignoreDuplicates: true },
     )

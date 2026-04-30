@@ -18,6 +18,7 @@ export type Turn = {
   user_message: string;
   agent_response_full: string | null;
   agent_summary: string | null;
+  device_label: string | null;
   user_message_at: string;
   agent_response_at: string | null;
   created_at: string;
