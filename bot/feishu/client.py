@@ -39,6 +39,66 @@ class FeishuClient:
             )
         return self._client
 
+    # ── identify ourselves ──────────────────────────────────────────────
+
+    async def fetch_self_info(self) -> Optional[dict]:
+        """Look up the bot's own identity via /open-apis/bot/v3/info.
+
+        Returns a dict like {"bot_name": "包工头", "open_id": "ou_..."}
+        or None on failure. Used at startup to populate the @-mention
+        check with the bot's actual open_id, regardless of what the
+        admin named the app.
+
+        We hit the HTTP endpoint directly via httpx because lark-oapi's
+        Python type stubs for bot.v3 are inconsistent across versions
+        (the GetBotInfoRequest module path moved). The token plumbing
+        is the only thing the SDK gives us; we reuse it via a tiny
+        dance.
+        """
+        import httpx
+        # Use the SDK's tenant_access_token issuer so we don't have to
+        # re-implement caching / refresh.
+        try:
+            token = self.client.config.app_settings.app_secret  # type: ignore[attr-defined]
+        except Exception:
+            token = None
+        # Simpler: hit auth API ourselves.
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as ac:
+                # 1. Get tenant_access_token
+                auth_resp = await ac.post(
+                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                    json={
+                        "app_id": settings.feishu_app_id,
+                        "app_secret": settings.feishu_app_secret,
+                    },
+                )
+                auth_resp.raise_for_status()
+                auth = auth_resp.json()
+                if auth.get("code") != 0:
+                    logger.warning("auth failed: %s", auth)
+                    return None
+                tat = auth["tenant_access_token"]
+                # 2. Look up our identity
+                info_resp = await ac.get(
+                    "https://open.feishu.cn/open-apis/bot/v3/info",
+                    headers={"Authorization": f"Bearer {tat}"},
+                )
+                info_resp.raise_for_status()
+                info = info_resp.json()
+                if info.get("code") != 0:
+                    logger.warning("bot info failed: %s", info)
+                    return None
+                bot = info.get("bot") or {}
+                return {
+                    "open_id": bot.get("open_id"),
+                    "app_name": bot.get("app_name"),
+                    "bot_name": bot.get("app_name"),
+                }
+        except Exception as e:
+            logger.warning("fetch_self_info crashed: %s", e)
+            return None
+
     # ── reactions: lightweight "I see you" acks ─────────────────────────
 
     async def add_reaction(self, message_id: str, emoji_type: str = "Get") -> bool:

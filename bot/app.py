@@ -41,6 +41,25 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("pmo-bot starting")
+
+    # Look up our own identity so the @-mention check in groups can
+    # match by open_id regardless of what the admin named the app.
+    info = await feishu_client.fetch_self_info()
+    if info:
+        feishu_events.set_self_identity(
+            open_id=info.get("open_id"),
+            name=info.get("bot_name") or info.get("app_name"),
+        )
+        logger.info(
+            "pmo-bot identity: name=%r open_id=%s…",
+            info.get("bot_name") or info.get("app_name"),
+            (info.get("open_id") or "")[:10],
+        )
+    else:
+        logger.warning(
+            "could not fetch bot self-info; @-mentions in groups may not work",
+        )
+
     gc_task = asyncio.create_task(_gc_loop())
     try:
         yield

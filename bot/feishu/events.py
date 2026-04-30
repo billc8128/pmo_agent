@@ -133,15 +133,30 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
         return None
 
     # Mentions: when the bot is @-mentioned in a group, the message
-    # contains a "mentions" field; the text has a token like
-    # @_user_1 / @_user_2 — these are mention placeholders. We strip
-    # them, then check if any of them resolved to our own bot.
+    # contains a "mentions" field; the text has tokens like
+    # @_user_1 / @_user_2 — placeholders for the mentioned users.
+    # We strip the placeholders for clean text, and check if any
+    # mention resolves to OUR bot.
+    #
+    # We compare against the cached self open_id (set at startup via
+    # set_self_identity). Falling back to a name match isn't reliable —
+    # admins can rename the app, and "name" in the mentions payload
+    # may also include @-mentions of human users with similar names.
     mentions = msg.get("mentions") or []
-    is_at_bot = any(
-        m.get("name") == "PMO bot"  # display name match — robust enough
-        or (m.get("id") or {}).get("open_id") == _self_open_id_cached()
-        for m in mentions
-    )
+    self_oid = _self_open_id_cached()
+    self_name = _self_name_cached()
+    is_at_bot = False
+    for m in mentions:
+        m_oid = (m.get("id") or {}).get("open_id")
+        m_name = m.get("name")
+        if self_oid and m_oid == self_oid:
+            is_at_bot = True
+            break
+        # Fallback: name match — used in groups where the open_id field
+        # might be missing or before set_self_identity has run.
+        if self_name and m_name == self_name:
+            is_at_bot = True
+            break
     # Strip mention placeholders from text
     text = re.sub(r"@_user_\d+", "", text).strip()
 
@@ -162,10 +177,24 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
     )
 
 
-# Cache the bot's own open_id once we discover it (it shows up as the
-# "id" of mentions referring to the bot itself in some payloads). We
-# don't strictly need this for MVP; the display-name match covers
-# common cases.
+# Cache the bot's own identity, populated at startup via the
+# /open-apis/bot/v3/info call (see app.py lifespan). Both fields
+# can be None if startup lookup failed; the @-mention check handles
+# that gracefully (it just won't match).
 _self_open_id: Optional[str] = None
+_self_name: Optional[str] = None
+
+
+def set_self_identity(*, open_id: Optional[str], name: Optional[str]) -> None:
+    """Called once at app startup with the bot's own info."""
+    global _self_open_id, _self_name
+    _self_open_id = open_id
+    _self_name = name
+
+
 def _self_open_id_cached() -> Optional[str]:
     return _self_open_id
+
+
+def _self_name_cached() -> Optional[str]:
+    return _self_name
