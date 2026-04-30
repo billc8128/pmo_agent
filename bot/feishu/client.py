@@ -143,6 +143,22 @@ class FeishuClient:
             return None
         return resp.data.message_id if resp.data else None
 
+    async def reply_image(self, parent_message_id: str, image_key: str) -> Optional[str]:
+        """Threaded reply with a single image (msg_type=image)."""
+        body = ReplyMessageRequestBody.builder() \
+            .msg_type("image") \
+            .content(json.dumps({"image_key": image_key}, ensure_ascii=False)) \
+            .build()
+        req = ReplyMessageRequest.builder() \
+            .message_id(parent_message_id) \
+            .request_body(body) \
+            .build()
+        resp = self.client.im.v1.message.reply(req)
+        if not resp.success():
+            logger.warning("feishu reply image failed: code=%s msg=%s", resp.code, resp.msg)
+            return None
+        return resp.data.message_id if resp.data else None
+
     async def reply_post(self, parent_message_id: str, post_content: dict) -> Optional[str]:
         """Threaded reply with a Feishu `post` rich-text message.
 

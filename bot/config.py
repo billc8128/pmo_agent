@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # ── Web base URL — used in answers to link out to /u/<handle> ──
     web_base_url: str = "https://pmo-agent-sigma.vercel.app"
 
+    # ── Image generation (Volcengine doubao-seedream-5.0-lite) ──
+    # We reuse the ARK API key (anthropic_auth_token) by default —
+    # it's the same Volcengine credential. Override only if you want
+    # to use a different model from the same account.
+    image_model: str = "doubao-seedream-5.0-lite"
+    image_api_url: str = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+    image_max_per_conversation_per_hour: int = 5
+
     # ── Misc ──
     log_level: str = "INFO"
     agent_max_duration_seconds: int = 120

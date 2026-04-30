@@ -17,7 +17,18 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from agent import imaging
 from db import queries
+
+
+# Set by app.py before each agent run so the image tool can rate-limit
+# per conversation and so the marker output references the right scope.
+_current_conversation_key_var: str = ""
+
+
+def set_current_conversation(conversation_key: str) -> None:
+    global _current_conversation_key_var
+    _current_conversation_key_var = conversation_key
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -146,6 +157,45 @@ async def get_activity_stats(args: dict) -> dict[str, Any]:
 
 
 @tool(
+    "generate_image",
+    "Generate an image with doubao-seedream and embed it into your reply. "
+    "Use when the user asks for a portrait, sketch, illustration, "
+    "or visualization based on someone's work — e.g. \"画一下 bcc 的样子\", "
+    "\"给团队画一张合影\", \"想象一下这个项目的视觉风格\". \n\n"
+    "PROMPT GUIDANCE: Be concrete. Anchor the image in specifics you "
+    "already discovered from the data — projects, tools, vibes — rather "
+    "than generic descriptions. Stylized illustration is preferred over "
+    "photorealistic to avoid pretending a real photo exists. Allowed "
+    "size values: '1024x1024' (square), '1024x1792' (portrait), "
+    "'1792x1024' (landscape), '16:9', '9:16', '1:1', '2K'. Default 1024x1024.\n\n"
+    "RETURN: A dict with image_key (Feishu's reference) and image_url. "
+    "To DISPLAY the image in your reply, include the literal token "
+    "[IMAGE:<image_key>] anywhere in your final answer text — the host "
+    "app will replace it with a separate image message in the chat. "
+    "Do NOT paste the image_url as a link; users see it as a real image "
+    "via the marker. \n\n"
+    "RATE LIMIT: 5 images per hour per conversation. If you hit the "
+    "limit, the tool returns {error: ...} — apologize and continue with "
+    "text only.",
+    {"prompt": str, "size": str},
+)
+async def generate_image(args: dict) -> dict[str, Any]:
+    try:
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return _err("prompt is required")
+        size = (args.get("size") or "1024x1024").strip()
+        result = await imaging.generate_and_upload(
+            conversation_key=_current_conversation_key_var or "anon",
+            prompt=prompt,
+            size=size,
+        )
+        return _ok(result)
+    except Exception as e:
+        return _err(f"{type(e).__name__}: {e}")
+
+
+@tool(
     "today_iso",
     "Return the current UTC date and a few useful time anchors (today's "
     "ISO, yesterday's start, 7d ago, 30d ago). Call this at the start "
@@ -182,6 +232,7 @@ def build_pmo_mcp():
             get_recent_turns,
             get_project_overview,
             get_activity_stats,
+            generate_image,
             today_iso,
         ],
     )

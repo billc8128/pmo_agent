@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -206,15 +207,46 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         cards.progress_card(question=ev.text, steps=list(steps), finished=True),
     )
 
-    # 5) send the answer as a SEPARATE message in `post` rich-text
-    #    format. We tried interactive cards for the answer too, but the
-    #    user wanted something that feels less like a "system widget"
-    #    and more like a chat reply. post is Feishu's native rich text;
-    #    bold + links survive, code/lists/code blocks degrade gracefully.
+    # 5) Send the answer. The agent may have embedded image markers
+    #    like [IMAGE:img_v2_xxx] — we split the text into segments and
+    #    send text + image messages in order so the chat reads
+    #    naturally.
     final_text = answer_text or "(空回答 — 试试换个问法?)"
-    post_content = post_format.markdown_to_post(final_text)
-    sent = await feishu_client.reply_post(ev.message_id, post_content)
-    if sent is None:
-        # Post path failed — fall back to a plain text reply so the
-        # user at least gets the answer.
-        await feishu_client.reply_text(ev.message_id, final_text)
+    await _send_answer_with_images(parent_message_id=ev.message_id, text=final_text)
+
+
+# Pattern: [IMAGE:img_v2_abc...] anywhere in the text. We're loose
+# about the key chars — Feishu image keys start with img_v2_ and can
+# contain various base64-ish characters.
+_IMAGE_MARKER_RE = re.compile(r"\[IMAGE:([A-Za-z0-9_\-]+)\]")
+
+
+async def _send_answer_with_images(*, parent_message_id: str, text: str) -> None:
+    """Split a final answer on [IMAGE:key] markers; send a text post +
+    image messages in order. If the parser finds no markers, send
+    exactly one post.
+    """
+    segments: list[tuple[str, str]] = []  # ("text"|"image", payload)
+    pos = 0
+    for m in _IMAGE_MARKER_RE.finditer(text):
+        if m.start() > pos:
+            segments.append(("text", text[pos:m.start()].strip()))
+        segments.append(("image", m.group(1)))
+        pos = m.end()
+    if pos < len(text):
+        segments.append(("text", text[pos:].strip()))
+
+    # Emit. Empty text segments are skipped — they happen when an
+    # image marker is the only content of a paragraph.
+    for kind, payload in segments:
+        if kind == "text":
+            if not payload:
+                continue
+            post_content = post_format.markdown_to_post(payload)
+            sent = await feishu_client.reply_post(parent_message_id, post_content)
+            if sent is None:
+                await feishu_client.reply_text(parent_message_id, payload)
+        elif kind == "image":
+            sent = await feishu_client.reply_image(parent_message_id, payload)
+            if sent is None:
+                logger.warning("could not send image_key=%s; skipping", payload)
