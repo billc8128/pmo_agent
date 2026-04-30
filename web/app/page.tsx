@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { serverClient } from '@/lib/supabase';
+import { CopyCommand } from './_components/copy-command';
 
 export const dynamic = 'force-dynamic';
 
@@ -54,42 +55,81 @@ export default async function Home() {
         >
           See what people are doing →
         </Link>
-        <Link
-          href="/login"
+        <a
+          href="#install"
           className="rounded-md border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-600 dark:hover:bg-zinc-900"
         >
-          Sign in to publish your own
-        </Link>
+          Get started →
+        </a>
       </div>
 
-      {/* How it works */}
-      <section className="mt-16 border-t border-zinc-200 pt-8 dark:border-zinc-800">
+      {/* Install — the most important section for new visitors */}
+      <section id="install" className="mt-16 scroll-mt-4 border-t border-zinc-200 pt-8 dark:border-zinc-800">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
-          How it works
+          Install (macOS / Linux)
         </h2>
-        <ol className="mt-4 space-y-4">
-          <Step n={1} title="Sign in with Google, pick a handle">
-            That gives you the URL{' '}
-            <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-xs dark:bg-zinc-800">
-              /u/&lt;handle&gt;
-            </code>
-            .
+        <p className="mt-3 text-sm leading-relaxed text-zinc-600 dark:text-zinc-300">
+          One command — auto-detects your platform and downloads the
+          binary from{' '}
+          <a
+            href="https://github.com/billc8128/pmo_agent/releases"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-indigo-600 underline decoration-dotted underline-offset-2 dark:text-indigo-400"
+          >
+            GitHub releases
+          </a>
+          .
+        </p>
+        <div className="mt-3">
+          <CopyCommand command="curl -fsSL https://pmo-agent-sigma.vercel.app/install.sh | bash" />
+        </div>
+      </section>
+
+      {/* Then run these */}
+      <section className="mt-10">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+          Then in your terminal
+        </h2>
+
+        <ol className="mt-4 space-y-5">
+          <Step
+            n={1}
+            title="Authorize this machine"
+            sub="Opens your browser. Sign in with Google, pick a handle, click Authorize."
+          >
+            <CopyCommand command="pmo-agent login" />
           </Step>
-          <Step n={2} title="Mint a daemon token on /me">
-            One token per machine. Plaintext is shown once, only its
-            hash is stored. Revoke from the same page.
+          <Step
+            n={2}
+            title="Install as a background service"
+            sub="Registers a macOS LaunchAgent so the daemon survives reboots and closed terminals."
+          >
+            <CopyCommand command="pmo-agent install" />
           </Step>
-          <Step n={3} title="Run pmo-agent on your machine">
-            <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-xs dark:bg-zinc-800">
-              pmo-agent login
-            </code>
-            , paste the token, then{' '}
-            <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-xs dark:bg-zinc-800">
-              pmo-agent start
-            </code>
-            . New turns appear on your profile within a few seconds.
+          <Step
+            n={3}
+            title="That's it"
+            sub="Open Claude Code or Codex. Each completed turn appears on your profile within seconds."
+          >
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              You&apos;ll get a macOS notification each time new turns
+              are uploaded (throttled to once every 5&nbsp;min).
+            </p>
           </Step>
         </ol>
+      </section>
+
+      {/* Quick reference */}
+      <section className="mt-12 rounded-lg border border-zinc-200 bg-zinc-50 p-5 dark:border-zinc-800 dark:bg-zinc-900">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+          Useful commands
+        </h2>
+        <dl className="mt-4 space-y-3 text-sm">
+          <CommandRef cmd="pmo-agent status" desc="Show service state, recent uploads, and discovered transcripts." />
+          <CommandRef cmd="pmo-agent uninstall" desc="Remove the LaunchAgent. Doesn't delete config or local state." />
+          <CommandRef cmd="tail -f ~/.pmo-agent/daemon.log" desc="Follow the live daemon log." />
+        </dl>
       </section>
 
       {/* What gets published */}
@@ -117,9 +157,19 @@ export default async function Home() {
         </ul>
       </section>
 
-      <footer className="mt-16 text-xs text-zinc-400 dark:text-zinc-500">
-        Public-by-default. No private mode in MVP. Don&apos;t paste
-        secrets into your AI agent.
+      <footer className="mt-16 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-400 dark:text-zinc-500">
+        <span>Public-by-default. No private mode in MVP.</span>
+        <span aria-hidden="true">·</span>
+        <a
+          href="https://github.com/billc8128/pmo_agent"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline decoration-dotted hover:text-zinc-600 dark:hover:text-zinc-300"
+        >
+          source on GitHub
+        </a>
+        <span aria-hidden="true">·</span>
+        <span>Don&apos;t paste secrets into your AI agent.</span>
       </footer>
     </main>
   );
@@ -128,10 +178,12 @@ export default async function Home() {
 function Step({
   n,
   title,
+  sub,
   children,
 }: {
   n: number;
   title: string;
+  sub?: string;
   children: React.ReactNode;
 }) {
   return (
@@ -139,15 +191,29 @@ function Step({
       <span className="flex h-7 w-7 flex-none items-center justify-center rounded-full bg-zinc-900 text-xs font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900">
         {n}
       </span>
-      <div className="pt-0.5">
+      <div className="min-w-0 flex-1 pt-0.5">
         <div className="font-medium text-zinc-900 dark:text-zinc-100">
           {title}
         </div>
-        <div className="mt-0.5 text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
-          {children}
-        </div>
+        {sub && (
+          <div className="mt-0.5 mb-2 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
+            {sub}
+          </div>
+        )}
+        {children}
       </div>
     </li>
+  );
+}
+
+function CommandRef({ cmd, desc }: { cmd: string; desc: string }) {
+  return (
+    <div className="flex flex-col gap-1 sm:flex-row sm:items-baseline sm:gap-3">
+      <code className="shrink-0 rounded bg-white px-2 py-0.5 font-mono text-xs text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+        {cmd}
+      </code>
+      <span className="text-xs text-zinc-500 dark:text-zinc-400">{desc}</span>
+    </div>
   );
 }
 
