@@ -16,6 +16,7 @@ import (
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter/claudecode"
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter/codex"
 	"github.com/superlion8/pmo_agent/daemon/internal/config"
+	"github.com/superlion8/pmo_agent/daemon/internal/notify"
 	"github.com/superlion8/pmo_agent/daemon/internal/store"
 	"github.com/superlion8/pmo_agent/daemon/internal/uploader"
 	"github.com/superlion8/pmo_agent/daemon/internal/watcher"
@@ -126,6 +127,7 @@ func runStart(args []string) error {
 				fmt.Printf("pmo-agent: + %s turn %d/%s (%d chars: %s…)\n",
 					t.Agent, t.TurnIndex, shortID(t.AgentSessionID), len(t.UserMessage),
 					oneLineStart(t.UserMessage, 50))
+				notify.UploadProgress(1)
 			case outcomeDeduped:
 				deduped.Add(1)
 			case outcomeAlreadyKnown:
@@ -140,6 +142,10 @@ func runStart(args []string) error {
 	fmt.Printf("pmo-agent:   claude_code root=%s\n", ccRoot)
 	fmt.Printf("pmo-agent:   codex       root=%s\n", cxRoot)
 	fmt.Println("pmo-agent: press Ctrl-C to stop")
+
+	// Visible "we're up" feedback. Especially valuable when the daemon
+	// runs under launchd (no terminal output is ever seen).
+	notify.StartedListening()
 
 	// Block until both watchers finish (which they will when ctx is canceled).
 	watcherWG.Wait()
