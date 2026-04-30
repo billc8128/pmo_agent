@@ -165,9 +165,10 @@ async def get_activity_stats(args: dict) -> dict[str, Any]:
     "PROMPT GUIDANCE: Be concrete. Anchor the image in specifics you "
     "already discovered from the data — projects, tools, vibes — rather "
     "than generic descriptions. Stylized illustration is preferred over "
-    "photorealistic to avoid pretending a real photo exists. Allowed "
-    "size values: '1024x1024' (square), '1024x1792' (portrait), "
-    "'1792x1024' (landscape), '16:9', '9:16', '1:1', '2K'. Default 1024x1024.\n\n"
+    "photorealistic to avoid pretending a real photo exists. Size "
+    "values: use '2K' (default, square), '4K', or aspect ratios like "
+    "'16:9' / '9:16' / '1:1'. doubao-seedream-5.0-lite requires at "
+    "least ~3.7M pixels — do not pass small sizes like '1024x1024'.\n\n"
     "RETURN: A dict with image_key (Feishu's reference) and image_url. "
     "To DISPLAY the image in your reply, include the literal token "
     "[IMAGE:<image_key>] anywhere in your final answer text — the host "
@@ -184,7 +185,7 @@ async def generate_image(args: dict) -> dict[str, Any]:
         prompt = (args.get("prompt") or "").strip()
         if not prompt:
             return _err("prompt is required")
-        size = (args.get("size") or "1024x1024").strip()
+        size = (args.get("size") or "2K").strip()
         result = await imaging.generate_and_upload(
             conversation_key=_current_conversation_key_var or "anon",
             prompt=prompt,

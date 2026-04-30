@@ -2,7 +2,7 @@
 
 The flow we expose to the agent:
 
-  prompt → doubao-seedream-5.0-lite → image url
+  prompt → doubao-seedream (model from settings.image_model) → image url
                                    → download bytes
                                    → upload to Feishu /im/v1/images
                                    → image_key
@@ -132,11 +132,15 @@ async def _feishu_tenant_token() -> str:
 async def _upload_to_feishu(image_bytes: bytes) -> str:
     """Upload to Feishu /im/v1/images, return image_key.
 
-    Feishu requires multipart with image_type="message".
+    Feishu requires multipart with image_type="message". The endpoint
+    sniffs content-type from the bytes, but we still pass a sensible
+    filename + mime so the multipart envelope is well-formed.
     """
     token = await _feishu_tenant_token()
+    # ARK returns JPEGs (extension .jpeg in the TOS URL). Match that
+    # so Feishu's content sniff agrees with the multipart hint.
     files = {
-        "image": ("generated.png", image_bytes, "image/png"),
+        "image": ("generated.jpg", image_bytes, "image/jpeg"),
     }
     data = {"image_type": "message"}
     async with httpx.AsyncClient(timeout=30.0) as ac:
@@ -146,10 +150,17 @@ async def _upload_to_feishu(image_bytes: bytes) -> str:
             data=data,
             files=files,
         )
-        r.raise_for_status()
+    # Always read the body before raising — Feishu returns code/msg
+    # JSON even on 400, and that's where the real reason lives.
+    try:
         d = r.json()
-    if d.get("code") != 0:
-        raise RuntimeError(f"feishu image upload failed: {d}")
+    except Exception:
+        d = {"raw": r.text[:500]}
+    if r.status_code >= 400 or d.get("code") not in (0, None):
+        raise RuntimeError(
+            f"feishu image upload failed (HTTP {r.status_code}, "
+            f"{len(image_bytes)} bytes): {d}"
+        )
     return d["data"]["image_key"]
 
 
@@ -160,7 +171,7 @@ async def generate_and_upload(
     *,
     conversation_key: str,
     prompt: str,
-    size: str = "1024x1024",
+    size: str = "2K",
 ) -> dict:
     """Generate an image via doubao and upload it to Feishu.
 
