@@ -24,10 +24,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter"
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter/claudecode"
+	"github.com/superlion8/pmo_agent/daemon/internal/adapter/codex"
 	"github.com/superlion8/pmo_agent/daemon/internal/config"
 	"github.com/superlion8/pmo_agent/daemon/internal/store"
 	"github.com/superlion8/pmo_agent/daemon/internal/uploader"
@@ -45,7 +47,8 @@ func main() {
 	}
 	path := flag.Arg(0)
 
-	turns, err := claudecode.ParseFile(path)
+	parser := pickParser(path)
+	turns, err := parser(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "parse:", err)
 		os.Exit(1)
@@ -154,4 +157,14 @@ func ptrIntStr(p *int64) string {
 		return "<dedup>"
 	}
 	return fmt.Sprintf("%d", *p)
+}
+
+// pickParser routes a path to the right adapter based on filename hint.
+// Codex jsonl filenames contain "rollout-" and live under .codex/sessions;
+// everything else defaults to claudecode.
+func pickParser(path string) func(string) ([]adapter.Turn, error) {
+	if strings.Contains(path, ".codex/sessions") || strings.Contains(path, "rollout-") {
+		return codex.ParseFile
+	}
+	return claudecode.ParseFile
 }

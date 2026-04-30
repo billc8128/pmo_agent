@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/superlion8/pmo_agent/daemon/internal/adapter/claudecode"
 )
 
 // TestWatcher_NoBackfillOfPreexistingFiles is the regression test for
@@ -31,7 +33,7 @@ func TestWatcher_NoBackfillOfPreexistingFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wt, err := NewWithInterval(root, 100*time.Millisecond)
+	wt, err := NewWithInterval("test", root, claudecode.ParseFile, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +96,7 @@ loop:
 //   4. expect exactly one Turn on Turns().
 func TestWatcher_NewSessionDirThenFile(t *testing.T) {
 	root := t.TempDir()
-	wt, err := NewWithInterval(root, 100*time.Millisecond)
+	wt, err := NewWithInterval("test", root, claudecode.ParseFile, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +161,7 @@ func TestWatcher_DebounceCoalescesWrites(t *testing.T) {
 	}
 	jsonl := filepath.Join(slugDir, "x.jsonl")
 
-	wt, err := NewWithInterval(root, 200*time.Millisecond)
+	wt, err := NewWithInterval("test", root, claudecode.ParseFile, 200*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
