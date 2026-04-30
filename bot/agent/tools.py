@@ -17,7 +17,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from supabase import queries
+from db import queries
 
 
 # ──────────────────────────────────────────────────────────────────────
