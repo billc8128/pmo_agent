@@ -24,6 +24,15 @@ func runStatus(args []string) error {
 		return err
 	}
 
+	// Section 0: service
+	fmt.Println("─── service ───")
+	if IsServiceLoaded() {
+		fmt.Println("  launchd:    loaded (running in background)")
+	} else {
+		fmt.Println("  launchd:    not loaded — run `pmo-agent install` to run as a background service")
+	}
+	fmt.Println()
+
 	// Section 1: config
 	fmt.Println("─── config ───")
 	cfg, err := config.Load()

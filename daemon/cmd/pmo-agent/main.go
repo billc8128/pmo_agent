@@ -22,10 +22,12 @@ Usage:
   pmo-agent <command> [flags]
 
 Commands:
-  login    Save a PAT and server URL to ~/.pmo-agent/config.toml
-  start    Watch transcripts and upload turns (foreground)
-  status   Show watched files and recent uploads
-  version  Print version info
+  login      Browser-based authorization; writes ~/.pmo-agent/config.toml
+  start      Watch transcripts and upload turns (foreground)
+  status     Show watched files, recent uploads, and service status
+  install    Install as a background service (macOS launchd)
+  uninstall  Remove the background service
+  version    Print version info
 
 Run "pmo-agent <command> -h" for command-specific flags.
 `
@@ -50,6 +52,10 @@ func main() {
 		exit(runStart(args))
 	case "status":
 		exit(runStatus(args))
+	case "install":
+		exit(runInstall(args))
+	case "uninstall":
+		exit(runUninstall(args))
 	case "version":
 		fmt.Println("pmo-agent", version)
 	case "help", "-h", "--help":
