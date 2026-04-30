@@ -25,6 +25,7 @@ import { DateGroupedTimeline } from '../../_components/date-grouped-timeline';
 import { DateNav, MobileDateScroll } from '../../_components/date-nav';
 import { ProjectGrid } from '../../_components/project-grid';
 import { ProjectFilterBadge } from '../../_components/project-filter-badge';
+import { ProjectChips } from '../../_components/project-chips';
 
 export const dynamic = 'force-dynamic';
 
@@ -59,8 +60,14 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
 
   const { data: turnsData, error: turnsErr } = await query;
   if (turnsErr) throw new Error(`Failed to load turns: ${turnsErr.message}`);
-  let turns: Turn[] = turnsData ?? [];
+  const allTurns: Turn[] = turnsData ?? [];
 
+  // Compute the chip universe BEFORE applying the project filter, so a
+  // user already drilled into one project still sees the others as
+  // chips and can switch directly.
+  const allRoots = collectRoots(allTurns);
+
+  let turns = allTurns;
   if (projectFilter) {
     turns = turns.filter(
       (t) => projectRootFromPath(t.project_path) === projectFilter,
@@ -95,6 +102,18 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
         <DateRangeChips basePath={basePath} searchParams={sp} range={range} />
       </div>
 
+      {/* Project chips appear in time view (where they let the user
+          filter) but not project view (the cards already serve that
+          role). */}
+      {effectiveView === 'time' && (
+        <ProjectChips
+          basePath={basePath}
+          searchParams={sp}
+          roots={allRoots}
+          active={projectFilter}
+        />
+      )}
+
       {projectFilter && (
         <ProjectFilterBadge basePath={basePath} searchParams={sp} project={projectFilter} />
       )}
@@ -110,6 +129,12 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
       )}
     </main>
   );
+}
+
+function collectRoots(turns: Turn[]): string[] {
+  const set = new Set<string>();
+  for (const t of turns) set.add(projectRootFromPath(t.project_path));
+  return [...set].sort();
 }
 
 function TimeView({

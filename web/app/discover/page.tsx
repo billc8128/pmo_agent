@@ -23,6 +23,7 @@ import { DateGroupedTimeline } from '../_components/date-grouped-timeline';
 import { DateNav, MobileDateScroll } from '../_components/date-nav';
 import { ProjectGrid } from '../_components/project-grid';
 import { ProjectFilterBadge } from '../_components/project-filter-badge';
+import { ProjectChips } from '../_components/project-chips';
 
 export const dynamic = 'force-dynamic';
 
@@ -61,8 +62,13 @@ export default async function DiscoverPage(props: PageProps<'/discover'>) {
   }
 
   const { data: turnsData } = await query;
-  let turns: Turn[] = turnsData ?? [];
+  const allTurns: Turn[] = turnsData ?? [];
 
+  // Compute chip universe BEFORE the project filter (so user can
+  // switch projects without first clearing the active filter).
+  const allRoots = collectRoots(allTurns);
+
+  let turns = allTurns;
   if (projectFilter) {
     turns = turns.filter(
       (t) => projectRootFromPath(t.project_path) === projectFilter,
@@ -107,6 +113,15 @@ export default async function DiscoverPage(props: PageProps<'/discover'>) {
         <DateRangeChips basePath="/discover" searchParams={sp} range={range} />
       </div>
 
+      {effectiveView === 'time' && (
+        <ProjectChips
+          basePath="/discover"
+          searchParams={sp}
+          roots={allRoots}
+          active={projectFilter}
+        />
+      )}
+
       {projectFilter && (
         <ProjectFilterBadge basePath="/discover" searchParams={sp} project={projectFilter} />
       )}
@@ -120,6 +135,12 @@ export default async function DiscoverPage(props: PageProps<'/discover'>) {
       )}
     </main>
   );
+}
+
+function collectRoots(turns: Turn[]): string[] {
+  const set = new Set<string>();
+  for (const t of turns) set.add(projectRootFromPath(t.project_path));
+  return [...set].sort();
 }
 
 function TimeView({
