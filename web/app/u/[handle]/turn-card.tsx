@@ -5,10 +5,14 @@
 // USER block: full prompt as plain pre-wrapped text. Already redacted
 // upstream (in the daemon, before upload).
 //
-// AGENT block: shows agent_summary by default. Click "expand" to
-// render agent_response_full as Markdown. The full text is bracketed
-// tool calls + prose, so it renders cleanly with GFM features
-// (fenced code, tables, links).
+// AGENT block has three states (handled inline below):
+//   1. agent_response_full empty → "(no agent response — interrupted)".
+//      Real situation: the user sent a prompt but the assistant never
+//      finished replying (next prompt came first, network dropped, etc).
+//   2. summary populated → show it by default, expand for full markdown.
+//   3. response present but summary null → "Summary updating…" — the
+//      summarize trigger hasn't completed yet (or failed). A page reload
+//      usually pulls in the fresh summary.
 
 import { useState } from 'react';
 import type { Turn } from '@/lib/types';
@@ -25,11 +29,18 @@ export function TurnCard({ turn }: { turn: Turn }) {
     day: 'numeric',
   });
 
-  const agentLabel = turn.agent === 'claude_code' ? 'CC' : turn.agent === 'codex' ? 'CDX' : turn.agent;
+  const agentLabel =
+    turn.agent === 'claude_code'
+      ? 'CC'
+      : turn.agent === 'codex'
+        ? 'CDX'
+        : turn.agent;
   const projectName = turn.project_path
     ? turn.project_path.split('/').filter(Boolean).pop() ?? turn.project_path
     : null;
   const deviceLabel = turn.device_label?.trim() || null;
+  const responseEmpty =
+    !turn.agent_response_full || turn.agent_response_full.trim() === '';
 
   return (
     <article className="rounded-lg border border-zinc-200 bg-white px-5 py-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
@@ -77,7 +88,7 @@ export function TurnCard({ turn }: { turn: Turn }) {
           <span className="text-[11px] font-semibold uppercase tracking-wider text-indigo-600 dark:text-indigo-400">
             Agent
           </span>
-          {turn.agent_summary && turn.agent_response_full && (
+          {turn.agent_summary && !responseEmpty && (
             <button
               type="button"
               onClick={() => setExpanded((v) => !v)}
@@ -89,20 +100,20 @@ export function TurnCard({ turn }: { turn: Turn }) {
           )}
         </div>
 
-        {turn.agent_summary === null ? (
+        {responseEmpty ? (
           <p className="text-sm italic text-zinc-500 dark:text-zinc-400">
-            Summary unavailable.
+            (no agent response — interrupted before the assistant could reply)
+          </p>
+        ) : turn.agent_summary === null ? (
+          <p className="text-sm italic text-zinc-500 dark:text-zinc-400">
+            Summary updating…
           </p>
         ) : !expanded ? (
           <p className="text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
             {turn.agent_summary}
           </p>
-        ) : turn.agent_response_full ? (
-          <ResponseMarkdown source={turn.agent_response_full} />
         ) : (
-          <p className="text-sm italic text-zinc-500 dark:text-zinc-400">
-            (full response missing)
-          </p>
+          <ResponseMarkdown source={turn.agent_response_full ?? ''} />
         )}
       </div>
     </article>
