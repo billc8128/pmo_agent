@@ -16,11 +16,20 @@ from __future__ import annotations
 from typing import Any
 
 
-def progress_card(*, question: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+def progress_card(
+    *,
+    question: str,
+    steps: list[dict[str, Any]],
+    finished: bool = False,
+) -> dict[str, Any]:
     """A card showing the user's question + a checklist of tool calls.
 
     steps is a list of {"tool": str, "args_hint": str, "done": bool}.
     Pending steps render with 🔧 (wrench), done with ✓.
+
+    When `finished=True`, the header changes to a "done" state and all
+    remaining steps are forced to done. The card is then no longer
+    patched — the agent's answer is sent as a separate `post` message.
     """
     elements: list[dict[str, Any]] = []
 
@@ -35,7 +44,8 @@ def progress_card(*, question: str, steps: list[dict[str, Any]]) -> dict[str, An
         elements.append({"tag": "hr"})
         lines = []
         for s in steps:
-            mark = "✓" if s.get("done") else "🔧"
+            done = s.get("done") or finished
+            mark = "✓" if done else "🔧"
             tool = s.get("tool", "?")
             hint = s.get("args_hint") or ""
             line = f"{mark} `{tool}`"
@@ -47,11 +57,14 @@ def progress_card(*, question: str, steps: list[dict[str, Any]]) -> dict[str, An
             "content": "\n".join(lines),
         })
 
+    title = "查询完成" if finished else "正在查询…"
+    template = "grey" if finished else "blue"
+
     return {
         "schema": "2.0",
         "header": {
-            "title": {"tag": "plain_text", "content": "正在查询…"},
-            "template": "blue",
+            "title": {"tag": "plain_text", "content": title},
+            "template": template,
         },
         "body": {"elements": elements},
     }

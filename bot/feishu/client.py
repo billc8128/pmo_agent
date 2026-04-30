@@ -83,6 +83,25 @@ class FeishuClient:
             return None
         return resp.data.message_id if resp.data else None
 
+    async def reply_post(self, parent_message_id: str, post_content: dict) -> Optional[str]:
+        """Threaded reply with a Feishu `post` rich-text message.
+
+        post_content is the dict returned by post_format.markdown_to_post.
+        """
+        body = ReplyMessageRequestBody.builder() \
+            .msg_type("post") \
+            .content(json.dumps(post_content, ensure_ascii=False)) \
+            .build()
+        req = ReplyMessageRequest.builder() \
+            .message_id(parent_message_id) \
+            .request_body(body) \
+            .build()
+        resp = self.client.im.v1.message.reply(req)
+        if not resp.success():
+            logger.warning("feishu reply post failed: code=%s msg=%s", resp.code, resp.msg)
+            return None
+        return resp.data.message_id if resp.data else None
+
     async def reply_card(self, parent_message_id: str, card: dict) -> Optional[str]:
         """Threaded card reply. card is the full card schema dict.
 

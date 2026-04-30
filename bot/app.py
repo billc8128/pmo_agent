@@ -28,6 +28,7 @@ from agent import runner as agent_runner
 from config import settings
 from feishu import cards
 from feishu import events as feishu_events
+from feishu import post_format
 from feishu.client import feishu_client
 
 logging.basicConfig(
@@ -179,12 +180,22 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         )
         return
 
-    # 4) final patch — render answer markdown + tool-count footer.
+    # 4) freeze the progress card — it stays as a record of what the
+    #    agent did, header switches to "done" / grey.
     await feishu_client.patch_card(
         card_message_id,
-        cards.final_card(
-            question=ev.text,
-            answer_markdown=answer_text or "(空回答 — 试试换个问法?)",
-            tool_count=len(steps),
-        ),
+        cards.progress_card(question=ev.text, steps=list(steps), finished=True),
     )
+
+    # 5) send the answer as a SEPARATE message in `post` rich-text
+    #    format. We tried interactive cards for the answer too, but the
+    #    user wanted something that feels less like a "system widget"
+    #    and more like a chat reply. post is Feishu's native rich text;
+    #    bold + links survive, code/lists/code blocks degrade gracefully.
+    final_text = answer_text or "(空回答 — 试试换个问法?)"
+    post_content = post_format.markdown_to_post(final_text)
+    sent = await feishu_client.reply_post(ev.message_id, post_content)
+    if sent is None:
+        # Post path failed — fall back to a plain text reply so the
+        # user at least gets the answer.
+        await feishu_client.reply_text(ev.message_id, final_text)
