@@ -86,7 +86,7 @@ def decrypt_if_needed(body: dict) -> dict:
     # full webhook handler.
     import lark_oapi as lark
     cipher = lark.AESCipher(settings.feishu_encrypt_key)
-    plaintext = cipher.decrypt_string(body["encrypt"])
+    plaintext = cipher.decrypt_str(body["encrypt"])
     return json.loads(plaintext)
 
 
