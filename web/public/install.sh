@@ -93,7 +93,7 @@ download_url="https://github.com/$REPO/releases/download/$version/$asset"
 tmp=$(mktemp -t pmo-agent.XXXXXX)
 trap 'rm -f "$tmp"' EXIT
 
-say "  Downloading $asset…"
+say "  Downloading ${asset}…"
 if ! curl -fsSL -o "$tmp" "$download_url"; then
   err "download failed: $download_url"
   exit 1
