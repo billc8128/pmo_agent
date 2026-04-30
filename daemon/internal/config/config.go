@@ -20,9 +20,18 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 )
 
-// DefaultServerURL is the production Supabase project. Override with
+// DefaultServerURL is the production Supabase project — used by the
+// daemon's upload path (POST /functions/v1/ingest). Override with
 // PMO_AGENT_SERVER_URL or by editing config.toml.
 const DefaultServerURL = "https://xecnsibhijdlwqulkxor.supabase.co"
+
+// DefaultWebURL is the Vercel-hosted web app — used for the
+// browser-based CLI auth flow (pmo-agent login → /cli-auth). This is
+// distinct from DefaultServerURL: Supabase hosts our API + auth
+// callbacks, but the user-facing site (login, /me, /u/:handle, and
+// the /cli-auth bridge that mints tokens) lives on Vercel. Override
+// with PMO_AGENT_WEB_URL.
+const DefaultWebURL = "https://pmo-agent-sigma.vercel.app"
 
 // Config is the on-disk shape of ~/.pmo-agent/config.toml.
 type Config struct {

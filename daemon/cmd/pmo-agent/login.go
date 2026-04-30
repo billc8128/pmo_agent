@@ -48,6 +48,7 @@ func runLogin(args []string) error {
 	}
 
 	server := resolveServer(*serverFlag)
+	web := resolveWeb()
 
 	// Token sources, in order of priority.
 	if *tokenFlag != "" {
@@ -73,8 +74,10 @@ func runLogin(args []string) error {
 		return saveAndReport(server, string(b))
 	}
 
-	// Default: browser flow.
-	tok, err := browserLogin(server, *labelFlag)
+	// Default: browser flow. Note we pass the WEB url here, not the
+	// server (Supabase API) url — the cli-auth page is hosted by the
+	// Next.js app on Vercel, not by Supabase.
+	tok, err := browserLogin(web, *labelFlag)
 	if err != nil {
 		return err
 	}
@@ -101,8 +104,9 @@ func saveAndReport(server, rawToken string) error {
 }
 
 // browserLogin runs the full CLI auth dance and returns the plaintext
-// token on success.
-func browserLogin(serverURL, labelOverride string) (string, error) {
+// token on success. webURL is the Next.js app's base URL (Vercel),
+// NOT the Supabase API URL — the /cli-auth page lives on the web app.
+func browserLogin(webURL, labelOverride string) (string, error) {
 	nonce, err := generateNonce()
 	if err != nil {
 		return "", fmt.Errorf("generate nonce: %w", err)
@@ -124,7 +128,7 @@ func browserLogin(serverURL, labelOverride string) (string, error) {
 	// Build the auth URL.
 	authURL := fmt.Sprintf(
 		"%s/cli-auth?session=%s&redirect=%s&label=%s",
-		strings.TrimRight(serverURL, "/"),
+		strings.TrimRight(webURL, "/"),
 		url.QueryEscape(nonce),
 		url.QueryEscape(redirectURL),
 		url.QueryEscape(label),
@@ -241,6 +245,17 @@ func resolveServer(flagVal string) string {
 		return existing.ServerURL
 	}
 	return config.DefaultServerURL
+}
+
+// resolveWeb returns the Next.js app's base URL — used only by the
+// browser CLI auth flow. It's intentionally NOT in config.toml: the
+// daemon doesn't need to know the website exists, except for this
+// one moment. Override with PMO_AGENT_WEB_URL for local development.
+func resolveWeb() string {
+	if v := os.Getenv("PMO_AGENT_WEB_URL"); v != "" {
+		return v
+	}
+	return config.DefaultWebURL
 }
 
 func isTerminal(fd uintptr) bool { return term.IsTerminal(int(fd)) }
