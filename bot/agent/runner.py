@@ -145,11 +145,28 @@ async def _get_client(conversation_key: str) -> _PooledClient:
 
 
 async def answer(conversation_key: str, question: str) -> str:
-    """Run the agent on a single user message and return the final text.
+    """Run the agent and return only the final answer text.
 
-    conversation_key uniquely identifies one ongoing conversation thread —
-    typically (chat_id, sender_open_id). Multiple calls with the same key
-    share short-term memory.
+    Kept for callers that don't care about progress; new code should use
+    `answer_streaming` to get tool-call events as they happen.
+    """
+    answer_text = ""
+    tool_count = 0
+    async for ev in answer_streaming(conversation_key, question):
+        if ev["kind"] == "tool":
+            tool_count += 1
+        elif ev["kind"] == "final":
+            answer_text = ev["text"]
+    return answer_text or "(空回答 — 试试换个问法?)"
+
+
+async def answer_streaming(conversation_key: str, question: str):
+    """Run the agent and yield progress events as they happen.
+
+    Yields dicts of one of these shapes:
+      {"kind": "tool",  "name": str, "args_hint": str}   — about to call a tool
+      {"kind": "final", "text": str}                      — final answer text
+      {"kind": "error", "message": str}                   — exception
     """
     slot = await _get_client(conversation_key)
 
@@ -157,7 +174,8 @@ async def answer(conversation_key: str, question: str) -> str:
     # conversation thread. Otherwise the SDK gets confused and the user
     # would step on themselves.
     if slot.busy:
-        return "(还在处理上一个问题，稍等几秒再发吧)"
+        yield {"kind": "final", "text": "(还在处理上一个问题，稍等几秒再发吧)"}
+        return
     slot.busy = True
     try:
         await slot.client.query(question)
@@ -168,17 +186,62 @@ async def answer(conversation_key: str, question: str) -> str:
                     if isinstance(block, TextBlock):
                         final_text_chunks.append(block.text)
                     elif isinstance(block, ToolUseBlock):
+                        name = block.name
+                        # Strip the "mcp__pmo__" prefix the SDK adds.
+                        if name.startswith("mcp__pmo__"):
+                            display = name[len("mcp__pmo__"):]
+                        else:
+                            display = name
+                        args_hint = _format_args_hint(block.input or {})
                         logger.info(
                             "agent: tool=%s input_keys=%s",
-                            block.name,
+                            name,
                             list((block.input or {}).keys()),
                         )
+                        yield {
+                            "kind": "tool",
+                            "name": display,
+                            "args_hint": args_hint,
+                        }
             elif isinstance(msg, ResultMessage):
                 # The SDK's terminating message; stop reading.
                 break
-        return "\n".join(final_text_chunks).strip() or "(空回答 — 试试换个问法?)"
+        final_text = "\n".join(final_text_chunks).strip()
+        yield {"kind": "final", "text": final_text}
+    except Exception as e:
+        logger.exception("agent failed: %s", conversation_key)
+        yield {"kind": "error", "message": f"{type(e).__name__}: {e}"}
     finally:
         slot.busy = False
+
+
+def _format_args_hint(args: dict) -> str:
+    """One-line summary of a tool call's interesting args.
+
+    Skips long fields (anything >40 chars), prefers human-meaningful
+    keys when present (handle / user_id / since / until / project_root),
+    truncates the rest.
+    """
+    if not args:
+        return ""
+    preferred = ("handle", "user_id", "days", "limit", "since", "until", "project_root")
+    parts: list[str] = []
+    for k in preferred:
+        if k in args and args[k] is not None and args[k] != "":
+            v = args[k]
+            sv = str(v)
+            # ISO timestamps are ugly — show just the date for readability.
+            if k in ("since", "until") and "T" in sv:
+                sv = sv[:10]
+            # user_id is a UUID — too noisy.
+            if k == "user_id":
+                sv = sv[:8] + "…"
+            if len(sv) > 40:
+                sv = sv[:37] + "…"
+            parts.append(f"{k}={sv}")
+            if len(parts) >= 3:
+                break
+    return " · ".join(parts)
 
 
 async def shutdown_all() -> None:
