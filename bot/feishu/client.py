@@ -41,12 +41,13 @@ class FeishuClient:
 
     # ── reactions: lightweight "I see you" acks ─────────────────────────
 
-    async def add_reaction(self, message_id: str, emoji_type: str = "GET") -> bool:
+    async def add_reaction(self, message_id: str, emoji_type: str = "Get") -> bool:
         """Add an emoji reaction to a user's message.
 
-        Default GET (那个有"GET"字样的黄色表情) reads as "received" /
-        "got it" — perfect ack for "I'm working on this" without
-        eating a message slot.
+        Default "Get" — the yellow emoji with "GET" written on it —
+        reads as "received" / "got it". Note the emoji_type is
+        case-sensitive: Feishu wants "Get", not "GET" (which returns
+        code 231001 'reaction type is invalid').
         """
         body = CreateMessageReactionRequestBody.builder() \
             .reaction_type(Emoji.builder().emoji_type(emoji_type).build()) \

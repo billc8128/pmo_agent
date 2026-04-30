@@ -110,7 +110,7 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
     )
 
     # 1) ack with reaction (don't await — non-blocking, best-effort).
-    asyncio.create_task(feishu_client.add_reaction(ev.message_id, "GET"))
+    asyncio.create_task(feishu_client.add_reaction(ev.message_id, "Get"))
 
     # 2) send the initial empty progress card.
     initial_card = cards.progress_card(question=ev.text, steps=[])
