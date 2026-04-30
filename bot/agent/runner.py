@@ -120,6 +120,9 @@ class _PooledClient:
     client: ClaudeSDKClient
     last_used: float = field(default_factory=time.monotonic)
     busy: bool = False
+    # Per-conversation FIFO so concurrent messages from the same
+    # (chat_id, sender_id) get processed in order rather than rejected.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 _pool: dict[str, _PooledClient] = {}
@@ -184,52 +187,56 @@ async def answer_streaming(conversation_key: str, question: str):
       {"kind": "tool",  "name": str, "args_hint": str}   — about to call a tool
       {"kind": "final", "text": str}                      — final answer text
       {"kind": "error", "message": str}                   — exception
+
+    Multiple concurrent calls with the same conversation_key are
+    SERIALIZED via the slot's lock — the second caller waits for the
+    first to finish, then runs. We deliberately don't reject; the
+    caller (a webhook handler) has already sent an ack reaction +
+    progress card, and silently dropping the message would feel like
+    the bot ignored the user.
     """
     slot = await _get_client(conversation_key)
 
-    # Concurrency guard: refuse a second concurrent question on the same
-    # conversation thread. Otherwise the SDK gets confused and the user
-    # would step on themselves.
-    if slot.busy:
-        yield {"kind": "final", "text": "(还在处理上一个问题，稍等几秒再发吧)"}
-        return
-    slot.busy = True
-    try:
-        await slot.client.query(question)
-        final_text_chunks: list[str] = []
-        async for msg in slot.client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        final_text_chunks.append(block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        name = block.name
-                        # Strip the "mcp__pmo__" prefix the SDK adds.
-                        if name.startswith("mcp__pmo__"):
-                            display = name[len("mcp__pmo__"):]
-                        else:
-                            display = name
-                        args_hint = _format_args_hint(block.input or {})
-                        logger.info(
-                            "agent: tool=%s input_keys=%s",
-                            name,
-                            list((block.input or {}).keys()),
-                        )
-                        yield {
-                            "kind": "tool",
-                            "name": display,
-                            "args_hint": args_hint,
-                        }
-            elif isinstance(msg, ResultMessage):
-                # The SDK's terminating message; stop reading.
-                break
-        final_text = "\n".join(final_text_chunks).strip()
-        yield {"kind": "final", "text": final_text}
-    except Exception as e:
-        logger.exception("agent failed: %s", conversation_key)
-        yield {"kind": "error", "message": f"{type(e).__name__}: {e}"}
-    finally:
-        slot.busy = False
+    # FIFO serialization. Note we await BEFORE setting busy so we
+    # also queue behind other in-flight calls on the same slot.
+    async with slot.lock:
+        slot.busy = True
+        try:
+            await slot.client.query(question)
+            final_text_chunks: list[str] = []
+            async for msg in slot.client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            final_text_chunks.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            name = block.name
+                            # Strip the "mcp__pmo__" prefix the SDK adds.
+                            if name.startswith("mcp__pmo__"):
+                                display = name[len("mcp__pmo__"):]
+                            else:
+                                display = name
+                            args_hint = _format_args_hint(block.input or {})
+                            logger.info(
+                                "agent: tool=%s input_keys=%s",
+                                name,
+                                list((block.input or {}).keys()),
+                            )
+                            yield {
+                                "kind": "tool",
+                                "name": display,
+                                "args_hint": args_hint,
+                            }
+                elif isinstance(msg, ResultMessage):
+                    # The SDK's terminating message; stop reading.
+                    break
+            final_text = "\n".join(final_text_chunks).strip()
+            yield {"kind": "final", "text": final_text}
+        except Exception as e:
+            logger.exception("agent failed: %s", conversation_key)
+            yield {"kind": "error", "message": f"{type(e).__name__}: {e}"}
+        finally:
+            slot.busy = False
 
 
 def _format_args_hint(args: dict) -> str:
