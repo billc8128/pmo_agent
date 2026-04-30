@@ -10,6 +10,31 @@ on with AI, in real time.
 > **Status**: MVP / demo. Validating whether a public AI-workflow
 > timeline is something people want — to read, and to share.
 
+**Live demo**: https://pmo-agent-sigma.vercel.app
+
+---
+
+## Install (macOS / Linux)
+
+```bash
+curl -fsSL https://pmo-agent-sigma.vercel.app/install.sh | bash
+```
+
+Then:
+
+```bash
+pmo-agent login        # opens browser, sign in with Google
+pmo-agent install      # registers as a background service (macOS launchd)
+```
+
+After that, every Claude Code or Codex turn on this machine
+appears at `https://pmo-agent-sigma.vercel.app/u/<your-handle>`
+within a couple of seconds. Closing your terminal or rebooting
+won't stop it.
+
+To stop / remove: `pmo-agent uninstall`. To rotate the token from
+the web UI: visit `/me` and revoke; then re-run `pmo-agent login`.
+
 ---
 
 ## Architecture
