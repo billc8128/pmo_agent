@@ -166,6 +166,94 @@ function humanDayLabel(dayKey: string): string {
   });
 }
 
+// ──────────────── Project-first hierarchy ────────────────
+//
+// Mirror of groupByDayAndProject with the levels swapped: project
+// becomes the top key, with per-day sub-blocks. This drives the
+// "By project" view.
+
+export type DayBlock = {
+  dayKey: string;
+  dayLabel: string;
+  turns: Turn[];     // newest-first within the day
+};
+
+export type ProjectGroupTree = {
+  root: string;
+  displayName: string;
+  turnCount: number;
+  latestAt: string;        // newest user_message_at across all days
+  ownerUserId: string;     // first turn's user_id; all turns in this group share it within /u/[handle].
+                           // On /discover the same project_root may legitimately have turns from
+                           // different users; in that case we still pick the first encountered as
+                           // the "owner" for summary lookup, since the LLM summary is per (user, root).
+                           // For cross-user discover, we end up with one project group per (root)
+                           // collapsed across users; that's the price of this view.
+  days: DayBlock[];
+};
+
+export function groupByProjectAndDay(turns: Turn[]): ProjectGroupTree[] {
+  const projMap = new Map<string, {
+    root: string;
+    displayName: string;
+    ownerUserId: string;
+    latestAt: string;
+    days: Map<string, DayBlock>;
+  }>();
+
+  for (const t of turns) {
+    const root = projectRootFromPath(t.project_path);
+    let p = projMap.get(root);
+    if (!p) {
+      p = {
+        root,
+        displayName: projectDisplayName(root),
+        ownerUserId: t.user_id,
+        latestAt: t.user_message_at,
+        days: new Map(),
+      };
+      projMap.set(root, p);
+    }
+    if (t.user_message_at > p.latestAt) p.latestAt = t.user_message_at;
+
+    const dayKey = localDayKey(new Date(t.user_message_at));
+    let day = p.days.get(dayKey);
+    if (!day) {
+      day = { dayKey, dayLabel: humanDayLabel(dayKey), turns: [] };
+      p.days.set(dayKey, day);
+    }
+    day.turns.push(t);
+  }
+
+  const result: ProjectGroupTree[] = [];
+  for (const p of projMap.values()) {
+    const days = [...p.days.values()].sort((a, b) =>
+      a.dayKey < b.dayKey ? 1 : -1,
+    );
+    let count = 0;
+    for (const d of days) count += d.turns.length;
+    result.push({
+      root: p.root,
+      displayName: p.displayName,
+      turnCount: count,
+      latestAt: p.latestAt,
+      ownerUserId: p.ownerUserId,
+      days,
+    });
+  }
+  // Sort projects by most-recent activity.
+  result.sort((a, b) => (a.latestAt < b.latestAt ? 1 : -1));
+  return result;
+}
+
+// ──────────────── View selector ────────────────
+
+export type View = 'time' | 'project';
+
+export function parseView(raw: unknown): View {
+  return raw === 'project' ? 'project' : 'time';
+}
+
 // ──────────────── Legacy: flat per-project group ────────────────
 //
 // Kept for back-compat with older callers, but the new timeline uses

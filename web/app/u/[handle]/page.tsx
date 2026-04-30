@@ -1,14 +1,12 @@
 // /u/:handle — public timeline of one user's local AI-coding sessions.
 //
-// Layout:
-//   - Date filter chips (Today / 7d / 30d / All) at the top.
-//   - Sticky left-side date nav on md+ screens; horizontal scroll
-//     strip on narrow screens.
-//   - Main column: turns grouped by date → project. Each project
-//     block carries an LLM-generated paragraph summarizing recent
-//     activity in that project, plus the actual turn cards.
+// Two views, switchable via ?view=:
+//   ?view=time (default)    — date → project → turns
+//   ?view=project           — project → date → turns
 //
-// Per spec §6.2: no realtime — page reload picks up new turns.
+// Both share the same shell: header, view toggle, date-range chips,
+// optional project filter badge, and a left sticky jump-list whose
+// content depends on the active view.
 
 import { notFound } from 'next/navigation';
 import { serverClient } from '@/lib/supabase';
@@ -16,15 +14,17 @@ import type { Profile, Turn } from '@/lib/types';
 import {
   dateRangeStartISO,
   groupByDayAndProject,
+  groupByProjectAndDay,
   parseDateRange,
+  parseView,
   projectRootFromPath,
 } from '@/lib/grouping';
 import { loadProjectSummaries } from '@/lib/project-summaries';
-import { DateRangeChips } from '../../_components/view-tabs';
-import {
-  DateGroupedTimeline,
-} from '../../_components/date-grouped-timeline';
+import { DateRangeChips, ViewToggle } from '../../_components/view-tabs';
+import { DateGroupedTimeline } from '../../_components/date-grouped-timeline';
 import { DateNav, MobileDateScroll } from '../../_components/date-nav';
+import { ProjectGroupedTimeline } from '../../_components/project-grouped-timeline';
+import { ProjectNav, MobileProjectScroll } from '../../_components/project-nav';
 import { ProjectFilterBadge } from '../../_components/project-filter-badge';
 
 export const dynamic = 'force-dynamic';
@@ -34,6 +34,7 @@ const PAGE_SIZE = 200;
 export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
   const { handle } = await props.params;
   const sp = await props.searchParams;
+  const view = parseView(sp.view);
   const range = parseDateRange(sp.range);
   const projectFilter = typeof sp.project === 'string' ? sp.project : '';
 
@@ -44,7 +45,6 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
     .select('id, handle, display_name, created_at')
     .eq('handle', handle)
     .maybeSingle<Profile>();
-
   if (profileErr) throw new Error(`Failed to load profile: ${profileErr.message}`);
   if (!profile) notFound();
 
@@ -68,9 +68,7 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
     );
   }
 
-  const days = groupByDayAndProject(turns);
   const summaries = await loadProjectSummaries(turns);
-
   const basePath = `/u/${handle}`;
 
   return (
@@ -84,7 +82,8 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
         </p>
       </header>
 
-      <div className="mb-6 flex items-center justify-end border-b border-zinc-200 pb-3 dark:border-zinc-800">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
+        <ViewToggle basePath={basePath} searchParams={sp} view={view} />
         <DateRangeChips basePath={basePath} searchParams={sp} range={range} />
       </div>
 
@@ -96,19 +95,49 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
         <p className="text-zinc-500 dark:text-zinc-400">
           No turns in this view.
         </p>
+      ) : view === 'project' ? (
+        <ProjectView turns={turns} summaries={summaries} />
       ) : (
-        <div className="grid grid-cols-1 gap-8 md:grid-cols-[10rem_minmax(0,1fr)]">
-          <DateNav days={days} />
-          <div>
-            <MobileDateScroll days={days} />
-            <DateGroupedTimeline
-              days={days}
-              profileById={null}
-              summaries={summaries}
-            />
-          </div>
-        </div>
+        <TimeView turns={turns} summaries={summaries} />
       )}
     </main>
+  );
+}
+
+function TimeView({
+  turns,
+  summaries,
+}: {
+  turns: Turn[];
+  summaries: Map<string, string | null>;
+}) {
+  const days = groupByDayAndProject(turns);
+  return (
+    <div className="grid grid-cols-1 gap-8 md:grid-cols-[10rem_minmax(0,1fr)]">
+      <DateNav days={days} />
+      <div>
+        <MobileDateScroll days={days} />
+        <DateGroupedTimeline days={days} profileById={null} summaries={summaries} />
+      </div>
+    </div>
+  );
+}
+
+function ProjectView({
+  turns,
+  summaries,
+}: {
+  turns: Turn[];
+  summaries: Map<string, string | null>;
+}) {
+  const projects = groupByProjectAndDay(turns);
+  return (
+    <div className="grid grid-cols-1 gap-8 md:grid-cols-[12rem_minmax(0,1fr)]">
+      <ProjectNav projects={projects} />
+      <div>
+        <MobileProjectScroll projects={projects} />
+        <ProjectGroupedTimeline projects={projects} profileById={null} summaries={summaries} />
+      </div>
+    </div>
   );
 }

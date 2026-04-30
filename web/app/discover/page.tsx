@@ -2,6 +2,7 @@
 //
 // Filter axes:
 //   ?handle=foo      limit to one user (default "all" interleaves)
+//   ?view=time | project
 //   ?range=...       today | 7d | 30d | all
 //   ?project=<root>  drill into one project root (still cross-user)
 
@@ -11,13 +12,17 @@ import type { Turn, Profile } from '@/lib/types';
 import {
   dateRangeStartISO,
   groupByDayAndProject,
+  groupByProjectAndDay,
   parseDateRange,
+  parseView,
   projectRootFromPath,
 } from '@/lib/grouping';
 import { loadProjectSummaries } from '@/lib/project-summaries';
-import { DateRangeChips } from '../_components/view-tabs';
+import { DateRangeChips, ViewToggle } from '../_components/view-tabs';
 import { DateGroupedTimeline } from '../_components/date-grouped-timeline';
 import { DateNav, MobileDateScroll } from '../_components/date-nav';
+import { ProjectGroupedTimeline } from '../_components/project-grouped-timeline';
+import { ProjectNav, MobileProjectScroll } from '../_components/project-nav';
 import { ProjectFilterBadge } from '../_components/project-filter-badge';
 
 export const dynamic = 'force-dynamic';
@@ -27,6 +32,7 @@ const PAGE_SIZE = 200;
 export default async function DiscoverPage(props: PageProps<'/discover'>) {
   const sp = await props.searchParams;
   const tab = typeof sp.handle === 'string' ? sp.handle : 'all';
+  const view = parseView(sp.view);
   const range = parseDateRange(sp.range);
   const projectFilter = typeof sp.project === 'string' ? sp.project : '';
 
@@ -64,7 +70,6 @@ export default async function DiscoverPage(props: PageProps<'/discover'>) {
     );
   }
 
-  const days = groupByDayAndProject(turns);
   const summaries = await loadProjectSummaries(turns);
 
   return (
@@ -93,7 +98,8 @@ export default async function DiscoverPage(props: PageProps<'/discover'>) {
         ))}
       </nav>
 
-      <div className="mb-6 flex items-center justify-end border-b border-zinc-200 pb-3 dark:border-zinc-800">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
+        <ViewToggle basePath="/discover" searchParams={sp} view={view} />
         <DateRangeChips basePath="/discover" searchParams={sp} range={range} />
       </div>
 
@@ -103,20 +109,54 @@ export default async function DiscoverPage(props: PageProps<'/discover'>) {
 
       {turns.length === 0 ? (
         <p className="text-zinc-500 dark:text-zinc-400">No turns in this view.</p>
+      ) : view === 'project' ? (
+        <ProjectView turns={turns} profileById={profileById} summaries={summaries} />
       ) : (
-        <div className="grid grid-cols-1 gap-8 md:grid-cols-[10rem_minmax(0,1fr)]">
-          <DateNav days={days} />
-          <div>
-            <MobileDateScroll days={days} />
-            <DateGroupedTimeline
-              days={days}
-              profileById={profileById}
-              summaries={summaries}
-            />
-          </div>
-        </div>
+        <TimeView turns={turns} profileById={profileById} summaries={summaries} />
       )}
     </main>
+  );
+}
+
+function TimeView({
+  turns,
+  profileById,
+  summaries,
+}: {
+  turns: Turn[];
+  profileById: Map<string, Profile>;
+  summaries: Map<string, string | null>;
+}) {
+  const days = groupByDayAndProject(turns);
+  return (
+    <div className="grid grid-cols-1 gap-8 md:grid-cols-[10rem_minmax(0,1fr)]">
+      <DateNav days={days} />
+      <div>
+        <MobileDateScroll days={days} />
+        <DateGroupedTimeline days={days} profileById={profileById} summaries={summaries} />
+      </div>
+    </div>
+  );
+}
+
+function ProjectView({
+  turns,
+  profileById,
+  summaries,
+}: {
+  turns: Turn[];
+  profileById: Map<string, Profile>;
+  summaries: Map<string, string | null>;
+}) {
+  const projects = groupByProjectAndDay(turns);
+  return (
+    <div className="grid grid-cols-1 gap-8 md:grid-cols-[12rem_minmax(0,1fr)]">
+      <ProjectNav projects={projects} />
+      <div>
+        <MobileProjectScroll projects={projects} />
+        <ProjectGroupedTimeline projects={projects} profileById={profileById} summaries={summaries} />
+      </div>
+    </div>
   );
 }
 
@@ -154,7 +194,7 @@ function hrefWithHandle(
     merged.handle = handle;
   }
   if (merged.range === 'all') delete merged.range;
-  delete merged.view;
+  if (merged.view === 'time') delete merged.view;
 
   const qs = new URLSearchParams(merged).toString();
   return qs ? `/discover?${qs}` : '/discover';

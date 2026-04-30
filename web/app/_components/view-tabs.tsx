@@ -1,9 +1,63 @@
-// Date-range chips for the timeline. The previous "View" tabs
-// (Timeline / By project) are gone — the new layout interleaves
-// dates and projects in a single hierarchy.
+// View toggle (Time / Project) + Date-range chips.
+//
+// Both are URL-driven Server Components. They preserve all other
+// search params when constructing their hrefs.
 
 import Link from 'next/link';
-import { DATE_RANGES, type DateRange } from '@/lib/grouping';
+import { DATE_RANGES, type DateRange, type View } from '@/lib/grouping';
+
+export function ViewToggle({
+  basePath,
+  searchParams,
+  view,
+}: {
+  basePath: string;
+  searchParams: Record<string, string | string[] | undefined>;
+  view: View;
+}) {
+  return (
+    <nav className="flex gap-1" aria-label="View">
+      <ViewLink
+        basePath={basePath}
+        searchParams={searchParams}
+        target="time"
+        active={view === 'time'}
+        label="By date"
+      />
+      <ViewLink
+        basePath={basePath}
+        searchParams={searchParams}
+        target="project"
+        active={view === 'project'}
+        label="By project"
+      />
+    </nav>
+  );
+}
+
+function ViewLink({
+  basePath,
+  searchParams,
+  target,
+  active,
+  label,
+}: {
+  basePath: string;
+  searchParams: Record<string, string | string[] | undefined>;
+  target: View;
+  active: boolean;
+  label: string;
+}) {
+  const href = buildHref(basePath, searchParams, { view: target });
+  const cls = active
+    ? 'rounded-md bg-zinc-900 px-3 py-1 text-xs font-medium text-white dark:bg-zinc-100 dark:text-zinc-900'
+    : 'rounded-md px-3 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800';
+  return (
+    <Link href={href} className={cls} prefetch={false}>
+      {label}
+    </Link>
+  );
+}
 
 export function DateRangeChips({
   basePath,
@@ -32,8 +86,6 @@ export function DateRangeChips({
   );
 }
 
-// buildHref preserves all existing search params except those being
-// overwritten. Default-valued keys are stripped for clean URLs.
 function buildHref(
   basePath: string,
   current: Record<string, string | string[] | undefined>,
@@ -47,10 +99,9 @@ function buildHref(
     if (v == null) continue;
     merged[k] = v;
   }
+  // Strip default-valued keys for clean URLs.
   if (merged.range === 'all') delete merged.range;
-  // Old "view" param no longer means anything; strip it so legacy
-  // URLs don't litter the address bar.
-  delete merged.view;
+  if (merged.view === 'time') delete merged.view;
 
   const qs = new URLSearchParams(merged).toString();
   return qs ? `${basePath}?${qs}` : basePath;
