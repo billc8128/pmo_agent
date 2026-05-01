@@ -27,6 +27,13 @@ pmo-agent login        # opens browser, sign in with Google
 pmo-agent install      # registers as a background service (macOS launchd)
 ```
 
+To update later:
+
+```bash
+pmo-agent update --check
+pmo-agent update
+```
+
 After that, every Claude Code or Codex turn on this machine
 appears at `https://pmo-agent-sigma.vercel.app/u/<your-handle>`
 within a couple of seconds. Closing your terminal or rebooting

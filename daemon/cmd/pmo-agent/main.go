@@ -5,6 +5,7 @@
 //   pmo-agent login     store PAT + server URL in ~/.pmo-agent/config.toml
 //   pmo-agent start     watch transcripts, upload turns (foreground)
 //   pmo-agent status    show watched files and recent uploads
+//   pmo-agent update    update the local binary from the latest release
 //
 // Spec: docs/specs/2026-04-29-mvp-design.md §4.
 
@@ -27,6 +28,7 @@ Commands:
   status     Show watched files, recent uploads, and service status
   install    Install as a background service (macOS launchd)
   uninstall  Remove the background service
+  update     Check for and install the latest pmo-agent release
   version    Print version info
 
 Run "pmo-agent <command> -h" for command-specific flags.
@@ -56,6 +58,8 @@ func main() {
 		exit(runInstall(args))
 	case "uninstall":
 		exit(runUninstall(args))
+	case "update":
+		exit(runUpdate(args))
 	case "version":
 		fmt.Println("pmo-agent", version)
 	case "help", "-h", "--help":
