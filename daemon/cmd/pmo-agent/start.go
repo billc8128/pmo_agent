@@ -196,6 +196,9 @@ func runRawTranscriptUploadLoop(
 	cli *rawtranscript.Client,
 	sources []rawTranscriptSource,
 ) {
+	if err := seedRawTranscriptBaselines(st, sources); err != nil {
+		fmt.Fprintln(os.Stderr, "raw transcript baseline:", err)
+	}
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
@@ -209,6 +212,26 @@ func runRawTranscriptUploadLoop(
 			timer.Reset(rawTranscriptScanInterval)
 		}
 	}
+}
+
+func seedRawTranscriptBaselines(st *store.Store, sources []rawTranscriptSource) error {
+	for _, src := range sources {
+		for _, path := range rawtranscript.JSONLFiles(src.root) {
+			info, err := os.Stat(path)
+			if err != nil || info.Size() == 0 {
+				continue
+			}
+			if err := st.MarkRawTranscriptFileSeen(
+				src.agent,
+				path,
+				info.Size(),
+				info.ModTime(),
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func uploadReadyRawTranscripts(

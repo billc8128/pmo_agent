@@ -122,7 +122,7 @@ func TestStore_TranscriptSHA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || state.SHA256 != "sha-a" || state.ByteSize != 123 || state.LocalMTime != mtime.Format(time.RFC3339Nano) {
+	if !ok || state.ByteSize != 123 || state.LocalMTime != mtime.Format(time.RFC3339Nano) {
 		t.Fatalf("path state = %+v,%v want sha-a/123/%s,true", state, ok, mtime.Format(time.RFC3339Nano))
 	}
 

@@ -105,6 +105,20 @@ func (s *Store) migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS uploaded_transcripts_path
 			ON uploaded_transcripts (agent, local_path);`,
+		// version 3: local raw JSONL file state. This records files seen at
+		// daemon startup too, so old historical files are not uploaded by default.
+		`CREATE TABLE IF NOT EXISTS raw_transcript_files (
+			agent             TEXT NOT NULL,
+			local_path        TEXT NOT NULL,
+			byte_size         INTEGER NOT NULL,
+			local_mtime       TEXT NOT NULL,
+			seen_at           TEXT NOT NULL,
+			PRIMARY KEY (agent, local_path)
+		);
+		INSERT OR REPLACE INTO raw_transcript_files
+		    (agent, local_path, byte_size, local_mtime, seen_at)
+		SELECT agent, local_path, byte_size, local_mtime, uploaded_at
+		FROM uploaded_transcripts;`,
 	}
 	for i := ver; i < len(steps); i++ {
 		if _, err := s.db.Exec(steps[i]); err != nil {
@@ -117,31 +131,55 @@ func (s *Store) migrate() error {
 	return nil
 }
 
-type TranscriptState struct {
-	SHA256     string
+type TranscriptFileState struct {
 	ByteSize   int64
 	LocalMTime string
 }
 
 // TranscriptPathState returns the last raw transcript state recorded for
-// a local file path. It lets the daemon skip unchanged historical files
-// without re-reading and re-gzipping them on every scan.
-func (s *Store) TranscriptPathState(agent, localPath string) (TranscriptState, bool, error) {
+// a local file path. It lets the daemon skip unchanged historical files.
+func (s *Store) TranscriptPathState(agent, localPath string) (TranscriptFileState, bool, error) {
 	const q = `
-		SELECT sha256, byte_size, local_mtime
-		FROM uploaded_transcripts
+		SELECT byte_size, local_mtime
+		FROM raw_transcript_files
 		WHERE agent = ? AND local_path = ?
 		LIMIT 1
 	`
-	var state TranscriptState
-	err := s.db.QueryRow(q, agent, localPath).Scan(&state.SHA256, &state.ByteSize, &state.LocalMTime)
+	var state TranscriptFileState
+	err := s.db.QueryRow(q, agent, localPath).Scan(&state.ByteSize, &state.LocalMTime)
 	if errors.Is(err, sql.ErrNoRows) {
-		return TranscriptState{}, false, nil
+		return TranscriptFileState{}, false, nil
 	}
 	if err != nil {
-		return TranscriptState{}, false, fmt.Errorf("query uploaded_transcripts path: %w", err)
+		return TranscriptFileState{}, false, fmt.Errorf("query raw_transcript_files: %w", err)
 	}
 	return state, true, nil
+}
+
+// MarkRawTranscriptFileSeen records the current local file state without
+// implying the raw transcript was uploaded to the server.
+func (s *Store) MarkRawTranscriptFileSeen(agent, localPath string, byteSize int64, localMTime time.Time) error {
+	const q = `
+		INSERT INTO raw_transcript_files
+		    (agent, local_path, byte_size, local_mtime, seen_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(agent, local_path) DO UPDATE
+		SET byte_size   = excluded.byte_size,
+		    local_mtime = excluded.local_mtime,
+		    seen_at     = excluded.seen_at
+	`
+	_, err := s.db.Exec(
+		q,
+		agent,
+		localPath,
+		byteSize,
+		localMTime.UTC().Format(time.RFC3339Nano),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert raw_transcript_files: %w", err)
+	}
+	return nil
 }
 
 // TranscriptSHA returns the last successfully uploaded raw transcript
@@ -196,7 +234,7 @@ func (s *Store) MarkTranscriptUploaded(
 	if err != nil {
 		return fmt.Errorf("insert uploaded_transcripts: %w", err)
 	}
-	return nil
+	return s.MarkRawTranscriptFileSeen(agent, localPath, byteSize, localMTime)
 }
 
 // IsUploaded returns true if a turn with this triple is already in the

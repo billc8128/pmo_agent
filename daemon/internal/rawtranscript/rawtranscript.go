@@ -123,25 +123,34 @@ func countJSONLLines(b []byte) int {
 	return n
 }
 
-// ReadyJSONLFiles returns transcript files whose mtime has been quiet
-// for at least quietFor. This prevents uploading a full file on every
-// small append while the agent is actively writing the session.
-func ReadyJSONLFiles(root string, quietFor time.Duration, now time.Time) []string {
+// JSONLFiles returns all transcript files under root.
+func JSONLFiles(root string) []string {
 	var out []string
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
 			return nil
 		}
-		info, err := d.Info()
+		out = append(out, path)
+		return nil
+	})
+	sort.Strings(out)
+	return out
+}
+
+// ReadyJSONLFiles returns transcript files whose mtime has been quiet
+// for at least quietFor. This prevents uploading a full file on every
+// small append while the agent is actively writing the session.
+func ReadyJSONLFiles(root string, quietFor time.Duration, now time.Time) []string {
+	var out []string
+	for _, path := range JSONLFiles(root) {
+		info, err := os.Stat(path)
 		if err != nil {
-			return nil
+			continue
 		}
 		if now.Sub(info.ModTime()) >= quietFor {
 			out = append(out, path)
 		}
-		return nil
-	})
-	sort.Strings(out)
+	}
 	return out
 }
 
