@@ -12,13 +12,17 @@ export default async function Home() {
   const sb = serverClient();
   const { count: turnCount } = await sb
     .from('turns')
-    .select('id', { count: 'exact', head: true });
+    .select('id', { count: 'exact', head: true })
+    .not('agent_response_full', 'is', null)
+    .neq('agent_response_full', '');
   const { count: profileCount } = await sb
     .from('profiles')
     .select('id', { count: 'exact', head: true });
   const { data: latest } = await sb
     .from('turns')
     .select('user_message_at')
+    .not('agent_response_full', 'is', null)
+    .neq('agent_response_full', '')
     .order('user_message_at', { ascending: false })
     .limit(1)
     .maybeSingle();

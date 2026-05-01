@@ -60,7 +60,7 @@ type sessionMetaPayload struct {
 
 type eventMsgPayload struct {
 	Type    string `json:"type"`
-	Message string `json:"message"`         // for user_message / agent_message
+	Message string `json:"message"`            // for user_message / agent_message
 	LastMsg string `json:"last_agent_message"` // for task_complete
 	TurnID  string `json:"turn_id"`
 }
@@ -249,6 +249,10 @@ func (sm *stateMachine) handleResponseItem(e *rawEntry) error {
 
 func (sm *stateMachine) closeCurrent() {
 	full, _ := redact.Redact(sm.curResponse.String())
+	if strings.TrimSpace(full) == "" {
+		sm.discardOpen()
+		return
+	}
 	turn := adapter.Turn{
 		Agent:             AgentName,
 		AgentSessionID:    sm.pickSessionID(),
@@ -318,14 +322,14 @@ func pickHints(toolName string, in map[string]any) []string {
 		return nil
 	}
 	perTool := map[string][]string{
-		"Bash":          {"cmd", "command", "workdir"},
-		"exec_command":  {"cmd", "command", "workdir"},
-		"apply_patch":   {"input"},
-		"shell":         {"command", "cmd"},
-		"read_file":     {"path", "file_path"},
-		"update_plan":   {"explanation"},
-		"web_fetch":     {"url"},
-		"view_image":    {"path"},
+		"Bash":         {"cmd", "command", "workdir"},
+		"exec_command": {"cmd", "command", "workdir"},
+		"apply_patch":  {"input"},
+		"shell":        {"command", "cmd"},
+		"read_file":    {"path", "file_path"},
+		"update_plan":  {"explanation"},
+		"web_fetch":    {"url"},
+		"view_image":   {"path"},
 	}
 	priority, ok := perTool[toolName]
 	if !ok {

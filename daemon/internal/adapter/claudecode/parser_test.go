@@ -39,6 +39,35 @@ func TestParse_OpenTurnIsNotEmitted(t *testing.T) {
 	}
 }
 
+func TestParse_EmptyAssistantDoesNotCloseTurn(t *testing.T) {
+	// Claude Code can write assistant entries that contain no user-visible
+	// text. Those are not completed turns; a later text assistant entry
+	// should still close the original prompt.
+	stream := join(
+		userText("hello", "2026-04-30T01:00:00Z"),
+		assistantText("", "2026-04-30T01:00:01Z"),
+		assistantText("real reply", "2026-04-30T01:00:02Z"),
+	)
+	turns := mustParse(t, stream)
+	if len(turns) != 1 {
+		t.Fatalf("want 1 turn, got %d", len(turns))
+	}
+	if turns[0].AgentResponseFull != "real reply" {
+		t.Fatalf("agent_response_full = %q, want real reply", turns[0].AgentResponseFull)
+	}
+}
+
+func TestParse_OnlyEmptyAssistantIsNotEmitted(t *testing.T) {
+	stream := join(
+		userText("hello", "2026-04-30T01:00:00Z"),
+		assistantText("", "2026-04-30T01:00:01Z"),
+	)
+	turns := mustParse(t, stream)
+	if len(turns) != 0 {
+		t.Fatalf("empty assistant must not emit a turn; got %d", len(turns))
+	}
+}
+
 func TestParse_ToolUseAccumulatesBeforeFinal(t *testing.T) {
 	// Common case: user → assistant(tool_use) → user(tool_result) → assistant(text final).
 	stream := join(
@@ -199,9 +228,9 @@ func userToolResult(toolUseID, payload, ts string) string {
 		"message": map[string]any{
 			"role": "user",
 			"content": []any{map[string]any{
-				"type":         "tool_result",
-				"tool_use_id":  toolUseID,
-				"content":      payload,
+				"type":        "tool_result",
+				"tool_use_id": toolUseID,
+				"content":     payload,
 			}},
 		},
 	})

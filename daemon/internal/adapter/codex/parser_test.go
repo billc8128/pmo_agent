@@ -46,6 +46,19 @@ func TestParse_OpenTurnIsNotEmitted(t *testing.T) {
 	}
 }
 
+func TestParse_TaskCompleteWithoutResponseIsNotEmitted(t *testing.T) {
+	stream := join(
+		sessionMeta("s", "/tmp"),
+		taskStarted("2026-04-30T01:00:00Z"),
+		userMessage("hi", "2026-04-30T01:00:00Z"),
+		taskComplete("", "2026-04-30T01:00:01Z"),
+	)
+	turns := mustParse(t, stream)
+	if len(turns) != 0 {
+		t.Fatalf("empty task_complete must not emit a turn; got %d", len(turns))
+	}
+}
+
 func TestParse_MultipleAgentMessagesConcatenate(t *testing.T) {
 	stream := join(
 		sessionMeta("s", "/tmp"),
@@ -206,8 +219,8 @@ func taskStarted(ts string) string {
 		"type":      "event_msg",
 		"timestamp": ts,
 		"payload": map[string]any{
-			"type":     "task_started",
-			"turn_id":  "t-" + ts,
+			"type":    "task_started",
+			"turn_id": "t-" + ts,
 		},
 	})
 }
@@ -239,7 +252,7 @@ func taskComplete(lastMsg, ts string) string {
 		"type":      "event_msg",
 		"timestamp": ts,
 		"payload": map[string]any{
-			"type":              "task_complete",
+			"type":               "task_complete",
 			"last_agent_message": lastMsg,
 		},
 	})

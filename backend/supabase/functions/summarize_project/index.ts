@@ -141,6 +141,8 @@ async function fetchProjectTurns(
       .select(select, { count: "exact" })
       .eq("user_id", userID)
       .eq("project_root", projectRoot)
+      .not("agent_response_full", "is", null)
+      .neq("agent_response_full", "")
       .order("user_message_at", { ascending: false })
       .limit(RECENT_TURN_LIMIT),
     admin
@@ -148,6 +150,8 @@ async function fetchProjectTurns(
       .select(select, { count: "exact" })
       .eq("user_id", userID)
       .is("project_root", null)
+      .not("agent_response_full", "is", null)
+      .neq("agent_response_full", "")
       .filter("project_path", "ilike", legacyProjectRootPattern(projectRoot))
       .order("user_message_at", { ascending: false })
       .limit(RECENT_TURN_LIMIT),

@@ -62,8 +62,8 @@ type rawMsg struct {
 type contentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
-	Name      string          `json:"name,omitempty"`       // for tool_use
-	Input     json.RawMessage `json:"input,omitempty"`      // for tool_use
+	Name      string          `json:"name,omitempty"`        // for tool_use
+	Input     json.RawMessage `json:"input,omitempty"`       // for tool_use
 	ToolUseID string          `json:"tool_use_id,omitempty"` // for tool_result
 }
 
@@ -195,6 +195,9 @@ func (sm *stateMachine) handleAssistant(e *rawEntry) error {
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
+			if strings.TrimSpace(b.Text) == "" {
+				continue
+			}
 			if sm.curResponse.Len() > 0 {
 				sm.curResponse.WriteString("\n\n")
 			}
@@ -214,6 +217,9 @@ func (sm *stateMachine) handleAssistant(e *rawEntry) error {
 	sm.curLastAt = e.Timestamp
 
 	if !hasToolUse {
+		if strings.TrimSpace(sm.curResponse.String()) == "" {
+			return nil
+		}
 		sm.closeCurrent()
 	}
 	return nil
@@ -322,21 +328,21 @@ func structuredHints(toolName string, in map[string]any) []string {
 	// Per-tool field priority. Each list is "most-salient first".
 	// Tools not listed here fall through to the generic preferred list.
 	perTool := map[string][]string{
-		"Bash":           {"command", "description"},
-		"Edit":           {"file_path", "old_string"},
-		"Write":          {"file_path"},
-		"Read":           {"file_path"},
-		"Grep":           {"pattern", "path", "glob"},
-		"Glob":           {"pattern"},
-		"WebFetch":       {"url", "prompt"},
-		"WebSearch":      {"query"},
-		"Task":           {"description", "subagent_type"},
-		"TodoWrite":      {"_todo_count"}, // synthetic, see below
-		"NotebookEdit":   {"notebook_path", "new_source"},
-		"BashOutput":     {"bash_id"},
-		"KillShell":      {"shell_id"},
-		"ExitPlanMode":   {"plan"},
-		"SlashCommand":   {"command"},
+		"Bash":            {"command", "description"},
+		"Edit":            {"file_path", "old_string"},
+		"Write":           {"file_path"},
+		"Read":            {"file_path"},
+		"Grep":            {"pattern", "path", "glob"},
+		"Glob":            {"pattern"},
+		"WebFetch":        {"url", "prompt"},
+		"WebSearch":       {"query"},
+		"Task":            {"description", "subagent_type"},
+		"TodoWrite":       {"_todo_count"}, // synthetic, see below
+		"NotebookEdit":    {"notebook_path", "new_source"},
+		"BashOutput":      {"bash_id"},
+		"KillShell":       {"shell_id"},
+		"ExitPlanMode":    {"plan"},
+		"SlashCommand":    {"command"},
 		"AskUserQuestion": {"questions"},
 	}
 	priority, ok := perTool[toolName]

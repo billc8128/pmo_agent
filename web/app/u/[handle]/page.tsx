@@ -52,6 +52,8 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
     .from('turns')
     .select('*')
     .eq('user_id', profile.id)
+    .not('agent_response_full', 'is', null)
+    .neq('agent_response_full', '')
     .order('user_message_at', { ascending: false })
     .limit(PAGE_SIZE);
 
@@ -60,7 +62,7 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
 
   const { data: turnsData, error: turnsErr } = await query;
   if (turnsErr) throw new Error(`Failed to load turns: ${turnsErr.message}`);
-  const allTurns: Turn[] = turnsData ?? [];
+  const allTurns = (turnsData ?? []) as Turn[];
 
   // Compute the chip universe BEFORE applying the project filter, so a
   // user already drilled into one project still sees the others as

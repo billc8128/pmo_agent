@@ -115,6 +115,17 @@ Deno.serve(async (req) => {
   ) {
     return bad(400, "project_root must be a string or null");
   }
+  if (!hasVisibleAgentResponse(p.agent_response_full)) {
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        turn_id: null,
+        deduped: true,
+        skipped: "empty_agent_response",
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  }
 
   // 4. Upsert. ON CONFLICT (turns_dedup) DO NOTHING — re-uploads are no-ops.
   const { data: inserted, error: insertErr } = await admin
@@ -156,6 +167,10 @@ function normalizeProjectRoot(
   if (projectRoot && projectRoot.trim()) return projectRoot;
   if (!projectPath) return null;
   return legacyProjectRootFromPath(projectPath);
+}
+
+function hasVisibleAgentResponse(response: string | null): boolean {
+  return typeof response === "string" && response.trim().length > 0;
 }
 
 // Legacy fallback for old daemons that have not yet been upgraded to

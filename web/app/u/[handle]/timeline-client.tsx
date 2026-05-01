@@ -39,6 +39,8 @@ export function TimelineClient({
         .from('turns')
         .select('*')
         .eq('user_id', userId)
+        .not('agent_response_full', 'is', null)
+        .neq('agent_response_full', '')
         .gt('user_message_at', cursor)
         .order('user_message_at', { ascending: false })
         .limit(50);

@@ -97,6 +97,8 @@ def recent_turns(
             "user_message_at, agent_response_at"
         )
         .eq("user_id", user_id)
+        .filter("agent_response_full", "not.is", "null")
+        .neq("agent_response_full", "")
         .order("user_message_at", desc=True)
         .limit(fetch_limit)
     )
