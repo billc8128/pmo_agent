@@ -17,7 +17,7 @@ import {
   groupByProjectAndDay,
   parseDateRange,
   parseView,
-  projectRootFromPath,
+  projectRootForTurn,
 } from '@/lib/grouping';
 import { loadProjectSummaries } from '@/lib/project-summaries';
 import { DateRangeChips, ViewToggle } from '../../_components/view-tabs';
@@ -69,9 +69,7 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
 
   let turns = allTurns;
   if (projectFilter) {
-    turns = turns.filter(
-      (t) => projectRootFromPath(t.project_path) === projectFilter,
-    );
+    turns = turns.filter((t) => projectRootForTurn(t) === projectFilter);
   }
 
   const summaries = await loadProjectSummaries(turns);
@@ -133,7 +131,7 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
 
 function collectRoots(turns: Turn[]): string[] {
   const set = new Set<string>();
-  for (const t of turns) set.add(projectRootFromPath(t.project_path));
+  for (const t of turns) set.add(projectRootForTurn(t));
   return [...set].sort();
 }
 

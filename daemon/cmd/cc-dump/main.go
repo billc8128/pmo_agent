@@ -31,6 +31,7 @@ import (
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter/claudecode"
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter/codex"
 	"github.com/superlion8/pmo_agent/daemon/internal/config"
+	"github.com/superlion8/pmo_agent/daemon/internal/projectroot"
 	"github.com/superlion8/pmo_agent/daemon/internal/store"
 	"github.com/superlion8/pmo_agent/daemon/internal/uploader"
 )
@@ -87,6 +88,9 @@ func runUpload(turns []adapter.Turn) error {
 
 	var sent, deduped, skipped int
 	for _, t := range turns {
+		if t.ProjectRoot == "" {
+			t.ProjectRoot = projectroot.Resolve(t.ProjectPath)
+		}
 		already, err := st.IsUploaded(t.Agent, t.AgentSessionID, t.TurnIndex)
 		if err != nil {
 			return err
@@ -122,7 +126,11 @@ func runUpload(turns []adapter.Turn) error {
 
 func printTurns(turns []adapter.Turn) {
 	for i, t := range turns {
-		fmt.Printf("─── Turn #%d ─── session=%s cwd=%s\n", i, short(t.AgentSessionID, 8), t.ProjectPath)
+		root := t.ProjectRoot
+		if root == "" {
+			root = projectroot.Resolve(t.ProjectPath)
+		}
+		fmt.Printf("─── Turn #%d ─── session=%s cwd=%s root=%s\n", i, short(t.AgentSessionID, 8), t.ProjectPath, root)
 		fmt.Printf("  user_at: %s | resp_at: %s\n", t.UserMessageAt.Format("15:04:05"), t.AgentResponseAt.Format("15:04:05"))
 		fmt.Printf("  USER  (%d chars): %s\n", len(t.UserMessage), oneLine(t.UserMessage, 100))
 		fmt.Printf("  AGENT (%d chars): %s\n", len(t.AgentResponseFull), oneLine(t.AgentResponseFull, 200))

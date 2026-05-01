@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter"
+	"github.com/superlion8/pmo_agent/daemon/internal/projectroot"
 )
 
 // DefaultInterval is how often the watcher rescans. Tuned for "feels
@@ -249,6 +250,9 @@ func (w *Watcher) parseAndEmitFrom(path string, high int) int {
 	for _, t := range turns {
 		if t.TurnIndex <= high {
 			continue
+		}
+		if t.ProjectRoot == "" {
+			t.ProjectRoot = projectroot.Resolve(t.ProjectPath)
 		}
 		select {
 		case w.turns <- t:

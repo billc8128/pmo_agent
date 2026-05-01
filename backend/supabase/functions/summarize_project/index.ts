@@ -48,30 +48,12 @@ Deno.serve(async (req) => {
   // Compute the live turn count for this (user, root) by listing the
   // matching turns. We need both the count (for the cache key) and
   // the recent N (for the LLM input) — one query handles both.
-  const { data: turns, error: turnsErr, count: liveCount } = await admin
-    .from("turns")
-    .select(
-      "id, turn_index, agent, project_path, user_message, agent_summary, user_message_at",
-      { count: "exact" },
-    )
-    .eq("user_id", body.user_id)
-    .filter("project_path", "ilike", projectRootPattern(body.project_root))
-    .order("user_message_at", { ascending: false })
-    .limit(RECENT_TURN_LIMIT);
-
-  if (turnsErr) {
-    return jsonRes(500, { ok: false, error: `fetch turns: ${turnsErr.message}` });
+  const fetched = await fetchProjectTurns(body.user_id, body.project_root);
+  if (fetched.error) {
+    return jsonRes(500, { ok: false, error: `fetch turns: ${fetched.error}` });
   }
-
-  // Filter client-side to enforce the exact "first 4 components"
-  // semantics we use on the web. The ilike pattern is a coarse
-  // pre-filter; this guarantees correctness.
-  const matchingTurns = (turns ?? []).filter((t: TurnRow) =>
-    projectRootFromPath(t.project_path) === body.project_root!
-  );
-  const matchingLiveCount = matchingTurns.length === RECENT_TURN_LIMIT
-    ? (liveCount ?? matchingTurns.length)  // approximate; sufficient for cache key
-    : matchingTurns.length;
+  const matchingTurns = fetched.turns;
+  const matchingLiveCount = fetched.liveCount;
 
   if (matchingTurns.length === 0) {
     // Empty set — caller has invalid project_root or no turns yet.
@@ -141,24 +123,73 @@ type TurnRow = {
   turn_index: number;
   agent: string;
   project_path: string | null;
+  project_root: string | null;
   user_message: string;
   agent_summary: string | null;
   user_message_at: string;
 };
 
-// projectRootPattern returns an ilike pattern that catches every path
-// whose first 4 components match the given root. We use it as a
-// coarse SQL pre-filter; exact matching is done client-side.
-function projectRootPattern(root: string): string {
+async function fetchProjectTurns(
+  userID: string,
+  projectRoot: string,
+): Promise<{ turns: TurnRow[]; liveCount: number; error?: string }> {
+  const select =
+    "id, turn_index, agent, project_path, project_root, user_message, agent_summary, user_message_at";
+  const [canonical, legacy] = await Promise.all([
+    admin
+      .from("turns")
+      .select(select, { count: "exact" })
+      .eq("user_id", userID)
+      .eq("project_root", projectRoot)
+      .order("user_message_at", { ascending: false })
+      .limit(RECENT_TURN_LIMIT),
+    admin
+      .from("turns")
+      .select(select, { count: "exact" })
+      .eq("user_id", userID)
+      .is("project_root", null)
+      .filter("project_path", "ilike", legacyProjectRootPattern(projectRoot))
+      .order("user_message_at", { ascending: false })
+      .limit(RECENT_TURN_LIMIT),
+  ]);
+
+  if (canonical.error) return { turns: [], liveCount: 0, error: canonical.error.message };
+  if (legacy.error) return { turns: [], liveCount: 0, error: legacy.error.message };
+
+  const canonicalRows = (canonical.data ?? []) as TurnRow[];
+  const legacyRows = ((legacy.data ?? []) as TurnRow[]).filter(
+    (t) => projectRootForTurn(t) === projectRoot,
+  );
+  const turns = [...canonicalRows, ...legacyRows]
+    .sort((a, b) => b.user_message_at.localeCompare(a.user_message_at))
+    .slice(0, RECENT_TURN_LIMIT);
+
+  // canonical.count is exact. legacy.count is a coarse SQL pre-filter;
+  // keep the previous approximate behavior when the legacy set is large.
+  const legacyLiveCount = legacyRows.length === RECENT_TURN_LIMIT
+    ? (legacy.count ?? legacyRows.length)
+    : legacyRows.length;
+  return {
+    turns,
+    liveCount: (canonical.count ?? canonicalRows.length) + legacyLiveCount,
+  };
+}
+
+// legacyProjectRootPattern returns an ilike pattern that catches every
+// path whose first 4 components may match the given legacy root. It is
+// only used for rows created before turns.project_root existed.
+function legacyProjectRootPattern(root: string): string {
   // Escape SQL LIKE wildcards in the root itself.
   const safe = root.replace(/[%_]/g, "\\$&");
   return `${safe}%`;
 }
 
-// projectRootFromPath mirrors web/lib/grouping.ts. Keeping it inlined
-// here because Edge Functions can't share TS code with the Next.js
-// project — they're separate deployments.
-function projectRootFromPath(p: string | null | undefined): string {
+function projectRootForTurn(t: Pick<TurnRow, "project_root" | "project_path">): string {
+  return t.project_root || legacyProjectRootFromPath(t.project_path);
+}
+
+// legacyProjectRootFromPath mirrors the web fallback for old rows.
+function legacyProjectRootFromPath(p: string | null | undefined): string {
   if (!p) return "(unknown)";
   const trimmed = p.startsWith("/") ? p.slice(1) : p;
   const parts = trimmed.split("/");

@@ -23,6 +23,11 @@ type Turn struct {
 	// ProjectPath is the cwd where the agent was running, when known.
 	ProjectPath string
 
+	// ProjectRoot is the canonical project boundary. It is usually the
+	// nearest git root for ProjectPath, falling back to ProjectPath when
+	// the cwd is outside git.
+	ProjectRoot string
+
 	// TurnIndex is the 0-based position of this turn within its session.
 	TurnIndex int
 

@@ -14,6 +14,7 @@
 //     "agent": "claude_code" | "codex",
 //     "agent_session_id": "uuid-from-jsonl-filename",
 //     "project_path": "/Users/.../some/repo" | null,
+//     "project_root": "/Users/.../some/repo" | null,
 //     "turn_index": 0,
 //     "user_message": "redacted prompt text",
 //     "agent_response_full": "redacted response text" | null,
@@ -38,6 +39,7 @@ type TurnPayload = {
   agent: string;
   agent_session_id: string;
   project_path: string | null;
+  project_root?: string | null;
   turn_index: number;
   user_message: string;
   agent_response_full: string | null;
@@ -106,6 +108,13 @@ Deno.serve(async (req) => {
   if (typeof p.user_message_at !== "string") {
     return bad(400, "user_message_at required (ISO-8601 string)");
   }
+  if (
+    p.project_root !== undefined &&
+    p.project_root !== null &&
+    typeof p.project_root !== "string"
+  ) {
+    return bad(400, "project_root must be a string or null");
+  }
 
   // 4. Upsert. ON CONFLICT (turns_dedup) DO NOTHING — re-uploads are no-ops.
   const { data: inserted, error: insertErr } = await admin
@@ -116,6 +125,7 @@ Deno.serve(async (req) => {
         agent: p.agent,
         agent_session_id: p.agent_session_id,
         project_path: p.project_path,
+        project_root: normalizeProjectRoot(p.project_root, p.project_path),
         turn_index: p.turn_index,
         user_message: p.user_message,
         agent_response_full: p.agent_response_full,
@@ -138,3 +148,21 @@ Deno.serve(async (req) => {
     { headers: { "content-type": "application/json" } },
   );
 });
+
+function normalizeProjectRoot(
+  projectRoot: string | null | undefined,
+  projectPath: string | null,
+): string | null {
+  if (projectRoot && projectRoot.trim()) return projectRoot;
+  if (!projectPath) return null;
+  return legacyProjectRootFromPath(projectPath);
+}
+
+// Legacy fallback for old daemons that have not yet been upgraded to
+// send project_root. New daemons resolve git roots locally.
+function legacyProjectRootFromPath(p: string): string {
+  const trimmed = p.startsWith("/") ? p.slice(1) : p;
+  const parts = trimmed.split("/");
+  if (parts.length <= 4) return p;
+  return "/" + parts.slice(0, 4).join("/");
+}

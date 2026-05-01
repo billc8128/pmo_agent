@@ -16,6 +16,7 @@
 
 import { useState } from 'react';
 import type { Turn } from '@/lib/types';
+import { projectRootForTurn } from '@/lib/grouping';
 import { ResponseMarkdown } from './response-markdown';
 
 export function TurnCard({ turn }: { turn: Turn }) {
@@ -35,8 +36,9 @@ export function TurnCard({ turn }: { turn: Turn }) {
       : turn.agent === 'codex'
         ? 'CDX'
         : turn.agent;
-  const projectName = turn.project_path
-    ? turn.project_path.split('/').filter(Boolean).pop() ?? turn.project_path
+  const projectRoot = projectRootForTurn(turn);
+  const projectName = projectRoot !== '(unknown)'
+    ? projectRoot.split('/').filter(Boolean).pop() ?? projectRoot
     : null;
   const deviceLabel = turn.device_label?.trim() || null;
   const responseEmpty =

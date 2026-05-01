@@ -9,8 +9,15 @@
 
 import type { Turn } from './types';
 
-// projectRootFromPath converts an absolute path into a "project root".
-// Default heuristic: take the first 4 path components after the
+// projectRootForTurn returns the canonical project key. New daemon
+// versions write project_root directly; old rows fall back to the
+// legacy "first 4 path components" heuristic.
+export function projectRootForTurn(t: Pick<Turn, 'project_root' | 'project_path'>): string {
+  return t.project_root || legacyProjectRootFromPath(t.project_path);
+}
+
+// legacyProjectRootFromPath converts an absolute path into a legacy
+// "project root" by taking the first 4 path components after the
 // leading slash.
 //
 //   /Users/a/Desktop/pmo_agent/daemon   →  /Users/a/Desktop/pmo_agent
@@ -19,13 +26,17 @@ import type { Turn } from './types';
 //
 // Paths with fewer than 4 components return verbatim. Empty / null
 // returns "(unknown)".
-export function projectRootFromPath(p: string | null | undefined): string {
+export function legacyProjectRootFromPath(p: string | null | undefined): string {
   if (!p) return '(unknown)';
   const trimmed = p.startsWith('/') ? p.slice(1) : p;
   const parts = trimmed.split('/');
   if (parts.length <= 4) return p;
   return '/' + parts.slice(0, 4).join('/');
 }
+
+// Back-compat export for older call sites. Prefer projectRootForTurn
+// when a full turn row is available.
+export const projectRootFromPath = legacyProjectRootFromPath;
 
 export function projectDisplayName(root: string): string {
   const slash = root.lastIndexOf('/');
@@ -110,7 +121,7 @@ export function groupByDayAndProject(turns: Turn[]): DayGroup[] {
       projMap = new Map();
       dayMap.set(dayKey, projMap);
     }
-    const root = projectRootFromPath(t.project_path);
+    const root = projectRootForTurn(t);
     let block = projMap.get(root);
     if (!block) {
       block = { root, displayName: projectDisplayName(root), turns: [] };
@@ -202,7 +213,7 @@ export function groupByProjectAndDay(turns: Turn[]): ProjectGroupTree[] {
   }>();
 
   for (const t of turns) {
-    const root = projectRootFromPath(t.project_path);
+    const root = projectRootForTurn(t);
     let p = projMap.get(root);
     if (!p) {
       p = {
@@ -273,7 +284,7 @@ export function groupTurnsByProject(
 ): ProjectGroup[] {
   const map = new Map<string, ProjectGroup>();
   for (const t of turns) {
-    const root = projectRootFromPath(t.project_path);
+    const root = projectRootForTurn(t);
     let g = map.get(root);
     if (!g) {
       g = {

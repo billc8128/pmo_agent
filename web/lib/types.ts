@@ -14,6 +14,7 @@ export type Turn = {
   agent: 'claude_code' | 'codex' | string;  // string fallback for forward-compat
   agent_session_id: string;
   project_path: string | null;
+  project_root: string | null;
   turn_index: number;
   user_message: string;
   agent_response_full: string | null;

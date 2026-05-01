@@ -66,6 +66,7 @@ type Payload struct {
 	Agent             string  `json:"agent"`
 	AgentSessionID    string  `json:"agent_session_id"`
 	ProjectPath       *string `json:"project_path"`
+	ProjectRoot       *string `json:"project_root"`
 	TurnIndex         int     `json:"turn_index"`
 	UserMessage       string  `json:"user_message"`
 	AgentResponseFull *string `json:"agent_response_full"`
@@ -74,9 +75,9 @@ type Payload struct {
 }
 
 // FromTurn converts an adapter.Turn into a wire Payload. Empty optional
-// fields (project_path, agent_response_full, agent_response_at) become
-// JSON null rather than empty strings, so the server's NULL semantics
-// in Postgres are preserved.
+// fields (project_path, project_root, agent_response_full,
+// agent_response_at) become JSON null rather than empty strings, so
+// the server's NULL semantics in Postgres are preserved.
 func FromTurn(t adapter.Turn) Payload {
 	p := Payload{
 		Agent:          t.Agent,
@@ -88,6 +89,10 @@ func FromTurn(t adapter.Turn) Payload {
 	if t.ProjectPath != "" {
 		s := t.ProjectPath
 		p.ProjectPath = &s
+	}
+	if t.ProjectRoot != "" {
+		s := t.ProjectRoot
+		p.ProjectRoot = &s
 	}
 	if t.AgentResponseFull != "" {
 		s := t.AgentResponseFull

@@ -90,10 +90,10 @@ loop:
 }
 
 // TestWatcher_NewSessionDirThenFile drives a realistic-shaped flow:
-//   1. start watcher with empty root,
-//   2. mkdir <root>/<slug>/  (must trigger a new fsnotify Add),
-//   3. write a complete jsonl turn into it,
-//   4. expect exactly one Turn on Turns().
+//  1. start watcher with empty root,
+//  2. mkdir <root>/<slug>/  (must trigger a new fsnotify Add),
+//  3. write a complete jsonl turn into it,
+//  4. expect exactly one Turn on Turns().
 func TestWatcher_NewSessionDirThenFile(t *testing.T) {
 	root := t.TempDir()
 	wt, err := NewWithInterval("test", root, claudecode.ParseFile, 100*time.Millisecond)
@@ -140,6 +140,9 @@ func TestWatcher_NewSessionDirThenFile(t *testing.T) {
 		}
 		if turn.UserMessage != "hello" {
 			t.Errorf("user_message = %q, want %q", turn.UserMessage, "hello")
+		}
+		if turn.ProjectRoot != "/tmp" {
+			t.Errorf("project_root = %q, want /tmp fallback", turn.ProjectRoot)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for turn")

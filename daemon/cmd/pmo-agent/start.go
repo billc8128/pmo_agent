@@ -17,6 +17,7 @@ import (
 	"github.com/superlion8/pmo_agent/daemon/internal/adapter/codex"
 	"github.com/superlion8/pmo_agent/daemon/internal/config"
 	"github.com/superlion8/pmo_agent/daemon/internal/notify"
+	"github.com/superlion8/pmo_agent/daemon/internal/projectroot"
 	"github.com/superlion8/pmo_agent/daemon/internal/store"
 	"github.com/superlion8/pmo_agent/daemon/internal/uploader"
 	"github.com/superlion8/pmo_agent/daemon/internal/watcher"
@@ -198,6 +199,9 @@ const (
 // uploadOne checks the local store, posts the turn, and marks it.
 // Returns one of outcome* on success; bubbles errors up.
 func uploadOne(ctx context.Context, st *store.Store, cli *uploader.Client, t adapter.Turn) (outcome, error) {
+	if t.ProjectRoot == "" {
+		t.ProjectRoot = projectroot.Resolve(t.ProjectPath)
+	}
 	already, err := st.IsUploaded(t.Agent, t.AgentSessionID, t.TurnIndex)
 	if err != nil {
 		return outcomeAlreadyKnown, err

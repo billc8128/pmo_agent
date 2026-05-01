@@ -28,6 +28,7 @@ func sampleTurn() adapter.Turn {
 		Agent:             "claude_code",
 		AgentSessionID:    "session-x",
 		ProjectPath:       "/tmp/proj",
+		ProjectRoot:       "/tmp",
 		TurnIndex:         3,
 		UserMessage:       "hi",
 		AgentResponseFull: "yo",
@@ -73,6 +74,9 @@ func TestUpload_HappyPath(t *testing.T) {
 	}
 	if got.AgentResponseAt == nil || *got.AgentResponseAt == "" {
 		t.Errorf("agent_response_at should be present, got nil")
+	}
+	if got.ProjectRoot == nil || *got.ProjectRoot != "/tmp" {
+		t.Errorf("project_root = %v, want /tmp", got.ProjectRoot)
 	}
 }
 
@@ -136,6 +140,9 @@ func TestFromTurn_NullableFields(t *testing.T) {
 	if p.ProjectPath != nil {
 		t.Error("project_path should be nil when empty")
 	}
+	if p.ProjectRoot != nil {
+		t.Error("project_root should be nil when empty")
+	}
 	if p.AgentResponseFull != nil {
 		t.Error("agent_response_full should be nil when empty")
 	}
@@ -148,6 +155,7 @@ func TestFromTurn_NullableFields(t *testing.T) {
 	s := string(b)
 	for _, want := range []string{
 		`"project_path":null`,
+		`"project_root":null`,
 		`"agent_response_full":null`,
 		`"agent_response_at":null`,
 	} {

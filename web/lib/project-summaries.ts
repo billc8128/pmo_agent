@@ -16,7 +16,7 @@
 // re-counts live and double-checks, so concurrent triggers are safe.
 
 import { serverClient } from './supabase';
-import { projectRootFromPath } from './grouping';
+import { projectRootForTurn } from './grouping';
 import type { Turn } from './types';
 
 const SUMMARIZE_PROJECT_URL =
@@ -36,7 +36,7 @@ export async function loadProjectSummaries(turns: Turn[]): Promise<SummaryMap> {
   // recomputes against the full database.
   const liveCount = new Map<string, number>();
   for (const t of turns) {
-    const root = projectRootFromPath(t.project_path);
+    const root = projectRootForTurn(t);
     const key = `${t.user_id}:${root}`;
     liveCount.set(key, (liveCount.get(key) ?? 0) + 1);
   }
@@ -48,7 +48,7 @@ export async function loadProjectSummaries(turns: Turn[]): Promise<SummaryMap> {
   // For typical pages with <20 distinct projects, this is fine.
   const sb = serverClient();
   const filterPairs = [...liveCount.keys()].map((k) => {
-    const [uid, root] = k.split(':', 2);
+    const [uid] = k.split(':', 2);
     // Trim the user_id off; the rest is the project_root (which may
     // itself contain colons in pathological cases — but a path
     // starting with "/" never will).
