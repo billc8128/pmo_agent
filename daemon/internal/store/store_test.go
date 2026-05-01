@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStore_MarkAndCheck(t *testing.T) {
@@ -85,5 +86,54 @@ func TestStore_RecentUploadsOrder(t *testing.T) {
 	// Most-recent first means turn_index=2 should be first.
 	if ups[0].TurnIndex != 2 {
 		t.Errorf("RecentUploads[0].TurnIndex = %d, want 2", ups[0].TurnIndex)
+	}
+}
+
+func TestStore_TranscriptSHA(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenAt(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	got, ok, err := s.TranscriptSHA("claude_code", "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || got != "" {
+		t.Fatalf("fresh transcript sha = %q,%v want empty,false", got, ok)
+	}
+
+	localPath := filepath.Join(dir, "sess-1.jsonl")
+	mtime := time.Date(2026, 5, 1, 1, 2, 3, 4, time.UTC)
+	if err := s.MarkTranscriptUploaded("claude_code", "sess-1", localPath, "sha-a", 123, 45, mtime); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = s.TranscriptSHA("claude_code", "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != "sha-a" {
+		t.Fatalf("transcript sha = %q,%v want sha-a,true", got, ok)
+	}
+
+	state, ok, err := s.TranscriptPathState("claude_code", localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || state.SHA256 != "sha-a" || state.ByteSize != 123 || state.LocalMTime != mtime.Format(time.RFC3339Nano) {
+		t.Fatalf("path state = %+v,%v want sha-a/123/%s,true", state, ok, mtime.Format(time.RFC3339Nano))
+	}
+
+	if err := s.MarkTranscriptUploaded("claude_code", "sess-1", localPath, "sha-b", 456, 78, mtime.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = s.TranscriptSHA("claude_code", "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != "sha-b" {
+		t.Fatalf("updated transcript sha = %q,%v want sha-b,true", got, ok)
 	}
 }

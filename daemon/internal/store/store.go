@@ -1,15 +1,11 @@
 // Package store wraps the daemon's local SQLite database
 // (~/.pmo-agent/state.db).
 //
-// Responsibilities (Milestone 1.4):
+// Responsibilities:
 //   - Track which turns have already been uploaded, keyed by
 //     (agent, session_id, turn_index). This is the same key the server
 //     dedupes on, so client-side dedup avoids needless POSTs.
-//
-// Responsibilities added in Milestone 1.5:
-//   - Track per-file byte offsets so the watcher knows where to resume
-//     after a daemon restart.
-//   - Append a row to redaction_log per redaction hit (rule + length).
+//   - Track raw JSONL transcript snapshots that have already been uploaded.
 
 package store
 
@@ -95,6 +91,20 @@ func (s *Store) migrate() error {
 			uploaded_at      TEXT NOT NULL,     -- RFC3339
 			PRIMARY KEY (agent, session_id, turn_index)
 		);`,
+		// version 2: raw JSONL transcript upload state
+		`CREATE TABLE IF NOT EXISTS uploaded_transcripts (
+			agent             TEXT NOT NULL,
+			session_id        TEXT NOT NULL,
+			local_path        TEXT NOT NULL,
+			sha256            TEXT NOT NULL,
+			byte_size         INTEGER NOT NULL,
+			compressed_size   INTEGER NOT NULL,
+			local_mtime       TEXT NOT NULL,
+			uploaded_at       TEXT NOT NULL,
+			PRIMARY KEY (agent, session_id)
+		);
+		CREATE INDEX IF NOT EXISTS uploaded_transcripts_path
+			ON uploaded_transcripts (agent, local_path);`,
 	}
 	for i := ver; i < len(steps); i++ {
 		if _, err := s.db.Exec(steps[i]); err != nil {
@@ -103,6 +113,88 @@ func (s *Store) migrate() error {
 		if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
 			return fmt.Errorf("bump user_version to %d: %w", i+1, err)
 		}
+	}
+	return nil
+}
+
+type TranscriptState struct {
+	SHA256     string
+	ByteSize   int64
+	LocalMTime string
+}
+
+// TranscriptPathState returns the last raw transcript state recorded for
+// a local file path. It lets the daemon skip unchanged historical files
+// without re-reading and re-gzipping them on every scan.
+func (s *Store) TranscriptPathState(agent, localPath string) (TranscriptState, bool, error) {
+	const q = `
+		SELECT sha256, byte_size, local_mtime
+		FROM uploaded_transcripts
+		WHERE agent = ? AND local_path = ?
+		LIMIT 1
+	`
+	var state TranscriptState
+	err := s.db.QueryRow(q, agent, localPath).Scan(&state.SHA256, &state.ByteSize, &state.LocalMTime)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TranscriptState{}, false, nil
+	}
+	if err != nil {
+		return TranscriptState{}, false, fmt.Errorf("query uploaded_transcripts path: %w", err)
+	}
+	return state, true, nil
+}
+
+// TranscriptSHA returns the last successfully uploaded raw transcript
+// hash for an agent session.
+func (s *Store) TranscriptSHA(agent, sessionID string) (string, bool, error) {
+	const q = `SELECT sha256 FROM uploaded_transcripts WHERE agent = ? AND session_id = ?`
+	var sha string
+	err := s.db.QueryRow(q, agent, sessionID).Scan(&sha)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("query uploaded_transcripts: %w", err)
+	}
+	return sha, true, nil
+}
+
+// MarkTranscriptUploaded records the content hash of the latest raw JSONL
+// snapshot accepted by the server.
+func (s *Store) MarkTranscriptUploaded(
+	agent,
+	sessionID,
+	localPath,
+	sha string,
+	byteSize,
+	compressedSize int64,
+	localMTime time.Time,
+) error {
+	const q = `
+		INSERT INTO uploaded_transcripts
+		    (agent, session_id, local_path, sha256, byte_size, compressed_size, local_mtime, uploaded_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(agent, session_id) DO UPDATE
+		SET local_path      = excluded.local_path,
+		    sha256          = excluded.sha256,
+		    byte_size       = excluded.byte_size,
+		    compressed_size = excluded.compressed_size,
+		    local_mtime     = excluded.local_mtime,
+		    uploaded_at     = excluded.uploaded_at
+	`
+	_, err := s.db.Exec(
+		q,
+		agent,
+		sessionID,
+		localPath,
+		sha,
+		byteSize,
+		compressedSize,
+		localMTime.UTC().Format(time.RFC3339Nano),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert uploaded_transcripts: %w", err)
 	}
 	return nil
 }

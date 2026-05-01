@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,9 +19,16 @@ import (
 	"github.com/superlion8/pmo_agent/daemon/internal/config"
 	"github.com/superlion8/pmo_agent/daemon/internal/notify"
 	"github.com/superlion8/pmo_agent/daemon/internal/projectroot"
+	"github.com/superlion8/pmo_agent/daemon/internal/rawtranscript"
 	"github.com/superlion8/pmo_agent/daemon/internal/store"
 	"github.com/superlion8/pmo_agent/daemon/internal/uploader"
 	"github.com/superlion8/pmo_agent/daemon/internal/watcher"
+)
+
+const (
+	rawTranscriptScanInterval       = 30 * time.Second
+	rawTranscriptQuietFor           = 20 * time.Second
+	maxRawTranscriptCompressedBytes = 50 * 1024 * 1024
 )
 
 // runStart is the daemon's main loop. Foreground only for v0 (per spec
@@ -33,6 +41,7 @@ func runStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	ccRootFlag := fs.String("cc-root", "", "Claude Code transcripts root (default: ~/.claude/projects)")
 	cxRootFlag := fs.String("codex-root", "", "Codex transcripts root (default: ~/.codex/sessions)")
+	uploadRawJSONL := fs.Bool("upload-raw-jsonl", rawJSONLDefaultEnabled(), "upload gzip-compressed raw JSONL snapshots for debugging/search")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -75,6 +84,7 @@ func runStart(args []string) error {
 	}
 
 	cli := uploader.New(cfg.ServerURL, cfg.Token)
+	rawCli := rawtranscript.NewClient(cfg.ServerURL, cfg.Token)
 
 	// Cancel everything on Ctrl-C / SIGTERM.
 	ctx, cancel := signal.NotifyContext(context.Background(),
@@ -107,6 +117,13 @@ func runStart(args []string) error {
 	// Drain non-fatal errors from both watchers.
 	go drainErrors("claude_code", ccWatcher.Errors())
 	go drainErrors("codex", cxWatcher.Errors())
+
+	if *uploadRawJSONL {
+		go runRawTranscriptUploadLoop(ctx, st, rawCli, []rawTranscriptSource{
+			{agent: rawtranscript.AgentClaudeCode, root: ccRoot},
+			{agent: rawtranscript.AgentCodex, root: cxRoot},
+		})
+	}
 
 	// Consumer: takes turns, pushes to backend.
 	doneConsume := make(chan struct{})
@@ -142,6 +159,11 @@ func runStart(args []string) error {
 		cfg.ServerURL, lastN(cfg.Token, 4))
 	fmt.Printf("pmo-agent:   claude_code root=%s\n", ccRoot)
 	fmt.Printf("pmo-agent:   codex       root=%s\n", cxRoot)
+	if *uploadRawJSONL {
+		fmt.Println("pmo-agent:   raw JSONL upload=enabled")
+	} else {
+		fmt.Println("pmo-agent:   raw JSONL upload=disabled")
+	}
 	fmt.Println("pmo-agent: press Ctrl-C to stop")
 
 	// Visible "we're up" feedback. Especially valuable when the daemon
@@ -156,6 +178,113 @@ func runStart(args []string) error {
 		sent.Load(), deduped.Load(), failed.Load())
 
 	return nil
+}
+
+func rawJSONLDefaultEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("PMO_AGENT_UPLOAD_RAW_JSONL")))
+	return v != "0" && v != "false" && v != "no"
+}
+
+type rawTranscriptSource struct {
+	agent string
+	root  string
+}
+
+func runRawTranscriptUploadLoop(
+	ctx context.Context,
+	st *store.Store,
+	cli *rawtranscript.Client,
+	sources []rawTranscriptSource,
+) {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			for _, src := range sources {
+				uploadReadyRawTranscripts(ctx, st, cli, src, time.Now())
+			}
+			timer.Reset(rawTranscriptScanInterval)
+		}
+	}
+}
+
+func uploadReadyRawTranscripts(
+	ctx context.Context,
+	st *store.Store,
+	cli *rawtranscript.Client,
+	src rawTranscriptSource,
+	now time.Time,
+) {
+	for _, path := range rawtranscript.ReadyJSONLFiles(src.root, rawTranscriptQuietFor, now) {
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "raw transcript:", err)
+			continue
+		}
+		if info.Size() == 0 {
+			continue
+		}
+		state, ok, err := st.TranscriptPathState(src.agent, path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "raw transcript:", err)
+			continue
+		}
+		if ok && state.ByteSize == info.Size() && state.LocalMTime == info.ModTime().UTC().Format(time.RFC3339Nano) {
+			continue
+		}
+		snap, err := rawtranscript.BuildSnapshot(src.agent, path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "raw transcript:", err)
+			continue
+		}
+		if snap.CompressedSize > maxRawTranscriptCompressedBytes {
+			fmt.Fprintf(os.Stderr, "raw transcript: skip %s: compressed size %s exceeds 50MB\n", path, humanSize(snap.CompressedSize))
+			continue
+		}
+		prevSHA, ok, err := st.TranscriptSHA(snap.Agent, snap.AgentSessionID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "raw transcript:", err)
+			continue
+		}
+		if ok && prevSHA == snap.SHA256 {
+			if err := st.MarkTranscriptUploaded(
+				snap.Agent,
+				snap.AgentSessionID,
+				snap.LocalPath,
+				snap.SHA256,
+				snap.ByteSize,
+				snap.CompressedSize,
+				snap.LastMTime,
+			); err != nil {
+				fmt.Fprintln(os.Stderr, "raw transcript:", err)
+			}
+			continue
+		}
+		if _, err := cli.Upload(ctx, snap); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			fmt.Fprintln(os.Stderr, "raw transcript upload:", err)
+			continue
+		}
+		if err := st.MarkTranscriptUploaded(
+			snap.Agent,
+			snap.AgentSessionID,
+			snap.LocalPath,
+			snap.SHA256,
+			snap.ByteSize,
+			snap.CompressedSize,
+			snap.LastMTime,
+		); err != nil {
+			fmt.Fprintln(os.Stderr, "raw transcript:", err)
+			continue
+		}
+		fmt.Printf("pmo-agent: raw %s session %s uploaded (%s gz)\n",
+			snap.Agent, shortID(snap.AgentSessionID), humanSize(snap.CompressedSize))
+	}
 }
 
 // mergeTurns fan-ins two Turn channels into one. The merged channel
