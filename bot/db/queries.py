@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from .client import sb
+from .client import sb, sb_admin
 
 
 def lookup_profile(handle: str) -> Optional[dict[str, Any]]:
@@ -28,6 +28,38 @@ def lookup_profile(handle: str) -> Optional[dict[str, Any]]:
         .execute()
     )
     return res.data if res and res.data else None
+
+
+def lookup_by_feishu_open_id(open_id: str) -> Optional[dict[str, Any]]:
+    """Resolve a Feishu open_id to the linked pmo_agent profile.
+
+    Returns the joined profile row (id, handle, display_name) or None
+    if the user hasn't bound their Feishu account yet.
+
+    The bot uses this to answer "我做了啥" without asking who you are.
+    """
+    if not open_id:
+        return None
+    # feishu_links is RLS-restricted to row owners; the bot reads via
+    # service role to look up arbitrary open_ids.
+    res = (
+        sb_admin()
+        .table("feishu_links")
+        .select("user_id, feishu_name, feishu_email, profiles!inner(handle, display_name)")
+        .eq("feishu_open_id", open_id)
+        .maybe_single()
+        .execute()
+    )
+    if not res or not res.data:
+        return None
+    row = res.data
+    profile = row.get("profiles") or {}
+    return {
+        "user_id": row["user_id"],
+        "handle": profile.get("handle"),
+        "display_name": profile.get("display_name"),
+        "feishu_name": row.get("feishu_name"),
+    }
 
 
 def list_profiles() -> list[dict[str, Any]]:
@@ -52,31 +84,32 @@ def recent_turns(
 ) -> list[dict[str, Any]]:
     """Turns for one user, newest-first, optionally filtered by date / project.
 
-    project_root matches by ilike prefix — '/Users/a/Desktop/pmo_agent'
-    catches turns from .../pmo_agent, .../pmo_agent/daemon, etc.
+    project_root matches the canonical project_root column. Older rows
+    without that column populated fall back to the legacy path heuristic.
     """
+    fetch_limit = 1000 if project_root else limit
     q = (
         sb()
         .table("turns")
         .select(
-            "id, agent, agent_session_id, project_path, turn_index, "
+            "id, agent, agent_session_id, project_path, project_root, turn_index, "
             "user_message, agent_summary, device_label, "
             "user_message_at, agent_response_at"
         )
         .eq("user_id", user_id)
         .order("user_message_at", desc=True)
-        .limit(limit)
+        .limit(fetch_limit)
     )
     if since_iso:
         q = q.gte("user_message_at", since_iso)
     if until_iso:
         q = q.lte("user_message_at", until_iso)
-    if project_root:
-        # Match the root and any sub-paths.
-        q = q.ilike("project_path", f"{project_root}%")
 
     res = q.execute()
-    return res.data or []
+    rows = res.data or []
+    if project_root:
+        rows = [r for r in rows if project_root_for_row(r) == project_root][:limit]
+    return rows
 
 
 def project_overview(user_id: str) -> list[dict[str, Any]]:
@@ -120,11 +153,7 @@ def turn_counts_by_window(
     by_project: dict[str, int] = {}
     by_day: dict[str, int] = {}
     for r in rows:
-        # project_root heuristic mirrors web/lib/grouping.ts:
-        # first 4 path components after the leading slash.
-        path = r.get("project_path") or ""
-        parts = path.lstrip("/").split("/") if path else []
-        root = "/" + "/".join(parts[:4]) if len(parts) > 4 else (path or "(unknown)")
+        root = project_root_for_row(r)
         by_project[root] = by_project.get(root, 0) + 1
 
         day = r["user_message_at"][:10]  # YYYY-MM-DD prefix
@@ -144,3 +173,18 @@ def turn_counts_by_window(
             reverse=True,
         ),
     }
+
+
+def project_root_for_row(row: dict[str, Any]) -> str:
+    """Return canonical project_root with legacy fallback for old rows."""
+    root = row.get("project_root")
+    if isinstance(root, str) and root:
+        return root
+    return legacy_project_root_from_path(row.get("project_path"))
+
+
+def legacy_project_root_from_path(path: Any) -> str:
+    if not isinstance(path, str) or not path:
+        return "(unknown)"
+    parts = path.lstrip("/").split("/")
+    return "/" + "/".join(parts[:4]) if len(parts) > 4 else path

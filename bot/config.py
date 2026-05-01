@@ -25,9 +25,13 @@ class Settings(BaseSettings):
     feishu_encrypt_key: str = ""
     feishu_verification_token: str = ""
 
-    # ── Supabase (read-only via anon key; RLS allows public select) ──
+    # ── Supabase ──
+    # anon_key  — RLS-respecting reads of public tables (profiles, turns).
+    # service_role_key — bypasses RLS; used ONLY for feishu_links lookups
+    #   so the bot can resolve sender_open_id → linked user_id.
     supabase_url: str
     supabase_anon_key: str
+    supabase_service_role_key: str = ""
 
     # ── Web base URL — used in answers to link out to /u/<handle> ──
     web_base_url: str = "https://pmo-agent-sigma.vercel.app"

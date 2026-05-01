@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from agent import runner as agent_runner
 from config import settings
+from db import queries as db_queries
 from feishu import cards
 from feishu import events as feishu_events
 from feishu import post_format
@@ -130,6 +131,19 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         ev.chat_type, ev.chat_id, ev.sender_open_id, ev.text[:80],
     )
 
+    # Resolve "who is asking" via feishu_links. None means the user
+    # hasn't bound their account yet — agent will fall back to handle-
+    # based parsing as before.
+    sender_identity: dict | None = None
+    try:
+        sender_identity = db_queries.lookup_by_feishu_open_id(ev.sender_open_id)
+    except Exception as e:
+        # Service role missing? Permission issue? Don't kill the request
+        # — just log and proceed without identity context.
+        logger.warning("feishu_links lookup failed for %s: %s", ev.sender_open_id, e)
+
+    framed_question = _frame_question(ev.text, sender_identity)
+
     # 1) ack with reaction (don't await — non-blocking, best-effort).
     asyncio.create_task(feishu_client.add_reaction(ev.message_id, "Get"))
 
@@ -142,7 +156,7 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         logger.warning("could not send card; falling back to plain text reply")
         try:
             answer = await asyncio.wait_for(
-                agent_runner.answer(conversation_key, ev.text),
+                agent_runner.answer(conversation_key, framed_question),
                 timeout=settings.agent_max_duration_seconds,
             )
         except Exception as e:
@@ -167,7 +181,7 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         )
 
     try:
-        async for event in agent_runner.answer_streaming(conversation_key, ev.text):
+        async for event in agent_runner.answer_streaming(conversation_key, framed_question):
             if event["kind"] == "tool":
                 # Mark previous tool as done — the LLM has moved on.
                 if steps and not steps[-1].get("done"):
@@ -213,6 +227,29 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
     #    naturally.
     final_text = answer_text or "(空回答 — 试试换个问法?)"
     await _send_answer_with_images(parent_message_id=ev.message_id, text=final_text)
+
+
+def _frame_question(text: str, sender: dict | None) -> str:
+    """Prepend a structured "who is asking" line to the user's text.
+
+    The LLM treats this as ground truth context: when the user says
+    "我做了啥", the agent already knows "我" maps to a specific
+    handle / user_id and skips the lookup_user dance.
+
+    Format is deliberately machine-readable (`[asker]: ...`) but kept
+    in the user message rather than hidden in the system prompt — that
+    way the SDK's per-conversation history sees it next to each turn,
+    so context for follow-up messages is consistent.
+    """
+    if sender and sender.get("handle"):
+        meta = (
+            f"[asker] handle=@{sender['handle']} "
+            f"user_id={sender['user_id']} "
+            f"display_name={sender.get('display_name') or sender.get('feishu_name') or '-'}"
+        )
+    else:
+        meta = "[asker] (this Feishu user has not bound their pmo_agent account yet)"
+    return f"{meta}\n\n{text}"
 
 
 # Pattern: [IMAGE:img_v2_abc...] anywhere in the text. We're loose

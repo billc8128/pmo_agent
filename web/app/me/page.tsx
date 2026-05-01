@@ -11,12 +11,15 @@ import { serverComponentClient } from '@/lib/supabase-server';
 import { OnboardingForm } from './onboarding-form';
 import { ProfileEditor } from './profile-editor';
 import { PatManager } from './pat-manager';
+import { FeishuLink } from './feishu-link';
 
 export const dynamic = 'force-dynamic';
 
 export default async function MePage(props: PageProps<'/me'>) {
   const sp = await props.searchParams;
   const next = typeof sp.next === 'string' ? sp.next : '';
+  const feishuStatus = typeof sp.feishu === 'string' ? sp.feishu : '';
+  const feishuReason = typeof sp.reason === 'string' ? sp.reason : '';
 
   const sb = await serverComponentClient();
 
@@ -78,6 +81,13 @@ export default async function MePage(props: PageProps<'/me'>) {
     .eq('user_id', user.id)
     .order('created_at', { ascending: false });
 
+  // Load the Feishu link if any. RLS scopes this to the current user.
+  const { data: feishuLink } = await sb
+    .from('feishu_links')
+    .select('feishu_name, feishu_email, linked_at')
+    .eq('user_id', user.id)
+    .maybeSingle();
+
   return (
     <main className="mx-auto max-w-2xl px-4 py-12">
       <header className="mb-8 flex items-end justify-between gap-4 border-b border-zinc-200 pb-6 dark:border-zinc-800">
@@ -108,6 +118,17 @@ export default async function MePage(props: PageProps<'/me'>) {
         </form>
       </header>
 
+      {feishuStatus === 'ok' && (
+        <div className="mb-6 rounded border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950 dark:text-emerald-200">
+          Feishu account linked successfully.
+        </div>
+      )}
+      {feishuStatus === 'error' && (
+        <div className="mb-6 rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
+          Feishu link failed: {feishuReason || 'unknown'}
+        </div>
+      )}
+
       <section className="mb-10">
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
           Profile
@@ -116,6 +137,13 @@ export default async function MePage(props: PageProps<'/me'>) {
           initialHandle={profile.handle}
           initialDisplayName={profile.display_name ?? ''}
         />
+      </section>
+
+      <section className="mb-10">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+          Feishu
+        </h2>
+        <FeishuLink link={feishuLink ?? null} />
       </section>
 
       <section>

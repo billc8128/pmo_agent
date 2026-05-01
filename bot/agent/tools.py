@@ -96,8 +96,8 @@ async def lookup_user(args: dict) -> dict[str, Any]:
     "agent summaries, and metadata (agent type, project, device). "
     "Use this when you need concrete activity to summarize.\n\n"
     "since / until are ISO-8601 timestamps. project_root is an "
-    "absolute path like '/Users/a/Desktop/pmo_agent' (matches sub-paths "
-    "too). Pass user_id from a previous lookup_user call.",
+    "canonical absolute path like '/Users/a/Desktop/pmo_agent'. "
+    "Pass user_id from a previous lookup_user call.",
     {
         "user_id": str,
         "since": str,
