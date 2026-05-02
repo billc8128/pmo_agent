@@ -323,12 +323,36 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    `user_ids: List[str]` (NOT `user_id_list`), `time_min: str`,
    `time_max: str`, `include_external_calendar: bool` (we pass
    `false`), `only_busy: bool` (we pass `true`). Use
-   `user_id_type="open_id"` on the request. If any returned slot
-   overlaps the requested window, mark the row `failed` (with
-   `error="conflict"` and the conflict payload in `result`) and
-   return `{conflict: [{open_id, busy_event_summary}]}` to the
-   agent. The agent reasks; a subsequent retry uses a *new*
-   message_id so a fresh row is created.
+   `user_id_type="open_id"` on the request.
+
+   If any returned slot overlaps the requested window, **the action
+   is complete with a "conflict" outcome — NOT a failure**. Mark the
+   row `status='success'` with
+   `result.outcome="conflict"`, `result.conflicts=[{open_id,
+   busy_event_summary}, ...]`, and `target_id=NULL`. Return that
+   result to the agent (it surfaces "albert 那个时间已经有会了，要换
+   时间吗？" to the user). A subsequent retry of the *same*
+   utterance hits Phase 1a's idempotency check, sees the cached
+   conflict, and returns it without re-calling Feishu. A new
+   utterance with a different time produces a different
+   `logical_key`, so a fresh row is created cleanly.
+
+   **Why not `failed`** (the v9 design): `failed` is the
+   "retryable technical error" status — Phase 1a's failed-status
+   branch automatically reclaims and re-executes via
+   `update_for_retry`. A conflict isn't a technical error; it's a
+   business outcome the user has to act on. Treating it as `failed`
+   meant a duplicate webhook would re-issue the freebusy call (and
+   if the conflicting meeting got cancelled in between, would
+   silently succeed in scheduling — a behavior the user never
+   asked for). Storing it as `success+outcome=conflict` makes the
+   idempotency contract clean: the user got the answer, repeating
+   the question gives the same answer.
+
+   The `outcome` discriminator on `result` is the same pattern used
+   by `reconciliation_kind` in §5.3 — it lets `status` retain pure
+   semantics ("did the side-effect-or-decision land?") while
+   richer semantics live in `result`.
 4. **Phase 2.2 — Create event**:
    `client.calendar.v4.calendar_event.create(CreateCalendarEventRequest
    .builder().calendar_id(bot_calendar_id).request_body(...).build())`
@@ -408,7 +432,7 @@ path** in code, not the URL-style name:
 | Concept | API endpoint URL | lark-oapi Python SDK path |
 |---|---|---|
 | Create calendar | `/open-apis/calendar/v4/calendars` | `client.calendar.v4.calendar.create(...)` |
-| Resolve user's primary calendar | `/open-apis/calendar/v4/calendars/primary` | `client.calendar.v4.calendar.primarys(...)` (note plural method name; takes `user_ids: List[str]`) |
+| Resolve user's primary calendar | `/open-apis/calendar/v4/calendars/primarys` (note plural — verified in `lark_oapi/api/calendar/v4/model/primarys_calendar_request.py:25`) | `client.calendar.v4.calendar.primarys(...)` (plural method name; takes `user_ids: List[str]`) |
 | Get calendar event | `/open-apis/calendar/v4/calendars/{...}/events/{...}` | `client.calendar.v4.calendar_event.get(...)` (requires both `calendar_id` and `event_id`) |
 | Create calendar event | `/open-apis/calendar/v4/calendars/{...}/events` | `client.calendar.v4.calendar_event.create(...)` (requires `calendar_id`) |
 | Delete calendar event | `/open-apis/calendar/v4/calendars/{...}/events/{...}` | `client.calendar.v4.calendar_event.delete(...)` (requires both `calendar_id` and `event_id`) |
@@ -461,10 +485,18 @@ Resolution rules:
   confirmations.
 - If `last:true`: look up `bot_actions WHERE chat_id=<current> AND
   sender_open_id=<current> AND action_type='schedule_meeting' AND
-  status='success' ORDER BY created_at DESC LIMIT 1`. **The
-  `sender_open_id` filter matters in groups**: without it, user A
-  could cancel a meeting user B asked the bot to schedule. Requires
-  `(chat_id, sender_open_id)` on `bot_actions` (see §6.2).
+  status='success' AND target_id IS NOT NULL ORDER BY created_at
+  DESC LIMIT 1`. **The `sender_open_id` filter matters in groups**:
+  without it, user A could cancel a meeting user B asked the bot
+  to schedule. **The `target_id IS NOT NULL` filter matters
+  post-iter-10**: §3.3 Phase 2.1 now stores freebusy conflicts as
+  `success` rows with `target_id=NULL` (they're "I checked and
+  there was a conflict" no-ops, not actual scheduled meetings).
+  Without this filter, `last:true` would resolve to a conflict row
+  that has no event to cancel. Both filters together match the
+  `last_bot_action_for_sender_in_chat` helper's `require_target=True`
+  default (§11 step 2). Requires `(chat_id, sender_open_id)` on
+  `bot_actions` (see §6.2).
 
 **Internal sequence**:
 
@@ -729,37 +761,83 @@ Docx in the bot's "文档柜" folder, returns
 does NOT accept Markdown directly. Two viable paths, to confirm during
 implementation:
 
-- **Path A (preferred)**: a **3-step** flow, NOT a single call. The
-  v6 spec described this as a one-shot `import_tasks.create` with
-  body=Markdown bytes — that was wrong. The actual `ImportTask` model
+- **Path A (preferred)**: a **3-step async flow**, NOT a single
+  call. The v6 spec described this as a one-shot
+  `import_tasks.create` with body=Markdown bytes — that was wrong.
+  The actual `ImportTask` model
   (`lark_oapi/api/drive/v1/model/import_task.py`) takes
   `file_token`, `file_extension`, `type`, `file_name`, `point` —
   i.e. the markdown source has to live in Drive first as a file
   whose token we then hand to the importer.
 
+  Each step that produces a Feishu artifact must persist its handle
+  to `bot_actions` immediately — same multi-step atomicity rule as
+  §3.3 schedule_meeting (Codex iter9 #1 / iter10 #2).
+
   1. **Upload the markdown source as a `.md` file**:
      `client.drive.v1.file.upload_all(file_name="meeting-notes.md",
      parent_type="explorer", parent_node=<bot_workspace.docs_folder_token>,
-     size=<bytes>, file=<bytes_io>)` → returns `file_token`. (SDK
-     attribute is singular `file`, not `files` — see §3.3bis.)
-  2. **Create the import task**:
+     size=<bytes>, file=<bytes_io>)` → returns `source_file_token`.
+     (SDK attribute is singular `file`, not `files` — see §3.3bis.)
+  2. **Phase 2.1.5 persist** (intermediate state): UPDATE the
+     `pending` row with `result.source_file_token=<from step 1>`.
+     The `.md` is now a real artifact in Drive; if any later step
+     fails, we need to know its token to clean it up.
+  3. **Create the import task**:
      `client.drive.v1.import_task.create(import_task=ImportTask(
-     file_token=<from step 1>, file_extension="md", type="docx",
-     file_name="<title>.docx", point=ImportTaskMountPoint(
-     mount_type=1, mount_key=<docs_folder_token>)))` →
-     returns `ticket` (the async task id). (SDK attribute is
-     singular `import_task`.)
-  3. **Poll for completion**: `client.drive.v1.import_task.get(ticket=<...>)`
-     every ~500 ms until `job_status == 0` (success) or terminal
-     failure. The completed result includes `token` (the new docx's
-     `doc_token`) and `url`.
+     file_token=<source_file_token>, file_extension="md",
+     type="docx", file_name="<title>.docx",
+     point=ImportTaskMountPoint(mount_type=1,
+     mount_key=<docs_folder_token>)))` → returns `ticket` (the async
+     task id). (SDK attribute is singular `import_task`.)
+  4. **Phase 2.2.5 persist**: UPDATE with
+     `result.import_ticket=<from step 3>`. The async import is now
+     in flight on Feishu's side; even if our process dies, we have
+     a record that there's an in-flight import to reconcile.
+  5. **Poll for completion**:
+     `client.drive.v1.import_task.get(ticket=<...>)` every ~500 ms
+     until `job_status == 0` (success) or terminal failure
+     (`job_status` is a known error code — consult the SDK docs at
+     poll-result time). Set a **5-minute total timeout** on this
+     poll loop. (The number is a defensive guess: typical
+     meeting-notes-sized markdown imports complete in seconds, but
+     Feishu has documented multi-minute waits under load. If
+     real-world timeouts hit the 5-minute cap with non-trivial
+     frequency, raise it; if 99p completes in < 10s, lower it
+     and surface "import is unusually slow" earlier as a
+     reconciled_unknown signal.)
+  6. **Phase 2.3.5 persist (on success)**: UPDATE with
+     `target_id=<doc_token from poll>`, `target_kind="docx"`,
+     `result.url=<...>`. Now undo can find the doc.
+  7. **Phase 3 — Persist terminal status**: UPDATE `status='success'`.
 
-  All three calls happen inside Phase 2 of the three-phase write
-  pattern (§5.1). If any step fails, mark `bot_actions` `failed`
-  with which step errored. The intermediate `.md` file in Drive can
-  be deleted on success (best-effort cleanup) or left as a backup
-  of the source markdown — implementation choice, leave it for v1
-  simplicity.
+  **Failure / uncertainty handling**:
+  - **Step 1 (upload) fails**: no Feishu artifact yet; mark `failed`
+    with `error="upload_failed: ..."`. Retry is safe.
+  - **Step 3 (import_task.create) fails after step 1 succeeded**:
+    `.md` is in Drive but no import has started. Best-effort delete
+    the orphan `.md` (`file.delete(file_token=source_file_token,
+    type="file")`); on cleanup success mark `failed`. On cleanup
+    failure mark `reconciled_unknown(partial_success)` with
+    `target_id=source_file_token` and `target_kind="file"` so undo
+    can clean it later.
+  - **Step 5 (poll) returns terminal failure** (Feishu reports the
+    import errored): no docx was produced. Best-effort delete the
+    `.md`; mark the row `failed`.
+  - **Step 5 (poll) times out after 5 min OR network error during
+    poll**: we **do not know** whether Feishu finished the import.
+    Mark `reconciled_unknown` with `kind=partial_success`,
+    `target_id=NULL` (we have no doc_token to point at),
+    `result.source_file_token=...`,
+    `result.import_ticket=...`. Surface to the user: "I started
+    importing your notes but lost track of whether it finished —
+    please check 文档柜 and let me know if you want me to retry or
+    delete what's there." Undo on this row can re-poll the ticket
+    and either delete the resulting docx (if found) or just delete
+    the `.md`.
+  - **Step 6 persist (DB UPDATE) fails after step 5 success**: same
+    pre-2.2.5-style residual crash window as in §3.3 — log the
+    `doc_token` to stderr at INFO level so an operator can recover.
 
 - **Path B (fallback)**: `client.docx.v1.document.create` (empty
   doc), then parse Markdown into Docx blocks ourselves and call
@@ -1233,6 +1311,18 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
     if recent:
         if recent["status"] == "success":
             return _ok({**recent["result"], "deduplicated_from_logical_key": True})
+        if recent["status"] == "reconciled_unknown":
+            # partial_success orphan — the artifact exists in Feishu
+            # but the action couldn't fully complete (e.g. attendees
+            # didn't get invited, or doc import polling timed out).
+            # We deliberately block retry to avoid duplicate
+            # artifacts; the user must run undo first or accept the
+            # orphan and ask again with a fresh utterance.
+            return _err(
+                "a previous identical call left a partial result "
+                "in Feishu (target_id={}); please ask me to undo "
+                "before re-issuing".format(recent.get("target_id"))
+            )
         # status == 'pending' — another caller is in flight.
         return _err("a previous identical call is in flight")
 
@@ -1403,7 +1493,7 @@ The three-phase pattern gives:
 | --- | --- | --- | --- |
 | **Transport** | `bot/feishu/events.py:_seen_events` LRU (`event_id`) | Feishu webhook redeliveries within the same process | Process restarts; user retypes the same instruction |
 | **Per-message idempotency** | `bot_actions UNIQUE(message_id, action_type)` | The same Feishu `message_id` reaching us twice (cross-process, cross-restart) | A *new* user message that says the same thing — different `message_id`, no constraint hit |
-| **Logical short-window exclusion** | `bot_actions_logical_locked_uniq` partial UNIQUE on `(logical_key) WHERE logical_key_locked = true AND status IN ('pending','success')` (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args. **Cross-process and cross-instance**: enforced by Postgres, not by app-layer reads. | Anything older than 60 s (lazy GC sets `logical_key_locked=false`); intentional re-issuance after that |
+| **Logical short-window exclusion** | `bot_actions_logical_locked_uniq` partial UNIQUE on `(logical_key) WHERE logical_key_locked = true AND status IN ('pending','success','reconciled_unknown')` (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args. **Cross-process and cross-instance**: enforced by Postgres, not by app-layer reads. **Also blocks duplicate side effects when a partial_success orphan exists** — see §6.2 lock-behavior table. | After 60s for `success` rows (lazy GC clears the lock); for `partial_success` orphans, blocked until `undo_last_action` runs and clears the lock. Intentional re-issuance worked into a fresh utterance still works after that. |
 
 `logical_key` is a stable hash over `(chat_id, sender_open_id,
 action_type, canonical_args)` — the same parameters that uniquely
@@ -1629,7 +1719,8 @@ CREATE INDEX bot_actions_chat_sender_recent_idx
 -- target_id lookups) keep working regardless of lock state.
 CREATE UNIQUE INDEX bot_actions_logical_locked_uniq
   ON bot_actions (logical_key)
-  WHERE logical_key_locked = true AND status IN ('pending', 'success');
+  WHERE logical_key_locked = true
+    AND status IN ('pending', 'success', 'reconciled_unknown');
 
 ALTER TABLE bot_actions ENABLE ROW LEVEL SECURITY;
 -- Service role only; no end-user policy.
@@ -1693,15 +1784,24 @@ or `asyncpg`, the same dispatch logic applies but reads
 `exception.diag.constraint_name` directly — swap the regex for the
 attribute access; nothing else changes.
 
-**Lock clearing on terminal status**: every helper that transitions
-a row to a terminal status (`failed`, `undone`, `reconciled_unknown`)
-**must also set `logical_key_locked = false`** in the same UPDATE.
-The partial UNIQUE predicate (`AND status IN ('pending','success')`)
-makes this redundant for index correctness — a non-active row would
-fall out of the index regardless — but explicit lock clearing makes
-queries that bypass the index (e.g. ad-hoc admin SELECTs filtering on
-`logical_key_locked` directly) behave intuitively. Belt and
-suspenders.
+**Lock behavior on status transitions** — NOT a uniform "always
+clear":
+
+| Transition | Final `logical_key_locked` | Reason |
+|---|---|---|
+| `pending → success` | `true` (until 60s GC) | The action completed; dedup window starts. |
+| `pending → failed` | `false` (cleared) | The Feishu call errored cleanly; retry on the same logical_key is safe. |
+| `pending → undone` | `false` (cleared) | The action was reversed; the logical request can be re-issued. |
+| `pending → reconciled_unknown(stuck_pending)` (case A in §5.3) | `false` (cleared) | We don't know what happened on Feishu; further info needs human verification. Retry with a fresh request is allowed (will create a new row). |
+| `pending → reconciled_unknown(partial_success)` (case B in §3.3 / §3.8) | **`true` (kept)** | Feishu artifact exists in a known location (`target_id` is set). A duplicate call would create a second artifact. Lock stays until undo runs (which transitions to `undone` and clears the lock). |
+
+The previous v9 design cleared `logical_key_locked` on every
+transition out of `pending`. That works for the three "no
+artifact" terminals but **breaks for partial_success**: a duplicate
+request would slip past dedup and create a second event/doc while
+the first one still sits orphaned in Feishu. Iter-10 reviewer
+caught this. Fix: split the helper into two (or pass `kind` to a
+single helper) so partial_success preserves the lock.
 
 ```sql
 -- mark_bot_action_failed
@@ -1715,14 +1815,39 @@ UPDATE bot_actions
    SET status='undone', logical_key_locked=false, updated_at=now()
  WHERE id=$id;
 
--- get_bot_action lazy GC for stuck pending
+-- mark_bot_action_reconciled_unknown(kind)
+-- 'stuck_pending' → clear the lock (we don't know if anything was done)
+-- 'partial_success' → KEEP the lock (we know an orphan exists)
+UPDATE bot_actions
+   SET status='reconciled_unknown',
+       error=$err,
+       result = jsonb_set(
+                  COALESCE(result,'{}'::jsonb),
+                  '{reconciliation_kind}', to_jsonb($kind::text)),
+       logical_key_locked = (CASE WHEN $kind = 'partial_success'
+                                  THEN true ELSE false END),
+       updated_at=now()
+ WHERE id=$id;
+
+-- get_bot_action lazy GC for stuck pending — always clears, since
+-- by definition stuck-pending GC is the case-A path
 UPDATE bot_actions
    SET status='reconciled_unknown',
        error='reconciled: pending too long',
-       logical_key_locked=false, updated_at=now()
+       result = jsonb_set(
+                  COALESCE(result,'{}'::jsonb),
+                  '{reconciliation_kind}', '"stuck_pending"'),
+       logical_key_locked=false,
+       updated_at=now()
  WHERE id=$id AND status='pending'
    AND created_at < now() - interval '5 minutes';
 ```
+
+**Implication for the partial UNIQUE index**: the predicate now
+includes `'reconciled_unknown'` so partial_success rows participate
+in the dedup index. This means `get_locked_by_logical_key` will
+return them. The §5.1 skeleton's Phase 0 must handle this case —
+see updated logic.
 
 `chat_id` is **required** (NOT NULL) because both `cancel_meeting`
 (§3.4) and `undo_last_action` (§3.9) need to scope "last action" to
@@ -1892,6 +2017,11 @@ agent commonly mishandles. For traceability:
 | 49 | `list_my_meetings` needed the user's primary `calendar_id` to call `calendar_event.list`, but spec didn't say how to get it | §3.5 explicitly invokes `client.calendar.v4.calendar.primarys(user_ids=[target], user_id_type="open_id")` and pulls `calendar.calendar_id` from the response. Added to the §3.3bis SDK callout table. Caught in iter-9 Codex review. |
 | 50 | Doc undo said `drive.v1.file.delete` but `DeleteFileRequest` requires both `file_token` and `type` (verified in `lark_oapi/api/drive/v1/model/delete_file_request.py`) | §3.8 records `target_id=<doc_token>` + `target_kind="docx"`; §3.9 calls `client.drive.v1.file.delete(file_token=target_id, type="docx")`. Caught in iter-9 Codex review. |
 | 51 | §3.3bis listed freebusy URL as `/open-apis/calendar/v4/freebusy/batch_query`, but installed SDK uses `/freebusy/batch` (`lark_oapi/api/calendar/v4/model/batch_freebusy_request.py:25`) | §3.3bis row updated; verification cite added inline. Caught in iter-9 Codex review. |
+| 52 | v9's `mark_bot_action_reconciled_unknown` cleared `logical_key_locked`, AND the partial UNIQUE predicate excluded `reconciled_unknown` — both rules combined meant a `partial_success` orphan did NOT block duplicate calls. A second message with the same logical request would create a second event/doc while the first orphan still sat in Feishu | (a) Predicate now `WHERE logical_key_locked = true AND status IN ('pending','success','reconciled_unknown')`. (b) `mark_bot_action_reconciled_unknown` takes a `kind` parameter; `partial_success` keeps the lock, `stuck_pending` clears it. (c) §5.1 Phase 0 explicitly handles a returned `reconciled_unknown(partial_success)` row by returning "please undo first" rather than re-running. Caught in iter-10 Codex review. |
+| 53 | `create_meeting_doc` Path A's async `import_task` flow had a single coarse "any failure → mark_failed" path. After `import_task.create` returns a ticket, the import is still in flight server-side — polling failure / timeout doesn't mean the import didn't complete. Retry could create a duplicate Docx; undo would have no token to point at | §3.8 Path A rewritten with the same Phase 2.X.5 intermediate-persist pattern as §3.3: persist `source_file_token` after upload, persist `import_ticket` after import_task.create, persist `target_id=doc_token` after poll-success. Polling timeout / network error → `reconciled_unknown(partial_success)` so duplicates are blocked; definitive Feishu-side failure → `failed` with cleanup. 5-minute total poll timeout. Caught in iter-10 Codex review. |
+| 54 | freebusy conflicts were stored as `status='failed'`, but Phase 1a's failed-status branch automatically reclaims and re-executes via `update_for_retry` — meaning a duplicate webhook would re-issue the freebusy call, and if the conflicting meeting got cancelled in the meantime, would silently schedule the new meeting (a behavior the user never reauthorized) | §3.3 Phase 2.1 now stores conflicts as `status='success'` + `result.outcome='conflict'` + `result.conflicts=[...]`. The idempotency check returns the cached conflict on retry without re-calling Feishu. The `outcome` discriminator on `result` is the same pattern used by `reconciliation_kind` in §5.3 — `status` retains pure semantics ("did the side-effect-or-decision land?") while richer business outcomes live in `result`. Caught in iter-10 Codex review. |
+| 55 | §11 step 2's helper list didn't enumerate the new DB primitives v9 introduced (`record_bot_action_target_pending` for intermediate persist, `mark_bot_action_reconciled_unknown(kind=...)` for partial-success vs stuck-pending) — implementers reading the spec would build only the helpers v8 mentioned and discover the gap mid-implementation | §11 step 2 rewritten as a one-line-per-helper checklist covering all v10 primitives, including the iter-10 additions. Caught in iter-10 Codex review. |
+| 56 | §3.3bis listed primarys URL as `/open-apis/calendar/v4/calendars/primary` (singular), but installed SDK uses `/calendars/primarys` (plural — `lark_oapi/api/calendar/v4/model/primarys_calendar_request.py:25`) | §3.3bis row corrected with cite. The SDK call snippet (`client.calendar.v4.calendar.primarys`) was already correct; only the URL column was wrong. Caught in iter-10 Codex review. |
 
 ---
 
@@ -1911,19 +2041,55 @@ internals.
    console and publish a new app version. **All later steps assume
    scopes are live**; without them every Feishu API call 401s.
 1. **Migrations** `0010` + `0011` — schema first, no app changes.
-2. **`db/queries.py`** — add the new functions for `bot_actions`
-   (`get_bot_action`, `insert_bot_action_pending` — must distinguish
-   PostgREST 409s by constraint name (`bot_actions_message_action_uniq`
-   vs `bot_actions_logical_locked_uniq`, both defined in §6.2) and
-   raise `MessageActionConflict` / `LogicalKeyConflict` accordingly;
-   `update_for_retry`, `mark_bot_action_success`,
-   `mark_bot_action_failed`, `mark_bot_action_undone`,
-   `last_bot_action_for_sender_in_chat`, `compute_logical_key`,
-   `get_locked_by_logical_key` — must inline-flip
-   `logical_key_locked=false` on success rows >60 s old before
-   returning (lazy GC, §5.3 case b), `acquire_bootstrap_lock`,
-   `release_bootstrap_lock`) and `bot_workspace`
-   (`get_bot_workspace`, `update_bot_workspace`).
+2. **`db/queries.py`** — add helpers for `bot_actions`. The full
+   set, with one-line job descriptions:
+   - `get_bot_action(message_id, action_type)` — Phase 1a lookup.
+   - `insert_bot_action_pending(...)` — Phase 1b insert. Distinguishes
+     PostgREST 409s by constraint name (`bot_actions_message_action_uniq`
+     vs `bot_actions_logical_locked_uniq`, both defined in §6.2) and
+     raises `MessageActionConflict` / `LogicalKeyConflict` carrying
+     the existing row.
+   - `record_bot_action_target_pending(action_id, *, target_id,
+     target_kind, result_patch)` — **NEW (§3.3 Phase 2.2.5, §3.8
+     Phases 2.1.5/2.2.5/2.3.5)**: UPDATE the row with `target_id`,
+     `target_kind`, and a JSONB `result` patch (deep-merge), without
+     changing `status` (stays `pending`). Used after each successful
+     intermediate Feishu call in a multi-step Phase 2 so a later
+     failure has something to point at.
+   - `update_for_retry(action_id, *, new_args, logical_key)` —
+     transitions `failed → pending` and re-claims
+     `logical_key_locked=true`; can raise `LogicalKeyConflict` if
+     the slot was won by another caller.
+   - `mark_bot_action_success(action_id, *, target_id, target_kind,
+     result_patch)` — Phase 3 success terminal.
+   - `mark_bot_action_failed(action_id, error)` — clears
+     `logical_key_locked` (technical-error retry permitted).
+   - `mark_bot_action_undone(action_id)` — clears the lock.
+   - `mark_bot_action_reconciled_unknown(action_id, *, kind, error,
+     target_id?, target_kind?, result_patch?)` — **NEW (§5.3 / §3.3
+     Phase 2.3 / §3.8)**: takes `kind ∈ {"stuck_pending",
+     "partial_success"}`. `partial_success` keeps
+     `logical_key_locked = true` (orphan blocks duplicate);
+     `stuck_pending` clears the lock. Writes
+     `result.reconciliation_kind` per the §5.3 contract.
+   - `last_bot_action_for_sender_in_chat(chat_id, sender_open_id, *,
+     statuses=("success","reconciled_unknown"), require_target=True)` —
+     used by `cancel_meeting(last:true)` and
+     `undo_last_action(last_for_me)`. Must accept both `success` and
+     `reconciled_unknown` rows so partial_success orphans can be
+     undone (see §3.9).
+   - `compute_logical_key(*, chat_id, sender_open_id, action_type,
+     canonical_args)` — pure hash function.
+   - `get_locked_by_logical_key(logical_key)` — Phase 0 lookup;
+     must inline-flip `logical_key_locked=false` on success rows
+     >60 s old before returning (lazy GC, §5.3 case b). Returns
+     rows with `status IN ('pending','success','reconciled_unknown')`
+     so partial_success orphans are visible to dedup.
+   - `acquire_bootstrap_lock()` / `release_bootstrap_lock()` — §4
+     workspace re-bootstrap mutex.
+
+   Also add `bot_workspace` helpers: `get_bot_workspace()`,
+   `update_bot_workspace(...)`.
 3. **`feishu/client.py`** — wrap calendar/bitable/docx/contact endpoints.
 4. **Create `bot/scripts/` directory + `bootstrap_bot_workspace.py`** —
    run once against dev env, verify the calendar/base/folder appear
