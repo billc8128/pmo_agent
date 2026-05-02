@@ -183,11 +183,42 @@ input's *shape*, not just sequence):
    it does NOT take names. Use it when the input string looks like
    `name@host.tld` or matches a phone-number regex.
 3. **Otherwise (free-form name / handle / Chinese name)** →
-   `contact.v3.user.search` (the `/open-apis/search/v1/user` endpoint;
-   this is what `lark-cli contact +search-user --query "<name>"` calls
-   under the hood). Returns a list of candidates ranked by relevance;
-   if exactly one match → `resolved`; if 2+ → `ambiguous`; if 0 →
+   raw HTTP call to `/open-apis/search/v1/user`. **The lark-oapi
+   Python SDK does NOT expose this endpoint** — `contact.v3.user`
+   has `batch`, `batch_get_id`, `get`, `list`, `find_by_department`,
+   etc., but no `search` method (verified against
+   `lark_oapi/api/contact/v3/resource/user.py`). The
+   `/open-apis/search/v1/user` endpoint is what `lark-cli contact
+   +search-user --query "<name>"` calls under the hood.
+
+   Implementation in `bot/feishu/client.py`: use `httpx` (already a
+   dependency, see `feishu/client.py:67`) to call the endpoint with
+   `Authorization: Bearer <tenant_access_token>`. Reuse the
+   existing tenant_access_token issuer flow (the same pattern as
+   `fetch_self_info` already does for `/open-apis/bot/v3/info`).
+   Request body: `{"query": "<name>", "page_size": 20}`. Response
+   contains `users: [{open_id, name, en_name, email, department_ids,
+   ...}]` ranked by relevance.
+
+   If exactly one match → `resolved`; if 2+ → `ambiguous`; if 0 →
    `unresolved`.
+
+   **Error handling for the raw HTTP path** (no PostgREST conflict
+   semantics here — just standard HTTP):
+   - Non-2xx → mark the input string as `unresolved` with an
+     `error_tag: "directory_search_failed"`. Let the agent reask the
+     user. Do not raise — fail soft per input string so a single
+     bad name doesn't kill resolution for siblings.
+   - HTTP 401 (token expired) → invalidate the cached
+     tenant_access_token, refetch via the existing issuer (same
+     pattern as `feishu/client.py:67`), retry once. If the second
+     attempt also 401s, surface a generic
+     `directory_search_unavailable` and tell the agent to reply
+     "我现在查不到通讯录，请稍后再试".
+   - HTTP 429 (rate limit) → one retry with 500 ms backoff; if still
+     429, treat as `unresolved` for that input.
+   - HTTP 5xx → one retry with 500 ms backoff; if still 5xx, treat
+     as `unresolved`.
 
 **Spec-vs-reality note**: an earlier draft of this spec described
 `batch_get_id` as a "by name" lookup. That was wrong — Feishu's docs
@@ -276,27 +307,79 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
 2. **Phase 2 — Freebusy pre-check**: call `calendar.v4.freebusy.batch`
    (the SDK method is `freebusy.batch(BatchFreebusyRequest)`, NOT
    `freebusy.list` — the latter is a single-user variant) with body
-   `{user_id_list: [open_id, ...], time_min, time_max,
-   include_external_calendar: false}`. If any returned slot overlaps
-   the requested window, mark the row `failed` (with
-   `error="conflict"` and the conflict payload stored in `result`)
-   and return `{conflict: [{open_id, busy_event_summary}]}` to the
-   agent. The agent reasks the user; a subsequent retry uses a *new*
-   message_id so a fresh row is created.
+   built via `BatchFreebusyRequestBody.builder()`. The body fields,
+   per `lark_oapi/api/calendar/v4/model/batch_freebusy_request_body.py`:
+   `user_ids: List[str]` (NOT `user_id_list`), `time_min: str`,
+   `time_max: str`, `include_external_calendar: bool` (we pass
+   `false`), `only_busy: bool` (we pass `true` to get a smaller
+   payload). If any returned slot overlaps the requested window,
+   mark the row `failed` (with `error="conflict"` and the conflict
+   payload stored in `result`) and return `{conflict: [{open_id,
+   busy_event_summary}]}` to the agent. The agent reasks the user;
+   a subsequent retry uses a *new* message_id so a fresh row is
+   created.
 3. **Phase 2 — Create event**: `calendar.v4.calendar_event.create`
    against the bot's primary calendar with
    `attendee_ability=can_modify_event`.
 4. **Phase 2 — Invite attendees**:
-   `calendar.v4.calendar_event.attendee.create(event_id, body=
+   `calendar.v4.calendar_event_attendee.create(event_id, body=
    {attendees: [{type: "user", user_id: open_id}, ...],
-   need_notification: true})`. The SDK method is `attendee.create`,
-   NOT `attendee.create_batch` (the latter does not exist;
-   `batch_delete` does, but for create the single endpoint accepts a
-   list in the body).
+   need_notification: true})`. **Note the SDK attribute path**: the
+   resource is exposed as `calendar.v4.calendar_event_attendee` (one
+   attribute, with underscore — see
+   `lark_oapi/api/calendar/v4/version.py`), NOT
+   `calendar.v4.calendar_event.attendee` (that path doesn't exist).
+   The HTTP-endpoint URL is `/open-apis/calendar/v4/calendars/{...}/
+   events/{...}/attendees`, but the **Python SDK collapses it into a
+   flat resource name**. Same applies to other nested-looking paths
+   in this spec — see "API endpoint vs SDK attribute path" callout
+   below.
+
+   Also note the method is `.create` (not `.create_batch`); the body
+   accepts a list in the `attendees` field. `batch_delete` exists for
+   removing multiple attendees but there is no `batch_create`.
 5. **Phase 3 — Persist terminal state**: update `bot_actions` to
    `status=success`, store `target_id=event_id`, `target_kind=
    "calendar_event"`, `result={event_id, calendar_id, link, attendees}`.
 6. Return event details to the agent.
+
+#### 3.3bis API endpoint vs lark-oapi SDK attribute path
+
+This spec uses two different naming styles for Feishu APIs and they
+mean different things. Implementers must use the **SDK attribute
+path** in code, not the URL-style name:
+
+| Concept | API endpoint URL | lark-oapi Python SDK path |
+|---|---|---|
+| Create calendar | `/open-apis/calendar/v4/calendars` | `client.calendar.v4.calendar.create(...)` |
+| Create calendar event | `/open-apis/calendar/v4/calendars/{...}/events` | `client.calendar.v4.calendar_event.create(...)` |
+| Add attendees | `/open-apis/calendar/v4/calendars/{...}/events/{...}/attendees` | `client.calendar.v4.calendar_event_attendee.create(...)` (flat, NOT `.calendar_event.attendee`) |
+| Batch freebusy | `/open-apis/calendar/v4/freebusy/batch_query` | `client.calendar.v4.freebusy.batch(...)` |
+| Create Drive folder | `/open-apis/drive/v1/files/create_folder` | `client.drive.v1.file.create_folder(...)` |
+| Upload Drive file | `/open-apis/drive/v1/files/upload_all` | `client.drive.v1.file.upload_all(...)` (singular `file`, NOT plural `files`) |
+| Create import task | `/open-apis/drive/v1/import_tasks` | `client.drive.v1.import_task.create(...)` (singular `import_task`, NOT plural `import_tasks`) |
+| Poll import task | `/open-apis/drive/v1/import_tasks/{ticket}` | `client.drive.v1.import_task.get(...)` |
+| Append doc blocks | `/open-apis/docx/v1/documents/{...}/blocks/{...}/children` | `client.docx.v1.document_block_children.create(...)` |
+| Bitable: create base | `/open-apis/bitable/v1/apps` | `client.bitable.v1.app.create(...)` |
+| Bitable: get base | `/open-apis/bitable/v1/apps/{...}` | `client.bitable.v1.app.get(...)` |
+| Bitable: create table | `/open-apis/bitable/v1/apps/{...}/tables` | `client.bitable.v1.app_table.create(...)` (NOT `app.table.create`) |
+| Bitable: append record | `/open-apis/bitable/v1/apps/{...}/tables/{...}/records` | `client.bitable.v1.app_table_record.create(...)` |
+| Bitable: batch records | (same path with `/batch_create`) | `client.bitable.v1.app_table_record.batch_create(...)` |
+| Bitable: batch delete | (same path with `/batch_delete`) | `client.bitable.v1.app_table_record.batch_delete(...)` |
+
+**Why the gap**: lark-oapi's Python SDK flattens nested REST paths
+into a single attribute on the version object (see
+`lark_oapi/api/calendar/v4/version.py`,
+`lark_oapi/api/drive/v1/version.py`,
+`lark_oapi/api/bitable/v1/version.py`,
+`lark_oapi/api/docx/v1/version.py`). When in doubt, open the
+`version.py` for the relevant API surface and grep for the resource;
+the `self.<name>` attributes are the legal SDK paths.
+
+The rest of this spec uses SDK-style paths (`calendar_event_attendee`,
+`drive.v1.file`, `import_task`, `app_table_record`, etc.). If you
+spot one that looks like a URL path with extra dots, it's probably
+a typo this callout missed — flag it and fix it before implementation.
 
 ### 3.4 `cancel_meeting`
 
@@ -546,16 +629,18 @@ implementation:
   whose token we then hand to the importer.
 
   1. **Upload the markdown source as a `.md` file**:
-     `drive.v1.files.upload_all(file_name="meeting-notes.md",
+     `client.drive.v1.file.upload_all(file_name="meeting-notes.md",
      parent_type="explorer", parent_node=<bot_workspace.docs_folder_token>,
-     size=<bytes>, file=<bytes_io>)` → returns `file_token`.
+     size=<bytes>, file=<bytes_io>)` → returns `file_token`. (SDK
+     attribute is singular `file`, not `files` — see §3.3bis.)
   2. **Create the import task**:
-     `drive.v1.import_tasks.create(import_task=ImportTask(
+     `client.drive.v1.import_task.create(import_task=ImportTask(
      file_token=<from step 1>, file_extension="md", type="docx",
      file_name="<title>.docx", point=ImportTaskMountPoint(
      mount_type=1, mount_key=<docs_folder_token>)))` →
-     returns `ticket` (the async task id).
-  3. **Poll for completion**: `drive.v1.import_tasks.get(ticket=<...>)`
+     returns `ticket` (the async task id). (SDK attribute is
+     singular `import_task`.)
+  3. **Poll for completion**: `client.drive.v1.import_task.get(ticket=<...>)`
      every ~500 ms until `job_status == 0` (success) or terminal
      failure. The completed result includes `token` (the new docx's
      `doc_token`) and `url`.
@@ -567,10 +652,11 @@ implementation:
   of the source markdown — implementation choice, leave it for v1
   simplicity.
 
-- **Path B (fallback)**: `docx.v1.document.create` (empty doc), then
-  parse Markdown into Docx blocks ourselves and call
-  `docx.v1.document.block.children.create` to append. More code, no
-  async polling, no intermediate file in Drive.
+- **Path B (fallback)**: `client.docx.v1.document.create` (empty
+  doc), then parse Markdown into Docx blocks ourselves and call
+  `client.docx.v1.document_block_children.create` (flat attribute
+  path, see §3.3bis) to append. More code, no async polling, no
+  intermediate file in Drive.
 
 Pick A first; fall back to B only if `drive:drive` import permissions
 can't be granted in production. The choice does not affect this
@@ -616,7 +702,7 @@ Dispatches on `action_type`:
   event_id, we instead create a fresh `schedule_meeting` audit row
   with `target_id=new_event_id` and `result={...}` and link both via
   `target_id` lookups.
-- `append_action_items` → `bitable.app.table.record.batch_delete`
+- `append_action_items` → `client.bitable.v1.app_table_record.batch_delete` (flat SDK attribute path; see §3.3bis)
   (one `record_id` per appended item, all stored in `result.record_ids`)
 - `create_meeting_doc` → `drive.v1.file.delete`
 
@@ -642,9 +728,10 @@ A new one-shot script: `bot/scripts/bootstrap_bot_workspace.py`.
 
 1. `calendar.v4.calendar.create` → primary calendar, store
    `calendar_id`.
-2. `bitable.v1.app.create` (folder=root) → "包工头的工作台" base, store
+2. `client.bitable.v1.app.create` (folder=root) → "包工头的工作台" base, store
    `app_token`.
-3. Inside that base, `bitable.v1.app.table.create` for two tables:
+3. Inside that base, `client.bitable.v1.app_table.create` (flat
+   attribute path, NOT `app.table.create`; see §3.3bis) for two tables:
    - `action_items` (fields: title, owner [Person field],
      project [Single Select], due_date [Date], status [Single Select:
      todo/doing/done], created_by_meeting [URL], created_at)
@@ -1164,7 +1251,7 @@ The three-phase pattern gives:
 | --- | --- | --- | --- |
 | **Transport** | `bot/feishu/events.py:_seen_events` LRU (`event_id`) | Feishu webhook redeliveries within the same process | Process restarts; user retypes the same instruction |
 | **Per-message idempotency** | `bot_actions UNIQUE(message_id, action_type)` | The same Feishu `message_id` reaching us twice (cross-process, cross-restart) | A *new* user message that says the same thing — different `message_id`, no constraint hit |
-| **Logical short-window exclusion** | `bot_actions` partial UNIQUE on `logical_key WHERE logical_key_locked = true` (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args. **Cross-process and cross-instance**: enforced by Postgres, not by app-layer reads. | Anything older than 60 s (lazy GC sets `logical_key_locked=false`); intentional re-issuance after that |
+| **Logical short-window exclusion** | `bot_actions_logical_locked_uniq` partial UNIQUE on `(logical_key) WHERE logical_key_locked = true AND status IN ('pending','success')` (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args. **Cross-process and cross-instance**: enforced by Postgres, not by app-layer reads. | Anything older than 60 s (lazy GC sets `logical_key_locked=false`); intentional re-issuance after that |
 
 `logical_key` is a stable hash over `(chat_id, sender_open_id,
 action_type, canonical_args)` — the same parameters that uniquely
@@ -1339,7 +1426,12 @@ CREATE TABLE bot_actions (
     error           text,                          -- failure detail
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (message_id, action_type)
+    -- Named constraint (NOT a default Postgres-generated name like
+    -- bot_actions_message_id_action_type_key) so the regex dispatch
+    -- in insert_bot_action_pending can recognize this exact string
+    -- in PostgREST's 409 error message. See §6.2 "Constraint names".
+    CONSTRAINT bot_actions_message_action_uniq
+      UNIQUE (message_id, action_type)
 );
 CREATE INDEX bot_actions_target_idx ON bot_actions (target_kind, target_id);
 CREATE INDEX bot_actions_pending_idx ON bot_actions (status, created_at)
@@ -1622,7 +1714,11 @@ agent commonly mishandles. For traceability:
 | 38 | `insert_bot_action_pending`'s UniqueViolation handler only re-read by `(message_id, action_type)`, so a logical_key conflict with a different message_id returned a generic "in flight" instead of the winner's result | `insert_bot_action_pending` inspects `e.diag.constraint_name` and raises `MessageActionConflict` or `LogicalKeyConflict` carrying the appropriate existing row (§5.1, §6.2 constraint-name contract). Caught in iter-7 Codex review. |
 | 39 | Spec used `freebusy.list` and `attendee.create_batch` — neither matches the lark-oapi Python SDK shape | `freebusy.batch` (§3.3 phase 2) and `attendee.create` with `body={attendees: [...]}` (§3.3 phase 4 / §3.9 cancel-restore). Verified against installed `lark_oapi/api/calendar/v4/resource/{freebusy,calendar_event_attendee}.py`. Caught in iter-7 Codex review. |
 | 40 | `cancel_meeting(event_id)` only required bot-ownership; anyone with the link could cancel a meeting scheduled in another chat | Added cross-chat guard: `bot_actions.chat_id` must equal `ctx.chat_id` (§3.4). Refuse with explanation otherwise; v1 has no override. Caught in iter-7 Codex review. |
-| 41 | Markdown-to-Docx import was described as a single `import_tasks.create` call with `body=Markdown bytes`; SDK actually requires upload-then-import-then-poll (3 steps) | §3.8 Path A rewritten as 3 steps: `files.upload_all` → `import_tasks.create(file_token=...)` → `import_tasks.get` poll. Verified against installed `lark_oapi/api/drive/v1/model/import_task.py`. Caught in iter-7 Codex review. |
+| 41 | Markdown-to-Docx import was described as a single `import_tasks.create` call with `body=Markdown bytes`; SDK actually requires upload-then-import-then-poll (3 steps) | §3.8 Path A rewritten as 3 steps: `file.upload_all` → `import_task.create(file_token=...)` → `import_task.get` poll. Verified against installed `lark_oapi/api/drive/v1/model/import_task.py`. Caught in iter-7 Codex review. |
+| 42 | `UNIQUE (message_id, action_type)` was unnamed in SQL → Postgres auto-generates a name like `bot_actions_message_id_action_type_key`, which the regex dispatch in `insert_bot_action_pending` would not recognize. All same-message conflicts would silently fall through to the generic catch | SQL now uses `CONSTRAINT bot_actions_message_action_uniq UNIQUE (message_id, action_type)` (§6.2) so the name appears literally in PostgREST's 409 error message. Caught in iter-8 Codex review. |
+| 43 | freebusy body field was named `user_id_list` in spec; SDK's `BatchFreebusyRequestBody.user_ids` would silently receive empty input, returning a 400 or no-op | Fixed to `user_ids: List[str]` per `lark_oapi/api/calendar/v4/model/batch_freebusy_request_body.py`. §3.3 phase 2 cites the model file directly. Caught in iter-8 Codex review. |
+| 44 | Several "API endpoint" path strings in spec didn't match lark-oapi Python SDK attribute paths (`calendar_event.attendee.create` instead of `calendar_event_attendee.create`; `drive.v1.files` instead of `drive.v1.file`; `drive.v1.import_tasks` instead of `drive.v1.import_task`; `bitable.v1.app.table` instead of `bitable.v1.app_table`; `docx.v1.document.block.children` instead of `docx.v1.document_block_children`) | All paths corrected to SDK attribute style; new §3.3bis "API endpoint vs lark-oapi SDK attribute path" callout table maps URL paths to SDK paths so future implementers can spot a mismatch quickly. Caught in iter-8 Codex review. |
+| 45 | `contact.v3.user.search` doesn't exist in lark-oapi Python SDK (verified in `lark_oapi/api/contact/v3/resource/user.py` — only `batch`, `batch_get_id`, `get`, `list`, `find_by_department` are exposed) | §3.1 step 3 now specifies a raw HTTP call to `/open-apis/search/v1/user` via `httpx` (already a dependency, see `feishu/client.py:67`) with `Bearer <tenant_access_token>`. Caught in iter-8 Codex review. |
 
 ---
 
@@ -1643,9 +1739,10 @@ internals.
    scopes are live**; without them every Feishu API call 401s.
 1. **Migrations** `0010` + `0011` — schema first, no app changes.
 2. **`db/queries.py`** — add the new functions for `bot_actions`
-   (`get_bot_action`, `insert_bot_action_pending` — must catch
-   `UniqueViolation` on both `(message_id, action_type)` and the
-   `logical_key WHERE logical_key_locked = true` partial UNIQUE;
+   (`get_bot_action`, `insert_bot_action_pending` — must distinguish
+   PostgREST 409s by constraint name (`bot_actions_message_action_uniq`
+   vs `bot_actions_logical_locked_uniq`, both defined in §6.2) and
+   raise `MessageActionConflict` / `LogicalKeyConflict` accordingly;
    `update_for_retry`, `mark_bot_action_success`,
    `mark_bot_action_failed`, `mark_bot_action_undone`,
    `last_bot_action_for_sender_in_chat`, `compute_logical_key`,
