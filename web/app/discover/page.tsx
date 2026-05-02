@@ -48,8 +48,6 @@ export default async function DiscoverPage(props: PageProps<'/discover'>) {
   let query = sb
     .from('turns')
     .select('*')
-    .not('agent_response_full', 'is', null)
-    .neq('agent_response_full', '')
     .order('user_message_at', { ascending: false })
     .limit(PAGE_SIZE);
 

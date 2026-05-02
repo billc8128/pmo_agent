@@ -52,8 +52,6 @@ export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
     .from('turns')
     .select('*')
     .eq('user_id', profile.id)
-    .not('agent_response_full', 'is', null)
-    .neq('agent_response_full', '')
     .order('user_message_at', { ascending: false })
     .limit(PAGE_SIZE);
 
