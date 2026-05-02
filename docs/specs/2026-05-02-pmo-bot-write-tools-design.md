@@ -127,7 +127,7 @@ user when the restore happens. It is still strictly better than
    └──────────┬────────────┘
               │
    ┌──────────┴────────────┐
-   │ bot/agent/tools.py    │   8 write tools, three-phase pattern
+   │ bot/agent/tools.py    │   8 new tools, write tools use three-phase pattern
    └──────────┬────────────┘
               │
    ┌──────────┴────────────┐
@@ -148,7 +148,7 @@ write tools; existing event handling, dedup, and cards are unchanged.
 
 ## 3. Tool catalog
 
-8 new write tools + 1 modification to an existing tool.
+8 new tools (5 write, 3 read) + 1 modification to an existing tool.
 
 | # | Tool | Domain | Read or Write |
 | --- | --- | --- | --- |
@@ -193,9 +193,10 @@ input's *shape*, not just sequence):
 
    Implementation in `bot/feishu/client.py`: use `httpx` (already a
    dependency, see `feishu/client.py:67`) to call the endpoint with
-   `Authorization: Bearer <tenant_access_token>`. Reuse the
-   existing tenant_access_token issuer flow (the same pattern as
-   `fetch_self_info` already does for `/open-apis/bot/v3/info`).
+   `Authorization: Bearer <tenant_access_token>`. Reuse the existing
+   manual auth-POST pattern from `fetch_self_info` (or factor that
+   pattern into a small shared helper first); there is not currently
+   a reusable token-issuer helper in `bot/feishu/client.py`.
    Request body: `{"query": "<name>", "page_size": 20}`. Response
    contains `users: [{open_id, name, en_name, email, department_ids,
    ...}]` ranked by relevance.
@@ -210,8 +211,9 @@ input's *shape*, not just sequence):
      user. Do not raise — fail soft per input string so a single
      bad name doesn't kill resolution for siblings.
    - HTTP 401 (token expired) → invalidate the cached
-     tenant_access_token, refetch via the existing issuer (same
-     pattern as `feishu/client.py:67`), retry once. If the second
+     tenant_access_token, rerun the manual auth-POST token fetch
+     pattern from `fetch_self_info` (or call a shared helper if
+     §3.1 step 3 factored one out), retry once. If the second
      attempt also 401s, surface a generic
      `directory_search_unavailable` and tell the agent to reply
      "我现在查不到通讯录，请稍后再试".
@@ -391,9 +393,22 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    richer semantics live in `result`.
 4. **Phase 2.2 — Create event**:
    `client.calendar.v4.calendar_event.create(CreateCalendarEventRequest
-   .builder().calendar_id(bot_calendar_id).request_body(...).build())`
-   with `attendee_ability=can_modify_event`. Returns
-   `event_id`.
+   .builder().calendar_id(bot_calendar_id)
+   .idempotency_key("schedule_meeting:" + action_id)
+   .request_body(...).build())` with
+   `attendee_ability=can_modify_event`. Returns `event_id`.
+
+   The `idempotency_key` is available in the installed SDK's
+   `CreateCalendarEventRequestBuilder` and is mandatory for this
+   call. Keyed by the persisted `bot_actions.id` (not by
+   `logical_key`): after the 60s logical dedup window expires, a
+   user intentionally repeating the same meeting request should
+   create a fresh event, so Feishu-side idempotency must be per
+   action row. Together with the pre-2.2.5 stderr log below, this
+   covers the residual crash window where Feishu accepted a create
+   but the DB UPDATE didn't land — a retry of the same
+   `bot_actions.id` deduplicates Feishu-side, and the operator can
+   reconcile the DB row from the stderr log.
 5. **Phase 2.2.5 — Intermediate persist (atomicity)**: as soon as
    `event_id` is in hand, run an UPDATE that records
    `target_id=event_id`, `target_kind='calendar_event'`,
@@ -546,18 +561,33 @@ a typo this callout missed — flag it and fix it before implementation.
 bot-scheduled meeting **in the current conversation**).
 
 Resolution rules:
-- If `event_id` is given: look up `bot_actions WHERE target_kind=
-  'calendar_event' AND target_id=event_id`. If no row → refuse
-  ("only cancel meetings I created"). If row exists but
-  `status='undone'` → no-op, return idempotent success. **Cross-chat
-  guard**: if the row's `chat_id ≠ ctx.chat_id`, refuse with a
-  message explaining "this meeting was scheduled in <other chat>;
-  please ask me there to cancel it." The `event_id` knowing-it-is-
-  bot-owned check alone is not enough — anyone in any chat who has
-  the link could otherwise cancel a meeting scheduled by a different
-  team. v1 keeps this strict (no override flag); a future "I'm sure,
-  cancel anyway" path can be added once UX supports cross-chat
-  confirmations.
+- If `event_id` is given: look up `bot_actions WHERE action_type IN
+  ('schedule_meeting','restore_schedule_meeting') AND
+  target_kind='calendar_event' AND target_id=event_id`. If no row
+  → refuse ("only cancel meetings I created"). The
+  `restore_schedule_meeting` arm covers events resurrected by §3.9
+  cancel-undo: the user should be able to cancel a restored
+  meeting just as easily as a freshly-scheduled one.
+
+  **Cross-chat guard first**: if the row's `chat_id ≠
+  ctx.chat_id`, refuse with a message explaining "this meeting was
+  scheduled in <other chat>; please ask me there to cancel it."
+  The `event_id` knowing-it-is-bot-owned check alone is not enough
+  — anyone in any chat who has the link could otherwise cancel a
+  meeting scheduled by a different team. v1 keeps this strict (no
+  override flag); a future "I'm sure, cancel anyway" path can be
+  added once UX supports cross-chat confirmations.
+
+  Then gate by source-row status:
+  - `status IN ('success','reconciled_unknown') AND target_id IS
+    NOT NULL` → proceed; this is a real bot-created meeting.
+  - `status='pending'` → return in-flight no-op ("the meeting is
+    still being scheduled — try again in a moment").
+  - `status='undone'` → return idempotent success ("already
+    cancelled").
+  - `status IN ('failed', 'reconciled_unknown')` with no
+    `target_id` → refuse with explanation that the original
+    schedule didn't actually create an event.
 - If `last:true`: **first** check whether the most recent action by
   this asker in this chat (any action_type) is itself a successful
   `cancel_meeting` from the last ~5 minutes. If so, return idempotent
@@ -642,16 +672,19 @@ Resolution rules:
    - `target_kind = 'calendar_event_cancel'`
    - `result.pre_cancel_event_snapshot = <from Phase 2a>`
    - `result.calendar_id = <...>`
-   - **`result.original_schedule_action_id = <bot_actions.id of the
-     schedule_meeting row that produced original_event_id>`**
-     (iter-16 #1 fix — without this, a partial cancel that crashes
-     before Phase 3 leaves the original schedule row at `success`
-     with `logical_key_locked=true`. The §3.9 cancel-restore branch
-     needs this id to find and explicitly retire the original row
-     before INSERTing the fresh restored schedule row, otherwise R2
-     hits a `LogicalKeyConflict` AFTER R1 has already created a new
-     event in Feishu — orphan. See §3.9 cancel-restore "Retire
-     original schedule row" pre-step.)
+   - **`result.source_meeting_action_id = <bot_actions.id of the
+     row that produced original_event_id>`** (iter-16 #1 fix,
+     renamed in iter-18 — the source row may be either a
+     `schedule_meeting` row or a `restore_schedule_meeting` row,
+     since §3.4 explicit-event_id path admits both. Without this
+     handle, a partial cancel that crashes before Phase 3 leaves
+     the source row at `success` with `logical_key_locked=true`.
+     The §3.9 cancel-restore branch needs this id to find and
+     explicitly retire the source row before INSERTing the fresh
+     restored schedule row, otherwise R2 hits a
+     `LogicalKeyConflict` AFTER R1 has already created a new event
+     in Feishu — orphan. See §3.9 cancel-restore "Retire source
+     meeting row" pre-step.)
 
    This id is the same row Phase -1 already looked up to extract
    `result.calendar_id` — just record its `id` here too.
@@ -876,6 +909,35 @@ so this tool does NOT need the multi-step intermediate-persist
 pattern from §3.3 / §3.8 — a single try/except around the batch
 call is sufficient. On success, persist the table_id + record_ids
 in one Phase 3 UPDATE.
+
+**Idempotency** (iter-22): pass a stable
+`client_token=<bot_actions.id>` on the `batch_create` request so a
+process-crash-then-retry doesn't double-insert. The SDK supports
+`client_token` on `BatchCreateAppTableRecordRequest`; the same
+`bot_actions.id` is the natural key (Feishu deduplicates server-
+side). Also embed a hidden `source_action_id=<bot_actions.id>`
+field on each record's payload so undo can recover record_ids
+even if the response was lost mid-flight (query the table by
+`source_action_id` before falling back to `result.record_ids`).
+
+**Ambiguous batch_create failure** (iter-23): if the request was
+sent and Feishu returned a transport-level error (timeout, 5xx,
+connection drop) BEFORE the batch was acknowledged, we don't know
+whether records were committed. Do NOT mark `failed` (which would
+release the logical lock and allow a duplicate retry). Instead:
+1. Query the table by `source_action_id=<bot_actions.id>`.
+2. If records found → mark `success` with the recovered
+   `record_ids`.
+3. If no records found → optionally retry once with the same
+   `client_token` (Feishu deduplicates).
+4. If still ambiguous → mark `reconciled_unknown(partial_success)`
+   with `target_id=<table_id>`, `target_kind='bitable_records'`,
+   `result.source_action_id=<bot_actions.id>`. Undo can later
+   query by `source_action_id` and clean up if records actually
+   landed.
+
+Only deterministic pre-accept validation failures (4xx with a
+clear "validation failed" body) may become `failed`.
 
 **Default-project resolution** (per item with no `project` provided):
 
@@ -1299,30 +1361,34 @@ Dispatches on `action_type`:
   audit row, and a crash mid-flight could leave a fresh orphan
   event on Feishu without a DB record):
 
-    **R0. Retire the original schedule row first** (iter-16 #1
-    fix, broadened in iter-17 #1 — load-bearing for the partial-
-    cancel path, see §3.4 Phase 2a.5 "result.original_schedule_action_id"):
-    in a single UPDATE, transition the original `schedule_meeting`
-    row identified by `result.original_schedule_action_id` to
-    `status='undone'` AND clear `logical_key_locked = false` (§6.2
-    lock-behavior on `pending → undone`).
+    **R0. Retire the source meeting row first** (iter-16 #1 fix,
+    broadened in iter-17 #1, renamed in iter-18 — load-bearing for
+    the partial-cancel path, see §3.4 Phase 2a.5
+    "result.source_meeting_action_id"): in a single UPDATE,
+    transition the source row identified by
+    `result.source_meeting_action_id` to `status='undone'` AND
+    clear `logical_key_locked = false` (§6.2 lock-behavior on
+    `pending → undone`).
 
-    The UPDATE predicate is `WHERE id = $original_schedule_action_id
+    The UPDATE predicate is `WHERE id = $source_meeting_action_id
+    AND action_type IN ('schedule_meeting','restore_schedule_meeting')
     AND status IN ('success', 'reconciled_unknown') AND target_kind
     = 'calendar_event'` (idempotent across retries). The
-    `reconciled_unknown` arm matters (iter-17 #1): if the original
-    schedule was itself a partial_success (event created but
-    attendee invite failed in §3.3 Phase 2.3), then the user
-    cancelled it (which §3.4 explicitly allows for partials), then
-    that cancel itself is now being undone — the original row
-    is `reconciled_unknown(partial_success)` with lock held. Without
+    `action_type` arm covers cancelling restored meetings (§3.4
+    explicit-event_id path admits both). The `reconciled_unknown`
+    arm matters (iter-17 #1): if the source schedule was itself a
+    partial_success (event created but attendee invite failed in
+    §3.3 Phase 2.3), then the user cancelled it (which §3.4
+    explicitly allows for partials), then that cancel itself is
+    now being undone — the source row is
+    `reconciled_unknown(partial_success)` with lock held. Without
     the `reconciled_unknown` arm in R0, the lock would stay held
     and the row would continue showing in `bot_known_events`.
 
     The `target_kind='calendar_event'` arm is defensive: it ensures
-    R0 only retires schedule rows, never accidentally a
+    R0 only retires schedule/restore rows, never accidentally a
     `calendar_event_cancel` or other shape pointed to by a
-    miswritten `original_schedule_action_id`.
+    miswritten `source_meeting_action_id`.
 
     Idempotency: if the cancel completed cleanly the first time
     (already `undone`, lock cleared), the UPDATE returns 0 rows —
@@ -1549,6 +1615,27 @@ Marks the source row `status=undone`. Records its own `undo_last_action`
 row with `target_id=<original action_id>` for traceability.
 
 Idempotent: calling it on an already-`undone` row is a no-op success.
+
+**Delete-side idempotency** (iter-20): every delete dispatch above
+(`schedule_meeting`, `restore_schedule_meeting` Case B,
+`cancel_meeting` cleanup, doc cleanup, bitable batch_delete) treats
+**Feishu "not found" / 404 as success**: the desired end state
+(artifact gone) already holds. Mark the source row `undone` and
+write the trace-only undo audit row exactly as on a real delete.
+This makes undo replay-safe: if delete succeeded but the process
+crashed before marking the source row `undone`, retry sees 404 →
+completes the DB transition cleanly.
+
+Non-404 API errors remain retryable failures. The undo helper
+records the error and leaves the source row's `status` unchanged,
+so a fresh user retry resumes from the same source.
+
+For `append_action_items` specifically, "not found means success"
+applies **per record_id** during batch_delete: the helper queries
+`source_action_id` to discover which records still exist, deletes
+those, treats already-missing ones as fine, and marks the source
+row `undone` only when the table no longer contains any record
+with that `source_action_id`.
 
 ---
 
@@ -2378,7 +2465,11 @@ CREATE TABLE bot_actions (
       UNIQUE (message_id, action_type)
 );
 CREATE INDEX bot_actions_target_idx ON bot_actions (target_kind, target_id);
-CREATE INDEX bot_actions_pending_idx ON bot_actions (status, created_at)
+-- Index supports the §5.3 stuck-pending GC predicate, which uses
+-- `updated_at` (not created_at — a row could be reclaimed via
+-- update_for_retry which bumps updated_at; the GC clock should
+-- restart from that retry, not the original insertion).
+CREATE INDEX bot_actions_pending_idx ON bot_actions (status, updated_at)
   WHERE status = 'pending';
 -- "last bot action this user requested in this chat" — used by
 -- cancel_meeting(last:true) and undo_last_action(last_for_me:true).
@@ -2508,16 +2599,23 @@ caught this. Fix: split the helper into two (or pass `kind` to a
 single helper) so partial_success preserves the lock.
 
 ```sql
--- mark_bot_action_failed
+-- mark_bot_action_failed: pending → failed, returns the row.
+-- The status='pending' guard prevents accidentally overwriting a
+-- terminal row (a delayed retry could otherwise clobber a row
+-- another worker already finalized). The 0-row case must be
+-- handled by the caller (re-read by id and dispatch on current
+-- status) — see §11 helper contract.
 UPDATE bot_actions
    SET status='failed', error=$err,
        logical_key_locked=false, updated_at=now()
- WHERE id=$id;
+ WHERE id=$id AND status='pending'
+ RETURNING *;
 
--- mark_bot_action_undone
+-- mark_bot_action_undone: same transition guard.
 UPDATE bot_actions
    SET status='undone', logical_key_locked=false, updated_at=now()
- WHERE id=$id;
+ WHERE id=$id AND status='pending'
+ RETURNING *;
 
 -- mark_bot_action_reconciled_unknown(action_id, *, kind, error,
 --                                     target_id?, target_kind?,
@@ -2554,7 +2652,8 @@ UPDATE bot_actions
        logical_key_locked = (CASE WHEN $kind = 'partial_success'
                                   THEN true ELSE false END),
        updated_at=now()
- WHERE id=$id;
+ WHERE id=$id AND status='pending'
+ RETURNING *;
 
 -- get_bot_action lazy GC for stuck pending — content-aware (§5.3
 -- case a). Picks 'partial_success' (lock kept) when the row has
@@ -2621,7 +2720,7 @@ these places:
 | Per-run context (`message_id`, `chat_id`, `sender_open_id`, `conversation_key`) via `RequestContext` dataclass owned by each `_PooledClient`, captured by closure in `build_pmo_mcp(ctx)` (see §5.0) | `bot/agent/tools.py` (`RequestContext` definition + factory), `bot/agent/runner.py` (one ctx per `_PooledClient`; `answer` / `answer_streaming` accept `message_id` / `chat_id` / `sender_open_id` and set `slot.ctx.*` inside the existing `slot.lock`), `bot/app.py` (calls `answer_streaming(...)` with the four params; **never** touches `_get_client` / `slot.ctx` / `slot.lock` directly) | new dataclass, factory pattern in `build_pmo_mcp`, runner public surface gains 3 kwargs, existing `set_current_conversation` removed entirely |
 | Tool schema + LLM-visible behavior | `bot/agent/tools.py` | new tools, three-phase pattern in each |
 | **Agent SDK `allowed_tools` whitelist** (`bot/agent/runner.py:179`) | `bot/agent/runner.py` | **must add** `mcp__pmo__resolve_people`, `mcp__pmo__schedule_meeting`, `mcp__pmo__cancel_meeting`, `mcp__pmo__list_my_meetings`, `mcp__pmo__append_action_items`, `mcp__pmo__query_action_items`, `mcp__pmo__create_meeting_doc`, `mcp__pmo__undo_last_action` to the existing list. Without this, the SDK filters the new tools out and the LLM never sees them. **Discovered during review iteration 3** — a previous draft incorrectly claimed runner.py was unchanged. |
-| Agent SDK system prompt | `bot/agent/runner.py` (`SYSTEM_PROMPT` constant) | append §9 directives |
+| Agent SDK system prompt | `bot/agent/runner.py` (`SYSTEM_PROMPT` constant) | replace tool inventory + read-only sentence per §9, then weave in §9 directives |
 | Feishu API wrappers (calendar, bitable, docx, contact) | `bot/feishu/client.py` | new methods |
 | `bot_actions` / `bot_workspace` SQL | `bot/db/queries.py` | new functions, all via `sb_admin()` |
 | Workspace bootstrap script | `bot/scripts/bootstrap_bot_workspace.py` | new file (and the `bot/scripts/` directory itself, created in step 4 of §11) |
@@ -2669,8 +2768,21 @@ A short README section in `bot/README.md` will list these.
 
 ## 9. System-prompt directives
 
-A new paragraph appended to the agent's system prompt (location:
-`bot/agent/runner.py` where the system message is composed):
+A new paragraph **appended** to the agent's system prompt — and
+**parts of the existing prompt must be REPLACED**, not just added
+to. The current `SYSTEM_PROMPT` in `bot/agent/runner.py` lists the
+old read-only tool inventory and explicitly says "这是只读问答助
+手" / "你不能：写代码、改文件、跑命令"; appending the directives
+below without removing those lines leaves contradictory instructions
+and will make write-tool use unreliable. Implementer must:
+
+1. Replace the tool inventory list to include the 8 new tools.
+2. Remove or rewrite the "this is a read-only assistant" sentence
+   so it doesn't directly contradict "you can now act on Feishu".
+3. Append the directives below (or weave them into the existing
+   prose where natural).
+
+The directive block to weave in:
 
 ```
 You can now act on Feishu, not just answer questions.
@@ -2820,6 +2932,46 @@ agent commonly mishandles. For traceability:
 | 107 | iter-16 introduced `action_type='restore_schedule_meeting'` to give cancel-restore audit rows a dedicated dispatch discriminator, but didn't update the `bot_known_events` JOIN (§3.5) or the `cancel_meeting(last:true)` filter (§3.4) — both still queried `action_type='schedule_meeting'` only. Result: a meeting resurrected by undo-of-cancel didn't show up in the asker's "我下午有啥会"; "取消刚才那个会" after a restore would silently target an even earlier schedule row | Both filters now read `action_type IN ('schedule_meeting','restore_schedule_meeting')`. Caught in iter-17 Codex review. |
 | 108 | §3.9 `restore_schedule_meeting` undo branch handled two conceptually distinct intents (finishing a `partial_success` restore vs rolling back a successful restore) with a single "probe attendees → if match mark success, else delete" path. The `success → user wants rollback` case would silently mark the row `success` again with no Feishu write, failing to honor the user's intent | Branch now dispatches by source row `status`: `reconciled_unknown` → probe attendees, finalize on match, retry invite on mismatch, ask before destructive delete; `success` → straightforward `calendar_event.delete` followed by mark `undone`. Caught in iter-17 Codex review. |
 | 109 | `undo_last_action` writes its own audit row with `target_id=<original action_id>`, satisfying the `last_for_me` "undoable" predicate. A user saying "撤销刚才那个" twice in a row would resolve to the undo row itself, then hit §3.9 dispatch with no `undo_last_action` arm — undefined behavior | `last_for_me` predicate now includes `AND action_type <> 'undo_last_action'`. v1 explicitly forbids undo-of-undo; redo is via a fresh user utterance. v2 may add explicit `redo_last_action`. §11 helper sig also updated. Caught in iter-17 Codex review. |
+| 110 | iter-18 Codex review allowed cancelling restored meetings; the §3.4 explicit-event_id path needed to admit `restore_schedule_meeting` rows AND status-gate before delete | §3.4 explicit-event_id lookup now `action_type IN ('schedule_meeting','restore_schedule_meeting')` AND status-gates: success/reconciled_unknown+target_id → proceed; pending → in-flight no-op; undone → idempotent success; failed/no-target → refuse. Caught in iter-18 / iter-19 Codex review (cherry-picked). |
+| 111 | `cancel_meeting` Phase 2a.5 used `original_schedule_action_id`, but the source row may be a `restore_schedule_meeting` row (cancelling a previously-restored meeting). Retiring the wrong row would leave the restored row visible/cancelable | Renamed to `result.source_meeting_action_id`; §3.9 R0 widened predicate to `action_type IN ('schedule_meeting','restore_schedule_meeting')`. Caught in iter-18 Codex review (cherry-picked). |
+| 112 | `schedule_meeting` Phase 2.2 didn't use Feishu's `idempotency_key` parameter, so a webhook retry that reaches Phase 2.2 again could create a second event before our `(message_id, action_type)` UNIQUE caught the row. (UNIQUE catches it AFTER Feishu has already accepted the second create.) | Phase 2.2 sets `idempotency_key="schedule_meeting:" + action_id`; restored event create uses the analogous keying. Caught in iter-20 Codex review (cherry-picked). |
+| 113 | `append_action_items` `batch_create` had no idempotency token. A duplicate webhook that reached Phase 2 again before the row was finalized could double-insert records. Also: ambiguous `batch_create` failures (transport timeout / 5xx after request was sent) would mark the row `failed`, releasing the lock and allowing a duplicate retry, when records may have actually committed | §3.6 now uses `client_token=<bot_actions.id>` on `batch_create` (Feishu deduplicates server-side); embeds hidden `source_action_id` on each record so undo can recover record_ids; on ambiguous post-send failures, queries by `source_action_id`, retries once with the same `client_token`, and only marks `failed` on deterministic pre-accept validation errors — otherwise `reconciled_unknown(partial_success)`. Caught in iter-22 / iter-23 Codex review (cherry-picked). |
+| 114 | §3.9 undo dispatches for delete-style compensations didn't define behavior when the Feishu artifact was already gone (e.g. delete succeeded but the process crashed before marking the source row `undone`; retry hits 404). Without a "not found means success" rule, retry would fail and the source row would never reach `undone` | §3.9 now treats Feishu 404 / not-found on every delete dispatch as success: mark source row `undone` and write the trace-only undo audit row. Non-404 errors remain retryable failures. For `append_action_items` batch_delete: query by `source_action_id` to discover surviving records, treat missing record_ids as fine, finalize when no records remain with that source_action_id. Caught in iter-20 / iter-21 Codex review (cherry-picked). |
+| 115 | §6.2 SQL helpers `mark_bot_action_failed`, `mark_bot_action_undone`, `mark_bot_action_reconciled_unknown` updated by `id` only. A delayed worker or miswired callsite could overwrite a terminal row (`success` / `undone` / prior recovery state) | All three helpers now use `WHERE id=$id AND status='pending'` AND `RETURNING *`. The 0-row case (terminal already) is handled by §11 helper contract: re-read by id and dispatch on the actual current status. Caught in iter-29 Codex review (cherry-picked). |
+| 116 | `bot_actions_pending_idx` was on `(status, created_at)`. The §5.3 stuck-pending GC actually queries by row age = `now() - updated_at` (since `update_for_retry` resets the GC clock by bumping `updated_at`). Index/predicate mismatch → seq scan on hot GC path | Index changed to `(status, updated_at) WHERE status='pending'`. Bootstrap lock recovery still uses `created_at` because it has no retry/heartbeat. Caught in iter-29 Codex review (cherry-picked). |
+| 117 | §9 / §11 said to "append" §9 directives to the system prompt, but the existing `SYSTEM_PROMPT` lists the read-only tool inventory and explicitly says "this is a read-only assistant". Appending without removing those leaves contradictory instructions | §9 now directs implementer to REPLACE the tool inventory + remove the read-only sentence first, then weave in the directive block. §7 / §11 step 8 updated accordingly. Caught in iter-30 Codex review (cherry-picked). |
+
+---
+
+### iter-18 → iter-30 over-engineering NOT applied (deliberate)
+
+Codex iter-22 through iter-30 added a substantial `claim_undo_message` /
+`undo_audit_ctx` / `attempt_count`-fence / `assert_undo_claim_owner`-
+heartbeat machinery (~30 findings, ~1100 lines of spec) to handle
+**concurrent worker overtake** and **stale claim ownership**. After
+review, this was NOT applied to v20 because:
+
+- `pmo_agent` runs as a single Railway instance; webhook handling is
+  per-conversation FIFO via `slot.lock` (`runner.py:240`).
+- Cross-process / cross-instance dedup is already covered by the
+  `bot_actions UNIQUE(message_id, action_type)` constraint plus the
+  `logical_key_locked` partial UNIQUE.
+- The fencing machinery defends against scenarios that don't occur in
+  the current architecture (two workers picking up the same
+  `message_id` claim and overtaking each other mid-compensation).
+- Adding it now imposes substantial implementation cost and reasoning
+  burden for zero practical risk reduction at v1 scale.
+
+If pmo_agent ever moves to multi-worker / multi-instance, the stashed
+`codex-iter18-30-fencing-heavy` branch (in `git stash`) preserves the
+full fencing design as a starting point. Until then, the spec's
+implementation-time crash recovery rests on:
+
+- Phase 2.X.5 intermediate persistence (Feishu artifact handle in DB
+  before the next sub-step).
+- `idempotency_key` / `client_token` on Feishu writes that support it.
+- §5.3 lazy stuck-pending GC (5-min content-aware promotion).
+- §3.9 delete-side 404-as-success idempotency for undo replay.
 
 ---
 
@@ -3018,7 +3170,7 @@ internals.
    `undo_last_action`) plus the `today_iso` extension as inner
    functions inside `build_pmo_mcp(ctx)`; each follows the §5.1
    skeleton and reads context from `ctx`.
-8. **System prompt** — append §9 directives in `bot/agent/runner.py`
+8. **System prompt** — REPLACE the existing tool inventory and the "this is a read-only assistant" sentence in `bot/agent/runner.py`'s `SYSTEM_PROMPT`, then weave in §9 directives
    (`SYSTEM_PROMPT` constant).
 9. **End-to-end smoke test** in a private Feishu group, mandatory
    coverage of these scenarios:
