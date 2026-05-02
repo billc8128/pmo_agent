@@ -344,22 +344,59 @@ Bitable base. Three-phase pattern.
    `project_root`, take the one with highest count.
 2. **Tie-break**: prefer the project whose latest turn is most recent.
 3. **Threshold**: if the top project has fewer than 3 turns in the
-   window, treat as no signal — fall through to step 4.
-4. Leave `project` null on the record AND mark
-   `default_project_resolution: "ambiguous"` in the tool's return
-   value so the agent reasks the user: "Which project should I file
-   these under?"
+   window, treat as no signal — the **whole tool call** halts before
+   writing anything (see "ambiguous flow" below).
 
-**Return shape** always includes the resolved project per item so the
-agent can confirm with the user before considering the operation done:
+**Ambiguous flow** (no auto-write, no orphan records):
+
+When **any** item lacks a project AND auto-resolution can't pick one
+confidently, the tool returns **without writing anything**:
+
+```json
+{
+  "needs_project": true,
+  "items_pending": [
+    {"title": "review API design", "owner_open_id": "ou_xxx"},
+    {"title": "send timeline to client", "owner_open_id": "ou_yyy"}
+  ],
+  "auto_suggestion": "/Users/a/Desktop/pmo_agent",
+  "auto_suggestion_confidence": "low",
+  "agent_directive": "Ask the user which project these belong to. Do not call append_action_items again until you have an explicit project string."
+}
+```
+
+The agent reasks the user. When the user answers, the agent calls
+`append_action_items` *again* with `project` populated explicitly on
+each item. Because the call has the same `(chat_id, sender_open_id,
+action_type, canonical_args)` shape as the first call **only if the
+user's intent is unchanged** (and `project` is part of canonical_args,
+so a different project produces a different `logical_key`), there is
+no logical_key collision — both calls execute cleanly.
+
+**Why not write-then-update**: an earlier draft proposed writing rows
+with `project=null` and asking the agent to update them later. That
+required either a new `update_action_items` tool (more surface) or
+LLM-driven `undo + re-append` (fragile, two side effects per
+correction). Halting at the boundary is simpler: one ask, one write,
+no orphan rows.
+
+**Return shape on success** (project resolved, items written):
 
 ```json
 {
   "records": [
-    {"record_id": "rec_xxx", "title": "...", "project_used": "/Users/a/Desktop/vibelive", "project_source": "auto_recent_turns" | "user_explicit" | "ambiguous"}
+    {
+      "record_id": "rec_xxx",
+      "title": "...",
+      "project_used": "/Users/a/Desktop/vibelive",
+      "project_source": "user_explicit" | "auto_recent_turns"
+    }
   ]
 }
 ```
+
+`project_source: "ambiguous"` is no longer a possible value — the
+ambiguous case never reaches the write path.
 
 ### 3.7 `query_action_items`
 
@@ -469,65 +506,81 @@ layer (`bot/db/client.py`) only uses Supabase REST clients; it does
 not hold a direct `psycopg` connection, so we can't issue
 `pg_advisory_xact_lock` from app code without adding a new dependency.
 
-Mechanism: re-bootstrap inserts a sentinel row into `bot_actions`:
+Mechanism: two distinct row roles — **lock** and **audit** — never
+the same row.
+
+**Acquire the lock** (transient, deleted on release):
 
 ```sql
--- Effectively the lock acquisition
+-- Lock row: exists at most once, lifecycle = "a bootstrap is in
+-- flight". Released by DELETE, NOT by transitioning status — see
+-- "Why DELETE, not UPDATE" below.
 INSERT INTO bot_actions
-  (message_id, chat_id, sender_open_id, action_type, status,
-   args, target_kind)
+  (message_id, chat_id, sender_open_id, logical_key,
+   action_type, status, args)
 VALUES
-  ('bootstrap-' || extract(epoch from now())::text || '-' || random_suffix,
-   '__system__', '__system__', 'bootstrap_workspace', 'pending',
-   $1::jsonb, 'workspace_bootstrap');
-```
-
-But the **lock semantics** come from a separate, deduplicated row:
-
-```sql
--- Sentinel row that exists at most once and represents "a bootstrap
--- is in progress". Inserted by whoever wins the race; everyone else
--- sees a UniqueViolation and waits.
-INSERT INTO bot_actions
-  (message_id, chat_id, sender_open_id, action_type, status, args)
-VALUES
-  ('__bootstrap_lock__', '__system__', '__system__',
+  ('__bootstrap_lock__', '__system__', '__system__', '__bootstrap_lock__',
    'bootstrap_workspace_lock', 'pending', '{}'::jsonb)
 ON CONFLICT (message_id, action_type) DO NOTHING
 RETURNING id;
 ```
 
-If the INSERT returned a row → we own the lock; do the re-bootstrap;
-update `bot_workspace`; UPDATE the lock row to `success` (or DELETE
-it — choosing UPDATE for audit-trail consistency).
+**Audit the work** (permanent, separate row per call):
 
-If the INSERT returned 0 rows → someone else owns the lock; poll
-`get_bot_action('__bootstrap_lock__', 'bootstrap_workspace_lock')`
-every 500ms until `status` is `success`, then re-read `bot_workspace`
-and proceed.
+```sql
+-- Each bootstrap attempt also writes its own audit row with a unique
+-- message_id (e.g. timestamp + random) so the history accumulates
+-- and stays queryable. logical_key here is just the same unique
+-- message_id (it's never used for dedup — bootstrap is intentionally
+-- not idempotent across re-runs; we want every attempt logged).
+INSERT INTO bot_actions
+  (message_id, chat_id, sender_open_id, logical_key,
+   action_type, status, args, target_kind)
+VALUES
+  ('bootstrap-' || $timestamp || '-' || $random_suffix,
+   '__system__', '__system__',
+   'bootstrap-' || $timestamp || '-' || $random_suffix,
+   'bootstrap_workspace', 'pending', $args, 'workspace_bootstrap')
+RETURNING id;
+```
 
-**Stuck-lock recovery**: if the sentinel row stays `pending` >5min,
-the same lazy GC from §5.3 marks it `reconciled_unknown`; the next
-caller treats `reconciled_unknown` as "lock owner crashed" and is
-allowed to retry the bootstrap (since bootstrap itself is idempotent
-in its substeps — `bitable.v1.app.create` etc. are not, but we
-detect existing resources and skip them).
+**Flow**:
 
-**Worst-case wait**: if the lock-holder process dies between owning
-the sentinel and finishing the bootstrap, every other write tool that
-arrives in the next ~5 minutes will see `status='pending'` and
-either wait or short-circuit. The lazy GC only triggers on a
-`get_bot_action` call **after** 5 minutes have elapsed. To avoid a
-5-minute stall on every webhook, the waiter should itself check
-`created_at` age each poll: if the sentinel row's age > 5 min, the
-waiter promotes it to `reconciled_unknown` directly (effectively
-inlining the GC). This keeps recovery time bounded by the polling
-interval, not by an external GC pass.
+- If the lock-INSERT returned a row → we own it. Write the audit row
+  (`bootstrap_workspace`, `pending`). Run the bootstrap substeps.
+  On success: mark the audit row `success` AND **DELETE the lock row**.
+  On failure: mark the audit row `failed`, DELETE the lock row anyway
+  (so the next caller can retry).
+- If the lock-INSERT returned 0 rows → someone else owns it. Poll
+  `get_bot_action('__bootstrap_lock__', 'bootstrap_workspace_lock')`
+  every 500ms until the row is GONE (i.e. the holder finished and
+  released). Then re-read `bot_workspace` and proceed.
 
-This is more complex than `pg_advisory_xact_lock` would be, but it
-reuses the audit table the spec already requires, doesn't add a new
-DB connection path, and is debuggable (you can SELECT the sentinel
-row to see who's holding the lock).
+**Why DELETE, not UPDATE-to-`success`** (the key v3-era bug, caught
+in iteration 4): the lock row uses
+`UNIQUE (message_id='__bootstrap_lock__', action_type='bootstrap_workspace_lock')`.
+If we left a `success` row sitting there forever, the **next**
+re-bootstrap (when a human deletes the workspace again) would hit
+`ON CONFLICT DO NOTHING` and **silently no-op** — the conflicting
+row already exists. Then it would see `status='success'` and assume
+"someone else just rebuilt it", read stale `bot_workspace`, and break.
+Deleting the lock on release ensures every fresh bootstrap can
+acquire afresh. The audit row remains intact in a separate row, so
+no history is lost.
+
+**Stuck-lock recovery**: if the lock row stays `pending` >5min, the
+holder process likely crashed. Any waiter that observes `created_at >
+5 min ago` proactively `DELETE`s the row (with a `WHERE
+created_at < now() - interval '5 minutes' AND status='pending'` guard
+to avoid TOCTOU) and retries the acquire. Recovery time is bounded by
+the polling interval, not by an external GC pass.
+
+This shape (separate lock row + separate audit row, lock released by
+DELETE) is the standard "advisory lock via UNIQUE row" pattern in
+Postgres. It reuses the table the spec already requires, doesn't add
+a `psycopg` dependency, and is debuggable — `SELECT * FROM
+bot_actions WHERE action_type='bootstrap_workspace_lock'` shows the
+current holder, if any.
 
 **Data loss is real**: when a resource is deleted by a human, the
 records inside it (e.g. previously-written `action_items` rows in the
@@ -544,62 +597,187 @@ in MVP — that is a future-work item if this becomes a real problem.
 This is the single most important pattern in this spec. **Every write
 tool's body follows this shape**, not a generic post-hoc listener.
 
-### 5.0 Per-run context propagation (`contextvars`, not module globals)
+### 5.0 Per-run context propagation (per-`_PooledClient` closure, NOT contextvars)
 
 Existing code uses a module-level `_current_conversation_key_var`
 (`bot/agent/tools.py:29-31`) set via `set_current_conversation` before
 each agent run. That works today because agent runs are serialized
-per-conversation (`bot/agent/runner.py` slot lock). It does **not**
-generalize: two concurrent runs in different conversations would
-race on the same global, and adding `message_id` doubles the surface.
+per-conversation (`bot/agent/runner.py` slot lock), and there is only
+one mutable field. It does **not** generalize to multiple fields
+(`message_id`, `chat_id`, `sender_open_id`) and multiple concurrent
+conversations.
 
-This spec switches both fields to `contextvars.ContextVar` — the
-standard Python primitive for per-task state in async code. Each
-`asyncio.create_task(_handle_message(...))` gets its own copy
-automatically; tools read the current task's value with no locks and
-no interference between concurrent runs.
+#### Why `contextvars.ContextVar` does NOT work here
+
+An earlier draft of this spec used `contextvars.ContextVar`, on the
+assumption that each `asyncio.create_task(_handle_message(...))` carries
+its own context. **That assumption is wrong for this SDK**. Inspection
+of the installed `claude-agent-sdk`:
+
+- `ClaudeSDKClient.connect()` starts a long-lived reader task once and
+  reuses it for every subsequent `query()`
+  (`claude_agent_sdk/client.py:171`, `_query.start()` /
+  `_query.initialize()`).
+- Tool calls arrive as MCP `control_request` messages on that reader
+  task; the reader dispatches each one via
+  `self._tg.start_soon(self._handle_control_request, request)`
+  (`_internal/query.py:196`).
+- `start_soon` (anyio's task-spawn primitive) does **not** propagate
+  the caller's `contextvars.Context` automatically the way
+  `asyncio.create_task` does. Even if it did, the caller here is the
+  reader task — not the original `_handle_message` task — so the
+  message_id we set on the webhook handler's frame would never reach
+  the tool body.
+- `tools/call` is dispatched by the MCP server's request handler
+  (`_internal/query.py:475`). At that point we're several `start_soon`
+  hops away from the webhook task that wanted to inject context.
+
+Result: any ContextVar set by `_handle_message` would be either
+**invisible** (never copied to the reader-spawned task) or **stale**
+(carrying values from whichever conversation last set them), and the
+pooled-client architecture makes the staleness case dominant.
+
+#### The actual mechanism: a mutable struct owned by `_PooledClient`
+
+Each pooled client gets one `RequestContext` instance. `build_pmo_mcp`
+becomes a factory that takes the context and returns an MCP server
+whose tool implementations close over it. `_handle_message` mutates
+the context's fields **before** calling `client.query()`, while
+holding `slot.lock` so no other request can interleave.
 
 ```python
 # bot/agent/tools.py
-import contextvars
+from dataclasses import dataclass
 
-_message_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "pmo_message_id", default="",
-)
-_conversation_key_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "pmo_conversation_key", default="",
-)
-_chat_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "pmo_chat_id", default="",
-)
-_sender_open_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "pmo_sender_open_id", default="",
-)
+@dataclass
+class RequestContext:
+    """Mutable per-pooled-client request scope.
 
-def set_current_request(
-    *, message_id: str, conversation_key: str, chat_id: str, sender_open_id: str,
-) -> None:
-    _message_id_ctx.set(message_id)
-    _conversation_key_ctx.set(conversation_key)
-    _chat_id_ctx.set(chat_id)
-    _sender_open_id_ctx.set(sender_open_id)
+    Mutated by app.py before every client.query() call, while holding
+    the pooled client's lock. Read by the tool closures via the same
+    object reference. No global state, no contextvars; the dataclass
+    instance lives as long as the _PooledClient that owns it.
+    """
+    message_id: str = ""
+    chat_id: str = ""
+    sender_open_id: str = ""
+    conversation_key: str = ""
+
+
+def build_pmo_mcp(ctx: RequestContext):
+    """Factory: returns an MCP server whose tools see `ctx` by closure.
+
+    Called once per _PooledClient, at client construction time, and
+    passed in via ClaudeAgentOptions(mcp_servers=...).
+    """
+
+    @tool("schedule_meeting", "...", {...})
+    async def schedule_meeting(args: dict) -> dict:
+        # Closure captures `ctx` itself, not its current value — so
+        # every invocation sees whatever app.py last wrote.
+        message_id = ctx.message_id
+        chat_id = ctx.chat_id
+        sender_open_id = ctx.sender_open_id
+        ...
+
+    # ... other tools ...
+
+    return create_sdk_mcp_server(
+        name="pmo", version="0.1.0",
+        tools=[schedule_meeting, ..., resolve_people, append_action_items, ...],
+    )
 ```
 
-`app.py` calls `set_current_request(...)` at the top of
-`_handle_message` (replacing the existing
-`set_current_conversation`). The existing call site at
-`tools.py:29-31` is migrated to the new API; one call site in
-`agent/imaging.py` (used by `generate_image`) is updated to read from
-`_conversation_key_ctx.get()` instead of the module global.
+```python
+# bot/agent/runner.py
+@dataclass
+class _PooledClient:
+    client: ClaudeSDKClient
+    ctx: RequestContext = field(default_factory=RequestContext)
+    last_used: float = field(default_factory=time.monotonic)
+    busy: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+async def _get_client(conversation_key: str) -> _PooledClient:
+    async with _pool_lock:
+        slot = _pool.get(conversation_key)
+        if slot is None:
+            ctx = RequestContext()  # one ctx for this pooled client's lifetime
+            options = ClaudeAgentOptions(
+                ...,
+                mcp_servers={"pmo": build_pmo_mcp(ctx)},  # closure over ctx
+                ...,
+            )
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            slot = _PooledClient(client=client, ctx=ctx)
+            _pool[conversation_key] = slot
+        ...
+        return slot
+```
+
+```python
+# bot/app.py — inside _handle_message, after acquiring slot.lock
+slot = await agent_runner._get_client(conversation_key)
+async with slot.lock:
+    slot.ctx.message_id = ev.message_id
+    slot.ctx.chat_id = ev.chat_id
+    slot.ctx.sender_open_id = ev.sender_open_id
+    slot.ctx.conversation_key = conversation_key
+    # ... then call into the agent ...
+```
+
+#### Why this is safe
+
+- **Per-conversation isolation**: each conversation has its own
+  `_PooledClient`, hence its own `ctx`. Two conversations running in
+  parallel never share state.
+- **Within a conversation, requests are FIFO** (`slot.lock` already
+  enforces this). One agent run completes before the next begins, so
+  the next mutation of `ctx` only happens after all of the current
+  run's tool calls have finished.
+- **No reliance on async-task context propagation**. The closure binds
+  to the `RequestContext` *object*, not to any task-local state. Tools
+  read it by attribute access; whatever value was set under the lock
+  is exactly what the tool sees.
+
+The existing call site at `tools.py:29-31` (`_current_conversation_key_var`
++ `set_current_conversation`) is removed and replaced. `agent/imaging.py`
+itself does **not** change — it already takes `conversation_key` as a
+kwarg. The change is at the caller side: the `generate_image` tool body
+inside `build_pmo_mcp(ctx)` now passes `ctx.conversation_key` to that
+existing kwarg instead of reading the old module global.
 
 ### 5.1 Tool body skeleton
 
+The skeleton runs inside the `build_pmo_mcp(ctx)` factory's closure (§5.0),
+so `ctx` is captured by reference — no parameter passing, no global state.
+
 ```python
 async def schedule_meeting(args: dict) -> dict[str, Any]:
-    message_id = _message_id_ctx.get()
-    chat_id = _chat_id_ctx.get()
-    sender_open_id = _sender_open_id_ctx.get()
+    # ctx is captured by closure from build_pmo_mcp(ctx); see §5.0.
+    message_id = ctx.message_id
+    chat_id = ctx.chat_id
+    sender_open_id = ctx.sender_open_id
     action_type = "schedule_meeting"
+
+    # Compute logical_key for repeat-utterance dedup (see §5.2 / §6.2).
+    logical_key = queries.compute_logical_key(
+        chat_id=chat_id,
+        sender_open_id=sender_open_id,
+        action_type=action_type,
+        canonical_args=args,
+    )
+
+    # Phase 0: short-window logical dedup
+    # Runs *before* Phase 1a (message_id check) deliberately: if a
+    # prior success exists for this logical_key, the side effect
+    # already happened. Whether the *current* message_id has a row
+    # (failed, pending, none) is moot — re-firing the API call would
+    # produce a duplicate.
+    recent = queries.get_recent_success_by_logical_key(logical_key, window_seconds=60)
+    if recent:
+        return _ok({**recent["result"], "deduplicated_from_logical_key": True})
 
     # Phase 1a: idempotency check
     existing = queries.get_bot_action(message_id, action_type)
@@ -636,6 +814,7 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
                 sender_open_id=sender_open_id,
                 action_type=action_type,
                 args=args,
+                logical_key=logical_key,
             )
         except queries.UniqueViolation:
             # Concurrent insert beat us — re-read and dispatch on its status.
@@ -685,14 +864,14 @@ UPDATE bot_actions
 The `WHERE status='failed'` clause is the lock: only one concurrent
 caller's UPDATE returns a row, others get 0 and bail.
 
-### 5.1 Why this and not a post-hoc listener
+### 5.1bis Why this and not a post-hoc listener
 
 | Naive approach | Failure mode |
 | --- | --- |
 | Write log after agent run finishes | Agent makes 3 tool calls; only 1 logged. |
 | Write log only on success | Webhook retry between API success and log write → duplicate side effect. |
 | Use Agent SDK's in-context memory | Memory is single-run; webhook retries are different runs entirely. |
-| Use existing `_seen_events` LRU only | Process-local, cleared on restart; doesn't cover business-level dedup ("user manually retried the same request"). |
+| Use existing `_seen_events` LRU only | Process-local, cleared on restart; doesn't cover business-level dedup. |
 
 The three-phase pattern gives:
 
@@ -703,18 +882,32 @@ The three-phase pattern gives:
 - **Audit trail for free**: the same row that locks the action also
   describes what was done and what the result was.
 
-### 5.2 Two-layer dedup, not redundant
+### 5.2 Three-layer dedup
 
-`bot/feishu/events.py:_seen_events` is the **transport** dedup: it
-stops the same Feishu webhook delivery from being processed twice
-within the same process. Cheap, in-memory, ~5 minute window.
+| Layer | Mechanism | Covers | Does NOT cover |
+| --- | --- | --- | --- |
+| **Transport** | `bot/feishu/events.py:_seen_events` LRU (`event_id`) | Feishu webhook redeliveries within the same process | Process restarts; user retypes the same instruction |
+| **Per-message idempotency** | `bot_actions UNIQUE(message_id, action_type)` | The same Feishu `message_id` reaching us twice (cross-process, cross-restart) | A *new* user message that says the same thing — different `message_id`, no constraint hit |
+| **Logical short-window dedup** | `bot_actions.logical_key` + 60-second look-back (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args | Anything older than the window; intentional re-issuance later |
 
-`bot_actions(UNIQUE message_id, action_type)` is the **business**
-dedup: it stops the same logical action from being executed twice,
-including across process restarts and across "user pressed enter
-twice on the same prompt" cases.
+`logical_key` is a stable hash over `(chat_id, sender_open_id,
+action_type, canonical_args)` — the same parameters that uniquely
+identify a logical request from a human's POV. The tool body's Phase
+0 (§5.1) checks for a `success` row with the same `logical_key`
+within 60s and returns its result instead of firing the side effect
+again.
 
-They cover different failure modes. Both stay.
+**Why a window, not another UNIQUE constraint**: the user might
+*legitimately* want to schedule "another 30-minute meeting with
+albert about the same topic" later in the day. Hard-blocking forever
+would surprise them. 60 seconds catches the "I pressed enter twice"
+case without trapping legitimate repeat scheduling.
+
+**Honesty about coverage**: in the no-confirmation-gate trust model
+(§1.4), **truly intentional re-issuance more than 60 seconds apart
+will execute twice**. We accept that — the cost of intercepting it is
+asking the user "did you mean to schedule again?" on every legitimate
+follow-up, which would erode the very fluidity §1.4 is paying for.
 
 ### 5.3 Reconciling stuck `pending` rows
 
@@ -775,6 +968,7 @@ CREATE TABLE bot_actions (
     message_id      text NOT NULL,                 -- Feishu message that triggered the action
     chat_id         text NOT NULL,                 -- Feishu chat id (group / p2p) — scope for "last in conversation"
     sender_open_id  text NOT NULL,                 -- Who asked the bot to do this — for per-user undo scoping
+    logical_key     text NOT NULL,                 -- hash(chat_id|sender_open_id|action_type|canonical_args), see §5.2
     attempt_count   int  NOT NULL DEFAULT 1,       -- bumped on retry-after-failure (see §5.1)
     action_type     text NOT NULL,                 -- 'schedule_meeting' | 'append_action_items' | ...
     status          text NOT NULL CHECK (
@@ -797,9 +991,20 @@ CREATE INDEX bot_actions_pending_idx ON bot_actions (status, created_at)
 -- Per-sender scoping prevents user A from undoing user B's action.
 CREATE INDEX bot_actions_chat_sender_recent_idx
   ON bot_actions (chat_id, sender_open_id, created_at DESC);
+-- Logical-key dedup: "did this user just say the same thing?"
+-- Partial index because we only ever look up succeeded rows here.
+CREATE INDEX bot_actions_logical_recent_idx
+  ON bot_actions (logical_key, created_at DESC)
+  WHERE status = 'success';
 ALTER TABLE bot_actions ENABLE ROW LEVEL SECURITY;
 -- Service role only; no end-user policy.
 ```
+
+`logical_key` canonicalization: `args` is canonicalized to a sorted-
+keys JSON before hashing, so `{a:1,b:2}` and `{b:2,a:1}` produce the
+same key. For `schedule_meeting`, `start_time` is normalized to UTC
+before hashing so equivalent `+08:00` / `+00:00` representations
+collide. Implementation in `db/queries.py:compute_logical_key`.
 
 `UNIQUE (message_id, action_type)` is the hard idempotency guarantee.
 Two concurrent inserts race; one wins, the other gets a violation and
@@ -829,7 +1034,7 @@ these places:
 | Concern | Lives in | Existing or new |
 | --- | --- | --- |
 | Feishu webhook handling | `bot/feishu/events.py`, `bot/app.py` | unchanged |
-| Per-run context (`message_id`, `chat_id`, `sender_open_id`, `conversation_key`) via `contextvars.ContextVar` (see §5.0) | `bot/agent/tools.py` (storage), `bot/app.py` (set call) | one block in tools.py, one call in app.py; existing `set_current_conversation` is migrated, not duplicated |
+| Per-run context (`message_id`, `chat_id`, `sender_open_id`, `conversation_key`) via `RequestContext` dataclass owned by each `_PooledClient`, captured by closure in `build_pmo_mcp(ctx)` (see §5.0) | `bot/agent/tools.py` (`RequestContext` definition + factory), `bot/agent/runner.py` (one ctx per `_PooledClient`), `bot/app.py` (mutate `slot.ctx.*` under `slot.lock`) | new dataclass, factory pattern in `build_pmo_mcp`, existing `set_current_conversation` removed entirely |
 | Tool schema + LLM-visible behavior | `bot/agent/tools.py` | new tools, three-phase pattern in each |
 | **Agent SDK `allowed_tools` whitelist** (`bot/agent/runner.py:179`) | `bot/agent/runner.py` | **must add** `mcp__pmo__resolve_people`, `mcp__pmo__schedule_meeting`, `mcp__pmo__cancel_meeting`, `mcp__pmo__list_my_meetings`, `mcp__pmo__append_action_items`, `mcp__pmo__query_action_items`, `mcp__pmo__create_meeting_doc`, `mcp__pmo__undo_last_action` to the existing list. Without this, the SDK filters the new tools out and the LLM never sees them. **Discovered during review iteration 3** — a previous draft incorrectly claimed runner.py was unchanged. |
 | Agent SDK system prompt | `bot/agent/runner.py` (`SYSTEM_PROMPT` constant) | append §9 directives |
@@ -841,10 +1046,11 @@ these places:
 Things explicitly NOT changed: `bot/feishu/cards.py`, `bot/db/client.py`,
 the existing read tools.
 
-Touched **internally only** for the contextvars migration:
-`bot/agent/imaging.py` reads the conversation key from
-`_conversation_key_ctx` instead of the old module global. No public
-API change; one-line edit.
+No imaging.py signature change is needed: `imaging.generate_and_upload`
+already takes `conversation_key` as a kwarg. The actual change is in
+the `generate_image` tool body inside `build_pmo_mcp(ctx)`, which now
+passes `ctx.conversation_key` to that existing kwarg instead of
+reading the removed module global.
 
 ---
 
@@ -914,15 +1120,15 @@ agent commonly mishandles. For traceability:
 | 4 | Orphaned half-completed multi-step actions | `bot_actions` audit log + `undo_last_action` (§3.9) |
 | 5 | Silent name-resolution failures | `resolve_people` returns `resolved/ambiguous/unresolved` separately (§3.1) |
 | 6 | Missing defaults for meeting duration / reminder | 30 min / 15 min, set in tool description (§3.3) |
-| 7 | "Which project" missing context | Tightened default rule with tie-break, threshold, and ambiguous return (§3.6) |
+| 7 | "Which project" missing context | When auto-resolution can't pick confidently, `append_action_items` returns `needs_project: true` and writes **nothing** — agent reasks user, user answers, agent retries with explicit project (§3.6). No orphan rows, no update tool needed. |
 | 8 | Bot's workspace resources deleted by humans | Self-healing re-bootstrap behind sentinel-row lock (§4); orphan acknowledgement |
 | 9 | Recurring meetings | Out of scope (§1.3) |
 | 10 | Meeting rooms / VC links | Out of scope (§1.3) |
 | 11 | Cross-language fuzzy matching | Out of scope; agent re-asks (§3.1) |
 | 12 | Doc attachments / images | Out of scope; markdown-only Docx body (§3.8) |
-| 13 | Per-task isolation of `message_id`/`chat_id` for concurrent runs | `contextvars.ContextVar` instead of module globals (§5.0) |
+| 13 | Per-task isolation of `message_id`/`chat_id` for concurrent runs | Per-`_PooledClient` `RequestContext` dataclass captured by closure in `build_pmo_mcp(ctx)` (§5.0). `contextvars.ContextVar` was tried in v3 and rejected: claude-agent-sdk dispatches tool calls from a long-lived reader task via `start_soon`, breaking ContextVar inheritance. |
 | 14 | Stuck `pending` rows after process crash | Lazy GC marks them `reconciled_unknown`, surfaced to user, never silently retried (§5.3) |
-| 15 | Concurrent re-bootstrap creating duplicate workspace resources | UNIQUE-row sentinel lock in `bot_actions` (§4) — chosen over `pg_advisory_xact_lock` because the existing `bot/db/client.py` uses Supabase REST only and has no direct Postgres connection |
+| 15 | Concurrent re-bootstrap creating duplicate workspace resources | Lock row + audit row are now **separate** in `bot_actions` (§4); lock released by **DELETE** so subsequent rebuilds can reacquire. (v3-era "release by UPDATE-to-success" was a real bug — the row would persist forever and block all future bootstraps.) |
 | 16 | "Last meeting in conversation" undefined without conversation scope | `chat_id` column on `bot_actions` + `(chat_id, sender_open_id, created_at DESC)` index (§6.2) |
 | 17 | Markdown-to-Docx assumption unverified | Two-path implementation note, A preferred (§3.8) |
 | 18 | Cross-user undo leak in groups (user A undoes user B's action) | `sender_open_id` column on `bot_actions`; `undo_last_action(last_for_me)` and `cancel_meeting(last)` filter on `(chat_id, sender_open_id)` (§3.4, §3.9, §6.2) |
@@ -932,6 +1138,10 @@ agent commonly mishandles. For traceability:
 | 22 | Scope name typos / drift between Feishu API versions | §11 step 0 runs `lark-cli` schema check before applying scopes in admin console |
 | 23 | No pre-execution confirmation gate for write actions | Accepted explicitly (§1.4); `undo_last_action` is elevated to safety-critical with v1 acceptance criteria |
 | 24 | `send_dm` (DM-as-bot) was raised by Codex review as missing | Marked out-of-scope in §1.3 with stated reason; deferred until draft-then-confirm UX is designed |
+| 25 | User retypes the same instruction → bot fires duplicate side effect (UNIQUE on `message_id` does NOT cover this) | `logical_key` column on `bot_actions` + 60-second look-back in tool body Phase 0 (§5.1, §5.2, §6.2). Re-issuance more than 60s apart still fires twice — explicitly accepted in §5.2. |
+| 26 | `contextvars.ContextVar` does not survive claude-agent-sdk's tool-call dispatch path | Per-`_PooledClient` `RequestContext` dataclass + closure-based `build_pmo_mcp(ctx)` factory (§5.0). Verified by inspecting `claude_agent_sdk/_internal/query.py:196` `start_soon` semantics. |
+| 27 | Bootstrap lock row left in `success` state forever, blocking all future rebuilds (v3 bug) | Release the lock by `DELETE`, audit by separate row (§4). Caught in iter-4 review. |
+| 28 | `append_action_items` ambiguous-project flow wrote orphan rows in v3 | Refactored to halt-and-ask: returns `needs_project` without writing (§3.6). Caught in iter-4 review. |
 
 ---
 
@@ -955,42 +1165,58 @@ internals.
    (`get_bot_action`, `insert_bot_action_pending`, `update_for_retry`,
    `mark_bot_action_success`, `mark_bot_action_failed`,
    `mark_bot_action_undone`, `last_bot_action_for_sender_in_chat`,
+   `compute_logical_key`, `get_recent_success_by_logical_key`,
    `acquire_bootstrap_lock`, `release_bootstrap_lock`) and
    `bot_workspace` (`get_bot_workspace`, `update_bot_workspace`).
 3. **`feishu/client.py`** — wrap calendar/bitable/docx/contact endpoints.
 4. **Create `bot/scripts/` directory + `bootstrap_bot_workspace.py`** —
    run once against dev env, verify the calendar/base/folder appear
    correctly. Re-runnable: detects existing workspace row and exits.
-5. **Contextvars migration in `bot/agent/tools.py`** — introduce
-   `_message_id_ctx`, `_chat_id_ctx`, `_sender_open_id_ctx`,
-   `_conversation_key_ctx` and `set_current_request(...)`; remove
-   `_current_conversation_key_var` module global. Update
-   `bot/agent/imaging.py` (one line) to read from
-   `_conversation_key_ctx.get()`. Zero behavioral change — pure
-   refactor — so it can ship and bake first.
+5. **Per-pooled-client `RequestContext` refactor** — touches three
+   files; ship and bake **before** any new write tools land:
+   - `bot/agent/tools.py`: define `RequestContext` dataclass; convert
+     `build_pmo_mcp` from a no-arg helper to a factory `build_pmo_mcp(ctx)`
+     whose tool implementations close over `ctx`. Remove the old
+     `_current_conversation_key_var` global and `set_current_conversation`.
+   - `bot/agent/runner.py`: each `_PooledClient` gets a fresh
+     `RequestContext` at construction and passes it into
+     `build_pmo_mcp(ctx)`. Add the new tools' names to `allowed_tools`
+     (combine with step 6 if you want to ship in one PR).
+   - `bot/app.py`: in `_handle_message`, after `_get_client` and
+     before `client.query()`, while holding `slot.lock`, mutate
+     `slot.ctx.message_id`, `slot.ctx.chat_id`,
+     `slot.ctx.sender_open_id`, `slot.ctx.conversation_key`.
+   - `bot/agent/imaging.py`: take `ctx` (or `conversation_key`) as an
+     argument from its caller (`generate_image` tool body) instead of
+     reading the old module global.
+
+   This is a **pure refactor** — no new tool, no new behavior. Existing
+   read tools should continue working unchanged. Verify with the
+   existing test set (or a manual round-trip in dev) before moving on.
+
 6. **`bot/agent/runner.py` — `allowed_tools` whitelist**: add the 8
    new `mcp__pmo__*` entries to the existing `allowed_tools` list at
-   `runner.py:179`. **This step blocks step 8**: without it the LLM
-   never sees the new tools, and the smoke test will silently fail
-   to invoke them.
+   `runner.py:179`. **This step blocks step 9** (smoke test): without
+   it the LLM never sees the new tools.
 7. **`agent/tools.py`** — add the 8 new tools (`resolve_people`,
    `schedule_meeting`, `cancel_meeting`, `list_my_meetings`,
    `append_action_items`, `query_action_items`, `create_meeting_doc`,
-   `undo_last_action`) plus the `today_iso` extension; register on the
-   MCP server. Each follows the §5.1 skeleton.
-8. **`app.py`** — replace the existing `set_current_conversation` call
-   in `_handle_message` with `set_current_request(message_id=...,
-   chat_id=..., sender_open_id=..., conversation_key=...)`.
-9. **System prompt** — append §9 directives in `bot/agent/runner.py`
+   `undo_last_action`) plus the `today_iso` extension as inner
+   functions inside `build_pmo_mcp(ctx)`; each follows the §5.1
+   skeleton and reads context from `ctx`.
+8. **System prompt** — append §9 directives in `bot/agent/runner.py`
    (`SYSTEM_PROMPT` constant).
-10. **End-to-end smoke test** in a private Feishu group, mandatory
-    coverage of these scenarios:
+9. **End-to-end smoke test** in a private Feishu group, mandatory
+   coverage of these scenarios:
     - Schedule a meeting with two attendees → confirm event in Feishu
       Calendar UI + `bot_actions` row with `status='success'` +
       meeting visible to both attendees with `attendee_ability=
       can_modify_event`.
     - Append 3 action items linked to the event above → confirm rows
       in `action_items` table, owners populated, project resolved.
+      Then test the ambiguous flow: ask "记一下要发邮件" with no project
+      hint and confirm `needs_project: true` is returned and **no rows
+      were written**. Provide a project, retry, confirm rows appear.
     - Create a meeting-notes doc → confirm Docx in 文档柜 + link works.
     - **Undo each of the above in turn** via `undo_last_action` →
       confirm Feishu side artifacts deleted + the original
@@ -998,11 +1224,21 @@ internals.
       `undo_last_action` row exists pointing at each original
       `action_id` (the audit trail per §3.9). (This is the §1.4
       safety-net check; do NOT skip it.)
+    - Logical_key dedup: ask the bot the same scheduling request
+      twice within 60s; confirm the second call returns the prior
+      result with `deduplicated_from_logical_key: true` and **no
+      second meeting** appears in Feishu.
     - Group chat: user A schedules a meeting, user B says "取消刚才那个会"
       → bot must refuse / say it can only undo user B's own actions.
+    - Bootstrap recovery: manually delete the bot's Bitable base in
+      Feishu, then issue a write request; confirm the bot self-heals
+      (re-creates the base, posts the warning message, completes the
+      original request). Run two such requests concurrently and
+      confirm only **one** new base is created.
 
-Each step touches at most one file (step 5 touches two: `tools.py`
-and `imaging.py`).
+Each step touches at most one or two files. Step 5 is the largest
+single touch (4 files), and is intentionally separated from new-
+behavior steps so a regression there is easier to bisect.
 
 ---
 
