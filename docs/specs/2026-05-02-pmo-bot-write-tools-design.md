@@ -351,10 +351,15 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    single-user variant) with body built via
    `BatchFreebusyRequestBody.builder()`. Body fields per
    `lark_oapi/api/calendar/v4/model/batch_freebusy_request_body.py`:
-   `user_ids: List[str]` (NOT `user_id_list`), `time_min: str`,
-   `time_max: str`, `include_external_calendar: bool` (we pass
-   `false`), `only_busy: bool` (we pass `true`). Use
-   `user_id_type="open_id"` on the request.
+   `user_ids=effective_attendees` (the union from Phase 2.0,
+   **including the auto-added asker** per `include_asker=True`;
+   parameter is named `user_ids`, NOT `user_id_list`), `time_min:
+   str`, `time_max: str`, `include_external_calendar: bool` (we
+   pass `false`), `only_busy: bool` (we pass `true`). Use
+   `user_id_type="open_id"` on the request. Including the asker in
+   the freebusy check matters: if the asker is double-booked at
+   the requested time, we want to surface that as a conflict
+   rather than silently scheduling over their existing meeting.
 
    If any returned slot overlaps the requested window, **the action
    is complete with a "conflict" outcome — NOT a failure**. Mark the
@@ -546,7 +551,18 @@ Resolution rules:
   team. v1 keeps this strict (no override flag); a future "I'm sure,
   cancel anyway" path can be added once UX supports cross-chat
   confirmations.
-- If `last:true`: look up `bot_actions WHERE chat_id=<current> AND
+- If `last:true`: **first** check whether the most recent action by
+  this asker in this chat (any action_type) is itself a successful
+  `cancel_meeting` from the last ~5 minutes. If so, return idempotent
+  no-op with a message like "我刚才已经取消了 X — 是要再取消另一个
+  更早的会吗？". This guards the iter-15 self-review B6 scenario:
+  user A schedules meeting X (success), cancels it (success), then
+  (perhaps from a double-tap or duplicated webhook) says "取消刚才
+  那个会" again — without this guard, the next-most-recent
+  schedule_meeting query below would silently cancel an unrelated
+  *earlier* meeting.
+
+  Otherwise, look up `bot_actions WHERE chat_id=<current> AND
   sender_open_id=<current> AND action_type='schedule_meeting' AND
   status IN ('success','reconciled_unknown') AND target_id IS NOT
   NULL ORDER BY created_at DESC LIMIT 1`. **The `sender_open_id`
@@ -562,8 +578,11 @@ Resolution rules:
   via "取消刚才那个会"; excluding it would force the user to use
   `undo_last_action` instead — confusing when both should work
   symmetrically. The combined filter matches the §3.9 "undoable"
-  predicate exactly. Requires `(chat_id, sender_open_id)` on
-  `bot_actions` (see §6.2).
+  predicate exactly. Note this query naturally excludes already-
+  cancelled meetings: §3.4 Phase 3 marks the original
+  `schedule_meeting` row `status='undone'`, which is excluded by
+  the `status IN ('success','reconciled_unknown')` clause.
+  Requires `(chat_id, sender_open_id)` on `bot_actions` (see §6.2).
 
 **Internal sequence**:
 
@@ -2041,10 +2060,11 @@ for case (a). Case (b) does NOT touch `status` — it mutates only
 Both `partial_success` flavors behave identically from undo's POV
 — the GC only differs in *who* set the row to reconciled_unknown.
 Both are visible to `last_for_me` per the §3.9 "undoable" predicate
-(`target_id IS NOT NULL OR (status='reconciled_unknown' AND result
-? 'import_ticket')`). Code that branches on reconciliation reason
-should test `result.reconciliation_kind` rather than parsing the
-`error` string, which is meant for human display.
+(`target_id IS NOT NULL OR (status='reconciled_unknown' AND
+(result ? 'import_ticket' OR result ? 'source_file_token'))`). Code
+that branches on reconciliation reason should test
+`result.reconciliation_kind` rather than parsing the `error` string,
+which is meant for human display.
 
 ---
 
@@ -2534,6 +2554,10 @@ agent commonly mishandles. For traceability:
 | 90 | `schedule_meeting` had no mechanism for including the asker in the meeting. Typical request "帮我和 Albert 订个会" resulted in `attendee_open_ids=[albert_open_id]` (LLM had no way to derive the asker's open_id from the prompt-injected `[asker]` line). Asker would not receive the invite AND `list_my_meetings`'s `bot_known_events` JOIN (which filters on `result.attendees ⊇ {target}`) would not surface the meeting back to the asker | New `include_asker: bool = True` input. When `True` (default), Phase 2.0 unions `ctx.sender_open_id` into the effective attendee list before any Feishu call; the original LLM-supplied list is preserved verbatim in `bot_actions.args`. Caught in iter-14 Codex review. |
 | 91 | `create_meeting_doc` undo only deleted the docx; the source `.md` was deliberately left in Drive ("v1 simplicity"). But §1.4 says every write tool's outputs must be undoable, and the smoke test asserts "Feishu side artifacts deleted" — both contracts were violated | §3.9 docx undo branch now also best-effort deletes `result.source_file_token` (logs warning on failure but doesn't fail the undo). §3.8 Phase 2.3.5 wording aligned. Caught in iter-14 Codex review. |
 | 92 | §3.3 Phase 2.3 attendee builder example used `CalendarEventAttendee(type="user", user_id=open_id)` and lower-case `true`. lark-oapi model classes accept only `d=None` in their `__init__` (raises `TypeError` on kwargs); only the `.builder()` shape works. Lower-case `true` is JS/Java, not Python | Example rewritten with full `.builder().type("user").user_id(open_id).build()` shape and Python `True`. Caught in iter-14 Codex review. |
+| 93 | `last_bot_action_for_sender_in_chat` skipped `pending` rows entirely (statuses filter excludes `pending`). A user's most recent action could be a stuck-mid-flight pending row; "撤销刚才那个" would silently surface the *second*-most-recent terminal row, undoing the wrong action | Helper now runs a pre-step that GCs any newer pending rows by the same sender via `_lazy_gc_stuck_pending`. Post-GC, the row either becomes `partial_success` (correctly returned as last) or `stuck_pending` (correctly skipped, no recoverable handle). Caught in iter-15 self-review. |
+| 94 | §3.3 Phase 2.1 freebusy body said `user_ids: List[str]` without specifying which list. iter-14 introduced `effective_attendees` (asker auto-included) but Phase 2.1 didn't say it was the freebusy input. Implementer might pass `args.attendee_open_ids` (raw LLM input, no asker), missing the case where asker is double-booked at the requested time | Phase 2.1 now explicitly reads `user_ids=effective_attendees` with rationale that asker double-booking should surface as conflict. Caught in iter-15 self-review. |
+| 95 | `cancel_meeting(last:true)` after a successful cancel of meeting X had no idempotency guard. A retry (double-tap, duplicated webhook missed by the LRU dedup) would resolve `last:true` to the next-most-recent uncancelled meeting (the schedule row of X is `undone` so falls out) and silently cancel an unrelated *earlier* meeting | §3.4 `last:true` rule prepended with a check: if the asker's most recent action in this chat is itself a successful `cancel_meeting` < ~5 min old, return idempotent no-op with "I already cancelled X — did you mean an earlier one?" Caught in iter-15 self-review. |
+| 96 | §5.3 prose quote of the §3.9 "undoable" predicate was missing the iter-13 `source_file_token` arm. Reader establishing mental model from §5.3 alone would miss the doc Phase 2.1.5 / 2.2.5 partial case | §5.3 quote now includes the full `(result ? 'import_ticket' OR result ? 'source_file_token')` clause. Caught in iter-15 self-review. |
 
 ---
 
@@ -2625,6 +2649,21 @@ internals.
      have `target_id=event_id`, so the source_file_token arm is
      irrelevant for cancel and the predicate naturally excludes
      unrelated doc partials.
+
+     **Pre-step: GC any newer pending rows by the same sender in
+     the same chat** (iter-15 self-review B2): before running the
+     undoable filter above, scan for rows matching `chat_id=$1 AND
+     sender_open_id=$2 AND status='pending' AND created_at < now() -
+     interval '5 minutes'` and run `_lazy_gc_stuck_pending` on each.
+     This ensures a stuck-pending row newer than the candidate the
+     filter would otherwise return doesn't get silently skipped:
+     after GC, content-aware kind assignment either promotes it to
+     `partial_success` (in which case it becomes the new "last
+     undoable" candidate, correctly representing the user's most
+     recent action) or to `stuck_pending` (in which case it's
+     correctly skipped because it has no recoverable handle). Without
+     this pre-step, "撤销刚才那个" after a crashed-mid-flight call
+     would silently undo an older action instead.
    - `compute_logical_key(*, chat_id, sender_open_id, action_type,
      canonical_args)` — pure hash function.
    - `get_locked_by_logical_key(logical_key)` — Phase 0 lookup;
