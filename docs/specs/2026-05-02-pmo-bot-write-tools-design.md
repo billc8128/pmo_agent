@@ -297,8 +297,22 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
 - `start_time: str` — RFC3339 with timezone, no defaults, no ambiguity.
 - `duration_minutes: int = 30`
 - `attendee_open_ids: list[str]` — must come from `resolve_people`.
+  The asker should NOT be in this list; the tool body adds them
+  automatically (see Phase 2.0 below).
 - `description: str = ""`
 - `reminder_minutes: int = 15`
+- `include_asker: bool = True` — when `True` (default), the tool
+  body unions `ctx.sender_open_id` into `attendee_open_ids` before
+  any Feishu call. The LLM cannot easily resolve its own Feishu
+  open_id (the `[asker]` line carries pmo `user_id`/`handle` only,
+  not open_id), so a typical request "帮我和 Albert 订个会" would
+  pass `attendee_open_ids=[albert_open_id]` and silently exclude
+  the asker. Worse, `list_my_meetings`'s `bot_known_events` JOIN
+  filters on `result.attendees ⊇ {target}`, so the asker would
+  not be able to find their own meeting. Auto-inclusion fixes
+  both. Set to `False` only for the rare "schedule a meeting I'm
+  not attending" intent (e.g., the asker is a PMO booking on
+  someone else's behalf).
 
 **Internal sequence** (the three-phase pattern, see §5):
 
@@ -309,16 +323,28 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    retries. **All subsequent steps including freebusy run only after
    this row exists**, so a webhook retry sees `pending` and bails out
    without re-issuing any Feishu calls.
-2. **Phase 2.0 — Read bot's calendar_id**: load
-   `bot_workspace.calendar_id` (cached in process for the request).
-   Every later Calendar SDK call needs **both** `calendar_id` AND
-   `event_id` as path params (`/calendars/:calendar_id/events/:event_id/...`)
-   — the SDK request builders all require both, see
+2. **Phase 2.0 — Read bot's calendar_id + finalize attendee list**:
+   load `bot_workspace.calendar_id` (cached in process for the
+   request). Every later Calendar SDK call needs **both**
+   `calendar_id` AND `event_id` as path params
+   (`/calendars/:calendar_id/events/:event_id/...`) — the SDK
+   request builders all require both, see
    `lark_oapi/api/calendar/v4/model/{create_calendar_event_attendee_request,
    get_calendar_event_request, delete_calendar_event_request}.py`. We
    thread the bot's own `calendar_id` through every step here, then
    record it in `result.calendar_id` so cancel/undo can re-read it
    later without going back to `bot_workspace`.
+
+   **Asker auto-inclusion** (iter-14 fix): if `include_asker=True`
+   (the default — see input docs above), compute the effective
+   attendee list as `effective_attendees =
+   list({*args.attendee_open_ids, ctx.sender_open_id})`. This
+   list is what gets passed to freebusy (Phase 2.1), the event
+   create call's notify field, the attendee invite call (Phase
+   2.3), and `result.attendees` (Phase 3). The LLM-supplied
+   `attendee_open_ids` is preserved verbatim in the
+   `bot_actions.args` jsonb for audit purposes — only the runtime
+   call uses the union.
 3. **Phase 2.1 — Freebusy pre-check**: call
    `client.calendar.v4.freebusy.batch(BatchFreebusyRequest)` (SDK
    method is `freebusy.batch`, NOT `freebusy.list` — the latter is a
@@ -388,12 +414,34 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    try to recover automatically — that would require an out-of-band
    reconciler that the §1.4 trust model doesn't currently warrant.
 6. **Phase 2.3 — Invite attendees**:
-   `client.calendar.v4.calendar_event_attendee.create(
-   CreateCalendarEventAttendeeRequest.builder().calendar_id(
-   bot_calendar_id).event_id(event_id).request_body(
-   CreateCalendarEventAttendeeRequestBody.builder().attendees([
-   CalendarEventAttendee(type="user", user_id=open_id), ...]).
-   need_notification(true).build()).user_id_type("open_id").build())`.
+   ```python
+   client.calendar.v4.calendar_event_attendee.create(
+     CreateCalendarEventAttendeeRequest.builder()
+       .calendar_id(bot_calendar_id)
+       .event_id(event_id)
+       .user_id_type("open_id")
+       .request_body(
+           CreateCalendarEventAttendeeRequestBody.builder()
+             .attendees([
+                 CalendarEventAttendee.builder()
+                   .type("user")
+                   .user_id(open_id)
+                   .build()
+                 for open_id in effective_attendees
+             ])
+             .need_notification(True)
+             .build()
+       )
+       .build()
+   )
+   ```
+   `CalendarEventAttendee` (and similar lark-oapi models) MUST be
+   constructed via `.builder().<field>(...).build()` — the model
+   class's `__init__` only accepts `d=None` and will raise
+   `TypeError` on keyword arguments. Same pattern for every
+   lark-oapi model in this spec. Note Python `True` (capital T),
+   not `true`.
+
    The SDK exposes this as `calendar.v4.calendar_event_attendee`
    (flat attribute, with underscore — see
    `lark_oapi/api/calendar/v4/version.py`), NOT as a nested
@@ -527,20 +575,62 @@ Resolution rules:
    required by every Calendar SDK call.
 2. **Phase 1 — pending insert** keyed on `(message_id, "cancel_meeting")`.
 3. **Phase 2a — Read full event before delete**:
-   `client.calendar.v4.calendar_event.get(GetCalendarEventRequest
-   .builder().calendar_id(calendar_id).event_id(event_id).build())`
+   ```python
+   client.calendar.v4.calendar_event.get(
+     GetCalendarEventRequest.builder()
+       .calendar_id(calendar_id)
+       .event_id(event_id)
+       .need_attendee(True)             # iter-14 fix: snapshot must
+       .user_id_type("open_id")          # carry attendees as open_id
+       .build()
+   )
+   ```
    → `pre_cancel_event_snapshot`. **Critical for undo**: without
    this snapshot, undo cannot restore the event; once Feishu
    deletes, the event is gone server-side. This call must succeed
    before we delete.
-4. **Phase 2b — Delete**:
+
+   The two builder args matter: `need_attendee=True` makes the
+   response include the attendee list (default omits it for
+   bandwidth); `user_id_type="open_id"` ensures the attendee user
+   IDs come back as open_ids matching the identity space used
+   everywhere else in this spec. Without these, restore (§3.9)
+   would either have no attendee list at all, or have union_ids
+   that mismatch the open_id-based `attendee.create` call.
+
+4. **Phase 2a.5 — Persist snapshot BEFORE deletion** (iter-14 fix):
+   UPDATE the `pending` row with `result.pre_cancel_event_snapshot=<from
+   2a>` and `result.calendar_id=<...>`. **The row stays `pending`**
+   — this is the same intermediate-persist pattern as §3.3 Phase
+   2.2.5. Critical for the §1.4 "cancel must be undoable" contract:
+   if the process crashes between `delete` (step 4) and Phase 3
+   (step 5), the snapshot is already in DB and undo can still run.
+   Without 2a.5, a crash in that window would leave the event
+   deleted on Feishu with no DB record of how to restore it —
+   directly violating §1.4. Also log
+   `pre_cancel_event_snapshot.event_id + attendees` to stderr at
+   INFO level just before the UPDATE for the residual upload-style
+   crash window between Feishu return and DB write.
+5. **Phase 2b — Delete**:
    `client.calendar.v4.calendar_event.delete(DeleteCalendarEventRequest
    .builder().calendar_id(calendar_id).event_id(event_id).build())`.
-5. **Phase 3 — Persist terminal state**: mark this `cancel_meeting`
-   row `success` with `result={original_event_id, calendar_id,
-   pre_cancel_event_snapshot}`. Mark the original `schedule_meeting`
+6. **Phase 3 — Persist terminal state**: mark this `cancel_meeting`
+   row `success` with **`target_id=<original_event_id>`,
+   `target_kind='calendar_event_cancel'`** (iter-14 fix — without
+   these, `last_for_me`'s `target_id IS NOT NULL` filter would
+   silently miss `cancel_meeting` rows, breaking the "取消后再撤销"
+   path), and augment `result` with `cancelled_at=now()`. The
+   `pre_cancel_event_snapshot` and `calendar_id` are already in
+   `result` from Phase 2a.5. Mark the original `schedule_meeting`
    row `status='undone'` for traceability (and so it stops appearing
    in `last_for_me` lookups).
+
+   The new `target_kind='calendar_event_cancel'` (distinct from
+   `'calendar_event'`) is a §3.9 dispatch discriminator: undo of a
+   cancel_meeting row uses the restore-from-snapshot path (§3.9),
+   never the simple delete path. Reusing `'calendar_event'` would
+   ambiguously re-route undo to the delete path and double-cancel
+   an already-cancelled event.
 
 **Why snapshot, not just rely on Feishu trash/recovery**: Feishu
 calendar events do not have a "recently deleted" recovery window
@@ -955,12 +1045,12 @@ implementation:
      `target_id=<doc_token from poll>`, `target_kind="docx"`,
      `result.url=<...>`, and **keep `result.source_file_token`
      intact** (do NOT clear it). The source `.md` stays in the bot's
-     文档柜 alongside the imported docx — for v1 we accept this
-     duplication ("v1 simplicity"; same trade-off mentioned in §3.8
-     intro). Undo on this row will delete the docx via target_id;
-     it deliberately does NOT also clean up the source `.md` because
-     a future "I want the markdown back" UX could read it. Now undo
-     can find the doc.
+     文档柜 alongside the imported docx for the row's working
+     lifetime — undo (§3.9) deletes BOTH the docx and the source
+     `.md` (iter-14 fix: §1.4 requires every write tool's outputs
+     to be undoable, and the smoke test verifies "Feishu side
+     artifacts deleted" — leaving the `.md` violates both
+     contracts). Now undo can find both.
   7. **Phase 3 — Persist terminal status**: UPDATE `status='success'`.
 
   **Failure / uncertainty handling**:
@@ -1031,11 +1121,14 @@ tool's **interface** — only its body.
     ```
 
     - `target_id IS NOT NULL` covers the normal cases:
-      `schedule_meeting` / `cancel_meeting` (event_id);
-      `append_action_items` (table_id, see §3.6);
-      `create_meeting_doc` after step 6 (doc_token);
+      `schedule_meeting` (event_id, target_kind='calendar_event');
+      `cancel_meeting` (the **original** event_id, target_kind=
+      'calendar_event_cancel' — distinct discriminator so dispatch
+      routes to restore-from-snapshot, see §3.4 Phase 3);
+      `append_action_items` (table_id, target_kind='bitable_records');
+      `create_meeting_doc` after step 6 (doc_token, target_kind='docx');
       `create_meeting_doc` partial-success at step 3 cleanup
-      failure (target_id=source_file_token, target_kind='file').
+      failure (source_file_token, target_kind='file').
     - The `result ? 'import_ticket'` arm covers the doc-partial
       case where polling timed out: `target_id` is NULL but we
       have an `import_ticket` we can re-poll.
@@ -1083,7 +1176,9 @@ Dispatches on `action_type`:
 - `cancel_meeting` → **restore-from-snapshot**:
   `client.calendar.v4.calendar_event.create(...calendar_id(<from
   result.calendar_id>)...)` populated from
-  `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a),
+  `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a.5,
+  before the delete — so this branch is reachable even if the
+  process crashed between delete and Phase 3),
   then `client.calendar.v4.calendar_event_attendee.create(...
   calendar_id(<same>).event_id(new_event_id).user_id_type(
   "open_id")...)` for the original attendees. The
@@ -1120,9 +1215,33 @@ Dispatches on `action_type`:
   source-of-truth artifact depends on which Phase the row got stuck
   at (see §3.8 for the four possible terminal shapes):
   - `target_kind='docx'` (full success or post-step-6 partial):
-    `client.drive.v1.file.delete(DeleteFileRequest.builder()
-    .file_token(<target_id>).type("docx").build())`. Both
-    `file_token` and `type` are required by the SDK (see
+    ```python
+    # 1. delete the docx itself (mandatory)
+    client.drive.v1.file.delete(
+      DeleteFileRequest.builder()
+        .file_token(target_id)
+        .type("docx")
+        .build()
+    )
+    # 2. ALSO best-effort delete the source .md if we still have its
+    #    token. iter-14 fix: §1.4 says "every write tool's outputs
+    #    must be undoable" and the smoke test checks "Feishu side
+    #    artifacts deleted" — leaving the .md violates both.
+    if result.get("source_file_token"):
+        try:
+            client.drive.v1.file.delete(
+              DeleteFileRequest.builder()
+                .file_token(result["source_file_token"])
+                .type("file")
+                .build()
+            )
+        except Exception as e:
+            logger.warning("undo: failed to delete source .md %s: %s",
+                           result["source_file_token"], e)
+            # Non-fatal: docx is gone, the user's intent is satisfied.
+            # Operator can manually clean the .md from the bot's 文档柜.
+    ```
+    Both `file_token` and `type` are required by the SDK (see
     `lark_oapi/api/drive/v1/model/delete_file_request.py`).
   - `target_kind='file'` (step-3 partial: `.md` uploaded but
     import never started): same call but `type="file"`. Using
@@ -1858,14 +1977,28 @@ user to verify on the Feishu side before issuing a fresh request.
 This deliberately surfaces a rare case to the user rather than silently
 risking a duplicate meeting.
 
-GC happens in `get_bot_action` itself: if a row matches `status=
-'pending' AND created_at < now() - interval '5 minutes'`, the function
-runs an atomic `UPDATE ... SET status='reconciled_unknown',
-result = jsonb_set(...), logical_key_locked = <CASE on content>
-WHERE id=$id AND status='pending' RETURNING *` before returning the
-row. The `WHERE status='pending'` predicate avoids races with a
-still-live caller about to commit a success. The full SQL is in
-§6.2 "Lock behavior on status transitions".
+GC happens via a shared helper `_lazy_gc_stuck_pending(action_id)`
+in `db/queries.py` that runs the atomic content-aware UPDATE
+described above. **Both** read paths invoke it as their first step,
+so a stuck-pending row is discovered no matter how the next request
+finds it:
+
+- `get_bot_action(message_id, action_type)` → calls
+  `_lazy_gc_stuck_pending` on the candidate row before returning
+  (catches the case where the user retries the *same* message_id).
+- `get_locked_by_logical_key(logical_key)` → calls
+  `_lazy_gc_stuck_pending` on the candidate row before evaluating
+  the success-unlock GC below (catches the **iter-14 case**: a new
+  user message with a fresh `message_id` but the same logical
+  request as a crashed earlier call. Without this, the new message
+  would loop forever on "previous identical call is in flight"
+  because the old `message_id`'s row sits at `pending` until
+  someone happens to look it up by message_id — which never
+  happens for a new user message.)
+
+The full SQL is in §6.2 "Lock behavior on status transitions"; the
+`WHERE id=$id AND status='pending'` predicate avoids races with a
+still-live caller about to commit a success.
 
 **(b) Aged success → unlock the logical_key** (§5.2): a `success`
 row older than 60 s should leave the partial UNIQUE index on
@@ -1874,14 +2007,17 @@ flips `logical_key_locked` from `true` to `false`. The row's `status`
 stays `success` — it's still a successful action for audit/restore
 purposes; only its claim on the dedup lock has expired.
 
-GC happens in `get_locked_by_logical_key` itself: when the function
-finds a candidate row matching the requested `logical_key`, it checks
+GC happens in `get_locked_by_logical_key` itself: AFTER running the
+shared `_lazy_gc_stuck_pending` helper from case (a), it then checks
 `created_at`. If `status='success' AND logical_key_locked = true AND
 created_at < now() - interval '60 seconds'`, it runs
 `UPDATE ... SET logical_key_locked = false WHERE id=$id AND
 logical_key_locked = true` (the predicate avoids double-flip races)
 and treats the row as not-locked (returning NULL to the caller, which
-then proceeds with its INSERT).
+then proceeds with its INSERT). The case-(a) GC running first is
+load-bearing here — without it, a 5-minute-stuck pending row would
+just look like any other locked row and the caller would see
+"in flight" forever.
 
 **Why both GCs are lazy and not a cron**: the rates are too low to
 justify a loop. Stuck-pending events fire only on process crash;
@@ -2391,6 +2527,13 @@ agent commonly mishandles. For traceability:
 | 83 | `mark_bot_action_reconciled_unknown(kind='partial_success')` had no helper-level guard that the resulting row would actually be undoable. A typo at a callsite — passing `partial_success` when no handle exists — would create a permanently locked + unreachable row | Helper now enforces an INVARIANT in Python (cannot easily be expressed in pure SQL since it inspects the *combined* existing+patched state): if `kind='partial_success'`, the post-update row must have at least one of `target_id`, `result.import_ticket`, `result.source_file_token`. Otherwise `ValueError` is raised; caller must either provide a handle or downgrade to `kind='stuck_pending'`. Caught in iter-13 Codex review. |
 | 84 | §6.2 lock-behavior table claimed partial_success "artifact exists in a known location (`target_id` is set)" — outdated since iter-12 introduced GC-discovered partials where only `result.import_ticket` or `result.source_file_token` is set | Cell rewritten to enumerate all three handle locations (`target_id` OR `result.import_ticket` OR `result.source_file_token`) and cross-references the helper invariant in §6.2 SQL. Caught in iter-13 Codex review. |
 | 85 | Findings-table row #37 quoted the iter-7 baseline predicate `status IN ('pending','success')` without noting that iter-10 (row 52) extended it to include `'reconciled_unknown'`. A future reviewer scanning the findings table would believe the baseline still applies | Row #37 now annotated with a forward reference to row 52 / current §6.2 SQL. Caught in iter-13 Codex review. |
+| 86 | Stuck-pending GC was wired to `get_bot_action` (message_id lookup) only. New user messages with the same logical request as a crashed earlier call go through `get_locked_by_logical_key` — they would see the 5-min-old `pending` row, get told "previous identical call is in flight", and stay stuck forever (because no `get_bot_action(old_message_id, ...)` is ever issued for a new utterance) | §5.3 case (a) GC promoted to a shared `_lazy_gc_stuck_pending(action_id)` helper; both `get_bot_action` and `get_locked_by_logical_key` call it as their first step. The §5.3 prose explicitly traces both paths. Caught in iter-14 Codex review. |
+| 87 | `cancel_meeting` Phase 3 didn't set `target_id` / `target_kind` on the success row. iter-11 made `last_for_me`'s undoable predicate require `target_id IS NOT NULL`; meanwhile §3.9 documented `cancel_meeting` as one of the `target_id`-covered normal cases — the two sections were silently inconsistent and a literal Phase-3 implementation would break the "取消后再撤销" path | §3.4 Phase 3 now sets `target_id=<original_event_id>` and `target_kind='calendar_event_cancel'` (a new discriminator distinct from `'calendar_event'` so §3.9 dispatch routes to restore-from-snapshot, not delete). §3.9 normal-cases list updated to reflect the discriminator. Caught in iter-14 Codex review. |
+| 88 | `cancel_meeting`'s `pre_cancel_event_snapshot` was held only in process memory and persisted in Phase 3 AFTER the delete call. A crash between `delete` (Phase 2b) and Phase 3 left the event gone on Feishu but with no snapshot in DB — directly violating §1.4's "cancel must be undoable" guarantee | New §3.4 **Phase 2a.5** persists the snapshot to `result.pre_cancel_event_snapshot` BEFORE the delete call, plus a stderr log of `event_id + attendees` for the residual pre-2a.5 crash window. Same intermediate-persist pattern as §3.3 Phase 2.2.5 / §3.8 Phase 2.X.5. Caught in iter-14 Codex review. |
+| 89 | The Phase 2a `calendar_event.get` SDK call did not pass `.need_attendee(True).user_id_type("open_id")`. Without `need_attendee`, the snapshot's attendee list could be empty; without `user_id_type`, attendee user IDs would default to `union_id`, mismatching the open_id-based `attendee.create` call that the restore branch makes | §3.4 Phase 2a now shows the full builder including both kwargs, with an inline rationale tying back to §3.3 Phase 2.3's identity space. Caught in iter-14 Codex review. |
+| 90 | `schedule_meeting` had no mechanism for including the asker in the meeting. Typical request "帮我和 Albert 订个会" resulted in `attendee_open_ids=[albert_open_id]` (LLM had no way to derive the asker's open_id from the prompt-injected `[asker]` line). Asker would not receive the invite AND `list_my_meetings`'s `bot_known_events` JOIN (which filters on `result.attendees ⊇ {target}`) would not surface the meeting back to the asker | New `include_asker: bool = True` input. When `True` (default), Phase 2.0 unions `ctx.sender_open_id` into the effective attendee list before any Feishu call; the original LLM-supplied list is preserved verbatim in `bot_actions.args`. Caught in iter-14 Codex review. |
+| 91 | `create_meeting_doc` undo only deleted the docx; the source `.md` was deliberately left in Drive ("v1 simplicity"). But §1.4 says every write tool's outputs must be undoable, and the smoke test asserts "Feishu side artifacts deleted" — both contracts were violated | §3.9 docx undo branch now also best-effort deletes `result.source_file_token` (logs warning on failure but doesn't fail the undo). §3.8 Phase 2.3.5 wording aligned. Caught in iter-14 Codex review. |
+| 92 | §3.3 Phase 2.3 attendee builder example used `CalendarEventAttendee(type="user", user_id=open_id)` and lower-case `true`. lark-oapi model classes accept only `d=None` in their `__init__` (raises `TypeError` on kwargs); only the `.builder()` shape works. Lower-case `true` is JS/Java, not Python | Example rewritten with full `.builder().type("user").user_id(open_id).build()` shape and Python `True`. Caught in iter-14 Codex review. |
 
 ---
 
