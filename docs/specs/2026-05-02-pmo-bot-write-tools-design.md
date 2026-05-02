@@ -634,12 +634,17 @@ the same row.
 -- Lock row: exists at most once, lifecycle = "a bootstrap is in
 -- flight". Released by DELETE, NOT by transitioning status — see
 -- "Why DELETE, not UPDATE" below.
+--
+-- logical_key_locked = false on this row: the lock semantics here
+-- come from the (message_id, action_type) UNIQUE, NOT from the
+-- logical_key partial UNIQUE. Setting it false prevents bootstrap
+-- attempts from inadvertently competing for the dedup index.
 INSERT INTO bot_actions
   (message_id, chat_id, sender_open_id, logical_key,
-   action_type, status, args)
+   action_type, status, args, logical_key_locked)
 VALUES
   ('__bootstrap_lock__', '__system__', '__system__', '__bootstrap_lock__',
-   'bootstrap_workspace_lock', 'pending', '{}'::jsonb)
+   'bootstrap_workspace_lock', 'pending', '{}'::jsonb, false)
 ON CONFLICT (message_id, action_type) DO NOTHING
 RETURNING id;
 ```
@@ -649,17 +654,18 @@ RETURNING id;
 ```sql
 -- Each bootstrap attempt also writes its own audit row with a unique
 -- message_id (e.g. timestamp + random) so the history accumulates
--- and stays queryable. logical_key here is just the same unique
--- message_id (it's never used for dedup — bootstrap is intentionally
--- not idempotent across re-runs; we want every attempt logged).
+-- and stays queryable. logical_key is set to the same unique message_id
+-- AND logical_key_locked = false: bootstrap is intentionally not
+-- idempotent across re-runs; we want every attempt logged and we
+-- don't want bootstrap to take up slots in the dedup index.
 INSERT INTO bot_actions
   (message_id, chat_id, sender_open_id, logical_key,
-   action_type, status, args, target_kind)
+   action_type, status, args, target_kind, logical_key_locked)
 VALUES
   ('bootstrap-' || $timestamp || '-' || $random_suffix,
    '__system__', '__system__',
    'bootstrap-' || $timestamp || '-' || $random_suffix,
-   'bootstrap_workspace', 'pending', $args, 'workspace_bootstrap')
+   'bootstrap_workspace', 'pending', $args, 'workspace_bootstrap', false)
 RETURNING id;
 ```
 
@@ -760,9 +766,44 @@ pooled-client architecture makes the staleness case dominant.
 
 Each pooled client gets one `RequestContext` instance. `build_pmo_mcp`
 becomes a factory that takes the context and returns an MCP server
-whose tool implementations close over it. `_handle_message` mutates
-the context's fields **before** calling `client.query()`, while
-holding `slot.lock` so no other request can interleave.
+whose tool implementations close over it. The runner mutates the
+context's fields **inside its existing `slot.lock` acquisition**
+before calling `client.query()`, so no other request can interleave.
+
+**Encapsulation matters here**: `app.py` and other callers do NOT
+reach into `_get_client`, `slot.ctx`, or `slot.lock` directly. Those
+are private to `bot/agent/runner.py`. The public surface of the
+runner gains the new request fields as parameters:
+
+```python
+# bot/agent/runner.py — public surface
+async def answer(
+    conversation_key: str,
+    question: str,
+    *,
+    message_id: str,
+    chat_id: str,
+    sender_open_id: str,
+) -> str: ...
+
+async def answer_streaming(
+    conversation_key: str,
+    question: str,
+    *,
+    message_id: str,
+    chat_id: str,
+    sender_open_id: str,
+):  # AsyncIterator
+    ...
+```
+
+Inside `answer_streaming`, *after* acquiring `slot.lock` (the same
+acquisition that already exists at `runner.py:240`), the runner sets
+`slot.ctx.*` from the new parameters. `app.py` never imports
+`_get_client` or touches `slot.*`; it just calls `answer_streaming`
+with the four request parameters and consumes the async iterator as
+it does today. This preserves the pooling protocol as private and
+also covers the fallback `answer()` path at `app.py:158` automatically.
 
 ```python
 # bot/agent/tools.py
@@ -808,7 +849,7 @@ def build_pmo_mcp(ctx: RequestContext):
 ```
 
 ```python
-# bot/agent/runner.py
+# bot/agent/runner.py — private internals (unchanged shape, plus ctx)
 @dataclass
 class _PooledClient:
     client: ClaudeSDKClient
@@ -818,32 +859,36 @@ class _PooledClient:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 async def _get_client(conversation_key: str) -> _PooledClient:
-    async with _pool_lock:
-        slot = _pool.get(conversation_key)
-        if slot is None:
-            ctx = RequestContext()  # one ctx for this pooled client's lifetime
-            options = ClaudeAgentOptions(
-                ...,
-                mcp_servers={"pmo": build_pmo_mcp(ctx)},  # closure over ctx
-                ...,
-            )
-            client = ClaudeSDKClient(options=options)
-            await client.connect()
-            slot = _PooledClient(client=client, ctx=ctx)
-            _pool[conversation_key] = slot
-        ...
-        return slot
+    # ...creates ctx + ClaudeSDKClient with mcp_servers={"pmo": build_pmo_mcp(ctx)}...
+    ...
+
+async def answer_streaming(
+    conversation_key: str,
+    question: str,
+    *,
+    message_id: str,
+    chat_id: str,
+    sender_open_id: str,
+):
+    slot = await _get_client(conversation_key)
+    async with slot.lock:                       # already exists today
+        slot.ctx.message_id = message_id
+        slot.ctx.chat_id = chat_id
+        slot.ctx.sender_open_id = sender_open_id
+        slot.ctx.conversation_key = conversation_key
+        # ... existing body: slot.client.query(question), receive_response loop ...
 ```
 
 ```python
-# bot/app.py — inside _handle_message, after acquiring slot.lock
-slot = await agent_runner._get_client(conversation_key)
-async with slot.lock:
-    slot.ctx.message_id = ev.message_id
-    slot.ctx.chat_id = ev.chat_id
-    slot.ctx.sender_open_id = ev.sender_open_id
-    slot.ctx.conversation_key = conversation_key
-    # ... then call into the agent ...
+# bot/app.py — _handle_message stays at the public surface only
+async for event in agent_runner.answer_streaming(
+    conversation_key,
+    framed_question,
+    message_id=ev.message_id,
+    chat_id=ev.chat_id,
+    sender_open_id=ev.sender_open_id,
+):
+    # ... existing card patching loop ...
 ```
 
 #### Why this is safe
@@ -912,17 +957,19 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
     )
 
     # ── Phase 0: short-window logical dedup. ────────────────────────
-    # Now backed by a partial UNIQUE index, not just a read-then-act:
-    # see §5.2.
-    # Two parallel "first" inserts (across two processes or a single
-    # process under concurrent webhooks) race on the UNIQUE
-    # constraint; the loser falls through to read the existing row
-    # and either returns its result (if success) or short-circuits
-    # (if pending). The 60s "window" is enforced by lazy GC: a
-    # success row > 60 s old is transitioned to status='archived' so
-    # it leaves the partial UNIQUE index, freeing the logical_key for
-    # the next legitimate request.
-    recent = queries.get_active_by_logical_key(logical_key)  # status IN ('pending','success')
+    # Backed by a partial UNIQUE index on (logical_key) WHERE
+    # logical_key_locked = true (see §5.2 / §6.2). Two parallel
+    # inserts (across two processes or a single process under
+    # concurrent webhooks) race on the UNIQUE; the loser falls
+    # through to read the existing row.
+    #
+    # The 60s "window" is implemented via the dedicated
+    # `logical_key_locked` BOOL column, NOT by mutating `status`. A
+    # success row stays status='success' forever (so all "find
+    # successful action" queries — last_for_me, bot_known_events,
+    # cancel_meeting target lookup — keep working). After 60 s, lazy
+    # GC just flips logical_key_locked to false, freeing the key.
+    recent = queries.get_locked_by_logical_key(logical_key)
     if recent:
         if recent["status"] == "success":
             return _ok({**recent["result"], "deduplicated_from_logical_key": True})
@@ -932,10 +979,7 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
     # Phase 1a: idempotency check
     existing = queries.get_bot_action(message_id, action_type)
     if existing:
-        if existing["status"] in ("success", "archived"):
-            # 'archived' is just 'success' aged out of the logical_key
-            # partial UNIQUE index — same payload, same idempotency
-            # semantics for a per-message_id retry.
+        if existing["status"] == "success":
             return _ok(existing["result"])
         if existing["status"] == "pending":
             return _err("a previous identical call is in flight")
@@ -1041,7 +1085,7 @@ The three-phase pattern gives:
 | --- | --- | --- | --- |
 | **Transport** | `bot/feishu/events.py:_seen_events` LRU (`event_id`) | Feishu webhook redeliveries within the same process | Process restarts; user retypes the same instruction |
 | **Per-message idempotency** | `bot_actions UNIQUE(message_id, action_type)` | The same Feishu `message_id` reaching us twice (cross-process, cross-restart) | A *new* user message that says the same thing — different `message_id`, no constraint hit |
-| **Logical short-window exclusion** | `bot_actions` partial UNIQUE on `logical_key WHERE status IN ('pending','success')` (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args. **Cross-process and cross-instance**: enforced by Postgres, not by app-layer reads. | Anything older than 60 s (the success row gets archived out of the index); intentional re-issuance after that |
+| **Logical short-window exclusion** | `bot_actions` partial UNIQUE on `logical_key WHERE logical_key_locked = true` (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args. **Cross-process and cross-instance**: enforced by Postgres, not by app-layer reads. | Anything older than 60 s (lazy GC sets `logical_key_locked=false`); intentional re-issuance after that |
 
 `logical_key` is a stable hash over `(chat_id, sender_open_id,
 action_type, canonical_args)` — the same parameters that uniquely
@@ -1057,22 +1101,43 @@ in the same process, at the same instant before the first INSERT
 commits) both see "no recent success" and both insert. The DB layer
 must enforce the exclusion or it isn't enforced.
 
-The fix: the tool body **always tries to INSERT** the `pending` row.
-If the partial UNIQUE constraint fires (because another caller is in
-flight on the same logical key, or another caller succeeded within
-the last 60 s), the loser's INSERT raises `UniqueViolation`. The
-loser then `SELECT`s the existing row and dispatches:
-- `status='success'` → return the prior result.
+The fix: the tool body **always tries to INSERT** the `pending` row
+with `logical_key_locked = true`. If the partial UNIQUE constraint
+fires (because another caller is in flight on the same logical key,
+or another caller succeeded within the last 60 s), the loser's
+INSERT raises `UniqueViolation`. The loser then `SELECT`s the
+existing row and dispatches:
+- `status='success'` → return the prior result (`deduplicated_from_logical_key`).
 - `status='pending'` → return `"a previous identical call is in flight"`.
 
-**The 60-second window is enforced by lazy GC, not by the index
-predicate**: the index predicate is just `status IN ('pending',
-'success')`. To "expire" a success row out of the index, the GC
-transitions it to `status='archived'` (a new value in the CHECK enum
-in §6.2), which removes it from the partial index and frees the
-logical_key for the next legitimate request. GC runs lazily inside
-`get_active_by_logical_key` — when it walks past a success row > 60 s
-old, it archives it before checking the next row.
+**The 60-second window is in a separate column, NOT in `status`**
+(this is iter-6 Codex review's correction to v5):
+
+`logical_key_locked: bool` is set to `true` at INSERT time and
+flipped to `false` by lazy GC after 60 s. The partial UNIQUE
+predicate is `WHERE logical_key_locked = true`. `status` retains
+its pure semantic meaning — `success` rows stay `success` forever,
+so every "find successful action" query (`last_for_me` (§3.4 / §3.9),
+`bot_known_events` (§3.5), `target_id` lookups (§3.4)) keeps working
+without needing to also accept some new status value.
+
+An earlier draft used a `status='archived'` value to express
+"dedupe-period expired" but that conflated two orthogonal axes:
+**did the action succeed** (audit/restore/undo concern) vs **does
+this row currently hold the logical_key lock** (dedup concern).
+Mixing them required every "successful action" query to start
+filtering `status IN ('success','archived')`, with future status
+values causing combinatorial drift. Splitting the axes into two
+columns (`status` for outcome, `logical_key_locked` for lock
+ownership) keeps each query clean.
+
+GC runs lazily inside `get_locked_by_logical_key` — when it walks
+past a success row whose `logical_key_locked = true AND created_at
+< now() - interval '60 seconds'`, it runs an atomic
+`UPDATE ... SET logical_key_locked = false WHERE id=$id AND
+logical_key_locked = true` (the predicate prevents double-flip
+under concurrent readers) and treats the row as not-locked
+(returning NULL) so the caller proceeds with their own INSERT.
 
 **Why a window at all**: the user might *legitimately* want to
 schedule "another 30-minute meeting with albert about the same topic"
@@ -1113,28 +1178,32 @@ $id AND status='pending' RETURNING *` before returning the row. The
 `WHERE status='pending'` predicate avoids races with a still-live
 caller about to commit a success.
 
-**(b) Aged success → `archived`** (§5.2 logical_key window): a
-`success` row older than 60 s should leave the partial UNIQUE index
-on `logical_key`, freeing the key for a legitimate repeat request.
-The GC transitions it to `archived` (same payload, different status
-value, no longer in the index).
+**(b) Aged success → unlock the logical_key** (§5.2): a `success`
+row older than 60 s should leave the partial UNIQUE index on
+`logical_key`, freeing the key for a legitimate repeat request. GC
+flips `logical_key_locked` from `true` to `false`. The row's `status`
+stays `success` — it's still a successful action for audit/restore
+purposes; only its claim on the dedup lock has expired.
 
-GC happens in `get_active_by_logical_key` itself: when the function
-finds a candidate row matching the requested `logical_key`, it
-checks `created_at`. If `status='success' AND created_at < now() -
-interval '60 seconds'`, it runs `UPDATE ... SET status='archived'
-WHERE id=$id AND status='success'` and treats the row as not-found
-(returning NULL to the caller, which then proceeds with its INSERT).
+GC happens in `get_locked_by_logical_key` itself: when the function
+finds a candidate row matching the requested `logical_key`, it checks
+`created_at`. If `status='success' AND logical_key_locked = true AND
+created_at < now() - interval '60 seconds'`, it runs
+`UPDATE ... SET logical_key_locked = false WHERE id=$id AND
+logical_key_locked = true` (the predicate avoids double-flip races)
+and treats the row as not-locked (returning NULL to the caller, which
+then proceeds with its INSERT).
 
 **Why both GCs are lazy and not a cron**: the rates are too low to
 justify a loop. Stuck-pending events fire only on process crash;
-aged-success rotations only matter to the next caller of the same
+logical-key unlocks only matter to the next caller of the same
 logical_key. Doing them inside the read function means we pay
 exactly when needed, and we don't introduce a new long-running task
 to monitor.
 
-The `status` CHECK constraint in §6.2 includes both
-`reconciled_unknown` and `archived` for these reasons.
+The `status` CHECK constraint in §6.2 includes `reconciled_unknown`
+for case (a). Case (b) does NOT touch `status` — it mutates only
+`logical_key_locked`, which is a separate column.
 
 ---
 
@@ -1175,11 +1244,15 @@ CREATE TABLE bot_actions (
     attempt_count   int  NOT NULL DEFAULT 1,       -- bumped on retry-after-failure (see §5.1)
     action_type     text NOT NULL,                 -- 'schedule_meeting' | 'append_action_items' | ...
     status          text NOT NULL CHECK (
-                      -- 'archived' = formerly 'success', aged out of the logical_key
-                      -- partial UNIQUE index after the 60s window. Same payload as
-                      -- 'success' for audit purposes, just no longer locks the key.
-                      status IN ('pending','success','failed','undone','reconciled_unknown','archived')
+                      status IN ('pending','success','failed','undone','reconciled_unknown')
                     ),
+    logical_key_locked boolean NOT NULL DEFAULT true,
+                                                    -- separate "do I currently hold the
+                                                    -- 60s logical_key dedup slot" axis;
+                                                    -- decoupled from `status` so audit /
+                                                    -- restore queries on success rows
+                                                    -- keep working after lock expires
+                                                    -- (§5.2 / §5.3 case b).
     args            jsonb NOT NULL,                -- tool inputs (sanitized)
     target_id       text,                          -- Feishu side ID (event_id, record_id, doc_token)
     target_kind     text,                          -- 'calendar_event' | 'bitable_record' | 'docx' | 'workspace_bootstrap'
@@ -1199,13 +1272,16 @@ CREATE INDEX bot_actions_chat_sender_recent_idx
   ON bot_actions (chat_id, sender_open_id, created_at DESC);
 
 -- Logical-key cross-process exclusion (§5.2): at most ONE row per
--- logical_key may exist in 'pending' or 'success' state. Two
--- concurrent INSERTs race; loser gets UniqueViolation. Lazy GC
--- transitions success rows older than 60 s to 'archived' so they
--- exit this index and free the key for legitimate repeat requests.
-CREATE UNIQUE INDEX bot_actions_logical_active_uniq
+-- logical_key may currently hold the dedup lock. Two concurrent
+-- INSERTs race on this UNIQUE; loser gets UniqueViolation. Lazy GC
+-- (§5.3 case b) flips logical_key_locked to false on success rows
+-- older than 60 s to free the key for legitimate repeat requests.
+-- Crucially: status is left at 'success' so all "find successful
+-- action" queries (last_for_me, bot_known_events, target_id
+-- lookups) keep working regardless of lock state.
+CREATE UNIQUE INDEX bot_actions_logical_locked_uniq
   ON bot_actions (logical_key)
-  WHERE status IN ('pending', 'success');
+  WHERE logical_key_locked = true;
 
 ALTER TABLE bot_actions ENABLE ROW LEVEL SECURITY;
 -- Service role only; no end-user policy.
@@ -1245,7 +1321,7 @@ these places:
 | Concern | Lives in | Existing or new |
 | --- | --- | --- |
 | Feishu webhook handling | `bot/feishu/events.py`, `bot/app.py` | unchanged |
-| Per-run context (`message_id`, `chat_id`, `sender_open_id`, `conversation_key`) via `RequestContext` dataclass owned by each `_PooledClient`, captured by closure in `build_pmo_mcp(ctx)` (see §5.0) | `bot/agent/tools.py` (`RequestContext` definition + factory), `bot/agent/runner.py` (one ctx per `_PooledClient`), `bot/app.py` (mutate `slot.ctx.*` under `slot.lock`) | new dataclass, factory pattern in `build_pmo_mcp`, existing `set_current_conversation` removed entirely |
+| Per-run context (`message_id`, `chat_id`, `sender_open_id`, `conversation_key`) via `RequestContext` dataclass owned by each `_PooledClient`, captured by closure in `build_pmo_mcp(ctx)` (see §5.0) | `bot/agent/tools.py` (`RequestContext` definition + factory), `bot/agent/runner.py` (one ctx per `_PooledClient`; `answer` / `answer_streaming` accept `message_id` / `chat_id` / `sender_open_id` and set `slot.ctx.*` inside the existing `slot.lock`), `bot/app.py` (calls `answer_streaming(...)` with the four params; **never** touches `_get_client` / `slot.ctx` / `slot.lock` directly) | new dataclass, factory pattern in `build_pmo_mcp`, runner public surface gains 3 kwargs, existing `set_current_conversation` removed entirely |
 | Tool schema + LLM-visible behavior | `bot/agent/tools.py` | new tools, three-phase pattern in each |
 | **Agent SDK `allowed_tools` whitelist** (`bot/agent/runner.py:179`) | `bot/agent/runner.py` | **must add** `mcp__pmo__resolve_people`, `mcp__pmo__schedule_meeting`, `mcp__pmo__cancel_meeting`, `mcp__pmo__list_my_meetings`, `mcp__pmo__append_action_items`, `mcp__pmo__query_action_items`, `mcp__pmo__create_meeting_doc`, `mcp__pmo__undo_last_action` to the existing list. Without this, the SDK filters the new tools out and the LLM never sees them. **Discovered during review iteration 3** — a previous draft incorrectly claimed runner.py was unchanged. |
 | Agent SDK system prompt | `bot/agent/runner.py` (`SYSTEM_PROMPT` constant) | append §9 directives |
@@ -1268,13 +1344,22 @@ reading the removed module global.
 ## 8. Permission scopes (Feishu Open Platform)
 
 The bot's app needs these scopes added (one-time admin task; without
-them everything 401s and no code change matters):
+them everything 401s and no code change matters).
+
+> ⚠️ **Do NOT paste any string marked `TBD` into the Feishu admin
+> console without first running §11 step 0** (`lark-cli` verification).
+> Feishu has renamed scopes between API versions, and a wrong string
+> silently produces a 401 at runtime that's frustrating to track
+> down. The `TBD` markers below indicate scope names whose exact
+> spelling needs confirmation before paste.
 
 - `im:*` (existing)
 - `calendar:calendar` — own calendar mgmt
 - `calendar:calendar.event:*` — create/update/delete events
 - `calendar:calendar.event.attendee:*` — invite/remove attendees
-- `calendar:calendar.freebusy:read` — conflict detection
+- **TBD** (likely `calendar:calendar.free_busy:read` or
+  `calendar:calendar.freebusy:read`) — conflict detection. Confirm in
+  §11 step 0 via lark-cli skill manifest before pasting.
 - `bitable:app` — full read/write on bot's own bases
 - `docx:document` — create/edit docs
 - `drive:drive` — manage bot's folder
@@ -1358,10 +1443,13 @@ agent commonly mishandles. For traceability:
 | 27 | Bootstrap lock row left in `success` state forever, blocking all future rebuilds (v3 bug) | Release the lock by `DELETE`, audit by separate row (§4). Caught in iter-4 review. |
 | 28 | `append_action_items` ambiguous-project flow wrote orphan rows in v3 | Refactored to halt-and-ask: returns `needs_project` without writing (§3.6). Caught in iter-4 review. |
 | 29 | `cancel_meeting` had no compensating undo path, breaking the §1.4 trust model | Added `pre_cancel_event_snapshot` capture before delete (§3.4); undo dispatcher restores via `calendar_event.create` (§3.9). Caveats documented. Caught in iter-5 Codex review. |
-| 30 | Logical-key dedup was a read-then-act race across processes | Replaced with a partial UNIQUE index `WHERE status IN ('pending','success')` (§6.2); concurrent inserts are serialized by Postgres, not by app reads. Lazy GC archives success rows >60 s old (§5.3). Caught in iter-5 Codex review. |
+| 30 | Logical-key dedup was a read-then-act race across processes | Replaced with a partial UNIQUE index `WHERE logical_key_locked = true` (§6.2); concurrent inserts are serialized by Postgres, not by app reads. Lazy GC flips `logical_key_locked` to false on success rows >60 s old (§5.3 case b). Caught in iter-5 Codex review; the column-vs-status decoupling came from iter-6. |
 | 31 | Naïve "always insert pending first" leaked rows when validation failed | New explicit Phase -1 in tool body skeleton (§5.1) for pre-flight checks that may return without writing `bot_actions`. `append_action_items` ambiguous flow lives in Phase -1. Caught in iter-5 Codex review. |
 | 32 | `list_my_meetings` required `user_open_id` but the LLM never has the asker's own open_id | Default `target` is `"self"`, resolved to `ctx.sender_open_id` (§3.5). Caught in iter-5 Codex review. |
 | 33 | Spec mis-stated `contact.v3.user.batch_get_id` as a "by name" lookup; it actually accepts only emails / phones | Resolution chain split by input shape: profiles → emails/phones via `batch_get_id` → names via `contact.v3.user.search` (§3.1). Caught in iter-5 Codex review. |
+| 34 | v5's `archived` status conflated "successful action" with "expired dedup lock", forcing every audit/restore/undo query to start filtering `status IN ('success','archived')` and risking combinatorial drift as new statuses get added | Decoupled into two columns: `status` stays pure (success / failed / undone / pending / reconciled_unknown) and a separate `logical_key_locked: bool` controls dedup-index membership. All "find successful action" queries keep `status='success'`, unaffected by the dedup window expiring (§6.2, §5.2, §5.3). Caught in iter-6 Codex review. |
+| 35 | v5 leaked runner-pool internals to `app.py` (direct `_get_client` access + manual `slot.lock` + `slot.ctx` mutation) | `runner.answer_streaming(message_id, chat_id, sender_open_id, …)` is the public surface. The runner sets `slot.ctx` inside its existing `slot.lock` acquisition. `app.py` and other callers never touch private pool state (§5.0, §7, §11 step 5). Caught in iter-6 Codex review. |
+| 36 | §8 scope table embedded a literal scope string (`calendar:calendar.freebusy:read`) whose exact spelling was deferred to §11 step 0 verification — implementers might copy it before verifying | §8 marks the scope `TBD — see §11 step 0`; a ⚠️ note tells implementers not to paste any TBD entry into the Feishu admin console until lark-cli verification has run. Caught in iter-6 Codex review. |
 
 ---
 
@@ -1384,13 +1472,15 @@ internals.
 2. **`db/queries.py`** — add the new functions for `bot_actions`
    (`get_bot_action`, `insert_bot_action_pending` — must catch
    `UniqueViolation` on both `(message_id, action_type)` and the
-   logical_key partial UNIQUE; `update_for_retry`,
-   `mark_bot_action_success`, `mark_bot_action_failed`,
-   `mark_bot_action_undone`, `last_bot_action_for_sender_in_chat`,
-   `compute_logical_key`, `get_active_by_logical_key` — must
-   inline-archive success rows >60 s old before returning,
-   `acquire_bootstrap_lock`, `release_bootstrap_lock`) and
-   `bot_workspace` (`get_bot_workspace`, `update_bot_workspace`).
+   `logical_key WHERE logical_key_locked = true` partial UNIQUE;
+   `update_for_retry`, `mark_bot_action_success`,
+   `mark_bot_action_failed`, `mark_bot_action_undone`,
+   `last_bot_action_for_sender_in_chat`, `compute_logical_key`,
+   `get_locked_by_logical_key` — must inline-flip
+   `logical_key_locked=false` on success rows >60 s old before
+   returning (lazy GC, §5.3 case b), `acquire_bootstrap_lock`,
+   `release_bootstrap_lock`) and `bot_workspace`
+   (`get_bot_workspace`, `update_bot_workspace`).
 3. **`feishu/client.py`** — wrap calendar/bitable/docx/contact endpoints.
 4. **Create `bot/scripts/` directory + `bootstrap_bot_workspace.py`** —
    run once against dev env, verify the calendar/base/folder appear
@@ -1398,20 +1488,30 @@ internals.
 5. **Per-pooled-client `RequestContext` refactor** — touches three
    files; ship and bake **before** any new write tools land:
    - `bot/agent/tools.py`: define `RequestContext` dataclass; convert
-     `build_pmo_mcp` from a no-arg helper to a factory `build_pmo_mcp(ctx)`
-     whose tool implementations close over `ctx`. Remove the old
-     `_current_conversation_key_var` global and `set_current_conversation`.
+     `build_pmo_mcp` from a no-arg helper to a factory
+     `build_pmo_mcp(ctx)` whose tool implementations close over
+     `ctx`. Remove the old `_current_conversation_key_var` global
+     and `set_current_conversation`.
    - `bot/agent/runner.py`: each `_PooledClient` gets a fresh
      `RequestContext` at construction and passes it into
-     `build_pmo_mcp(ctx)`. Add the new tools' names to `allowed_tools`
-     (combine with step 6 if you want to ship in one PR).
-   - `bot/app.py`: in `_handle_message`, after `_get_client` and
-     before `client.query()`, while holding `slot.lock`, mutate
-     `slot.ctx.message_id`, `slot.ctx.chat_id`,
-     `slot.ctx.sender_open_id`, `slot.ctx.conversation_key`.
-   - `bot/agent/imaging.py`: take `ctx` (or `conversation_key`) as an
-     argument from its caller (`generate_image` tool body) instead of
-     reading the old module global.
+     `build_pmo_mcp(ctx)`. The public `answer` and `answer_streaming`
+     functions gain `message_id`, `chat_id`, `sender_open_id`
+     keyword parameters. Inside `answer_streaming`, after
+     `async with slot.lock:` (the existing line at `runner.py:240`),
+     assign all four request fields to `slot.ctx` BEFORE calling
+     `slot.client.query(...)`. The `agent_tools.set_current_conversation`
+     line at `runner.py:244` is removed in the same diff.
+   - `bot/app.py`: update both call sites of `agent_runner.answer*` —
+     the streaming path at `app.py:184` and the fallback `answer`
+     path at `app.py:158-160` — to pass the three new keyword
+     arguments. **Do not** import `_get_client`, `_PooledClient`,
+     `slot.lock`, or `slot.ctx` from runner. The pool stays a private
+     implementation detail of `runner.py`.
+   - `bot/agent/imaging.py` does not change. The
+     `generate_image` tool body inside `build_pmo_mcp(ctx)` already
+     has `ctx` in scope; it passes `ctx.conversation_key` to
+     `imaging.generate_and_upload`'s existing `conversation_key`
+     kwarg.
 
    This is a **pure refactor** — no new tool, no new behavior. Existing
    read tools should continue working unchanged. Verify with the
