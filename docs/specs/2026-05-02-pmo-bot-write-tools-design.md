@@ -494,7 +494,7 @@ Resolution rules:
   there was a conflict" no-ops, not actual scheduled meetings).
   Without this filter, `last:true` would resolve to a conflict row
   that has no event to cancel. Both filters together match the
-  `last_bot_action_for_sender_in_chat` helper's `require_target=True`
+  `last_bot_action_for_sender_in_chat` helper's `undoable_only=True`
   default (§11 step 2). Requires `(chat_id, sender_open_id)` on
   `bot_actions` (see §6.2).
 
@@ -716,6 +716,24 @@ LLM-driven `undo + re-append` (fragile, two side effects per
 correction). Halting at the boundary is simpler: one ask, one write,
 no orphan rows.
 
+**Persistence on success**: write `target_kind="bitable_records"`,
+`target_id=<bot_workspace.action_items_table_id>`, and
+`result.record_ids=[<rec_xxx>, ...]` to the `bot_actions` row. The
+`target_id` is the **table id**, not any individual record — that
+keeps `target_id` non-NULL (so `last_for_me` can find it without a
+special case) and gives undo enough context to find the table.
+Individual record_ids live in `result.record_ids`; the undo path
+(§3.9) reads `target_id` to know which table, then reads
+`result.record_ids` to know which records to delete.
+
+**Why the table id, not a record id**: a single `append_action_items`
+call writes N records, all in the same table. If we picked one
+record_id as `target_id`, undo would have to special-case "look up
+all sibling records via result.record_ids anyway". Using the table
+id makes the contract uniform: `target_kind` tells you what kind of
+collection, `target_id` tells you the container, `result` carries
+the per-row details.
+
 **Return shape on success** (project resolved, items written):
 
 ```json
@@ -734,12 +752,26 @@ no orphan rows.
 `project_source: "ambiguous"` is no longer a possible value — the
 ambiguous case never reaches the write path.
 
+**Implementation note — `user_id_type="open_id"`**: the SDK calls
+for batch-create / search / list app_table_record all accept a
+`user_id_type` query param (see
+`lark_oapi/api/bitable/v1/model/{batch_create,search,list}_app_table_record_request.py`).
+Pass `user_id_type="open_id"` on every call so the Person field
+(`owner`) round-trips as open_id rather than the SDK's default
+`union_id`. Without this the records will write but the `owner`
+column will silently use the wrong identity space — the values
+won't match the open_ids `resolve_people` returned, and Bitable
+filters by owner will miss.
+
 ### 3.7 `query_action_items`
 
 **Inputs**: any combination of `owner_open_id`, `project`, `status`,
 `since`, `until`.
 
-Reads from the `action_items` table; no write side effects.
+Reads from the `action_items` table; no write side effects. Pass
+`user_id_type="open_id"` on the SDK call (matches §3.6's identity
+space, so `owner_open_id` filters land on the same column values
+that were written).
 
 ### 3.8 `create_meeting_doc`
 
@@ -856,17 +888,36 @@ tool's **interface** — only its body.
   - `last_for_me: true` — undo the most recent **terminal** row in
     the current conversation **that the current asker created**.
     Scoped by `(chat_id, sender_open_id)`, see §6.2. The lookup
-    filter is `status IN ('success', 'reconciled_unknown') AND
-    target_id IS NOT NULL`, **not** just `status='success'`: the
-    `reconciled_unknown` arm catches partial-Phase-2 failures from
-    §3.3 (event was created in Feishu but attendees couldn't be
-    invited). Without this, the user has no way to clean up the
-    orphan event via the safety-net path. Rows with `target_id IS
-    NULL` are skipped — they represent the residual pre-2.2.5 crash
-    window where we don't know what to delete. The earlier
-    `last_in_chat` name is renamed to make the per-asker scope
-    explicit; in groups, user A cannot undo user B's actions through
-    this tool.
+    filter is the **"undoable" predicate**:
+
+    ```sql
+    status IN ('success', 'reconciled_unknown')
+    AND (
+      target_id IS NOT NULL
+      OR (status = 'reconciled_unknown'
+          AND result ? 'import_ticket')
+    )
+    ```
+
+    - `target_id IS NOT NULL` covers the normal cases:
+      `schedule_meeting` / `cancel_meeting` (event_id);
+      `append_action_items` (table_id, see §3.6);
+      `create_meeting_doc` after step 6 (doc_token);
+      `create_meeting_doc` partial-success at step 3 only
+      (target_id=source_file_token, target_kind='file').
+    - The `result ? 'import_ticket'` arm covers the doc-partial
+      case where polling timed out: `target_id` is NULL but we
+      have an `import_ticket` we can re-poll. Without this arm,
+      that orphan would be unreachable via `last_for_me` while
+      simultaneously holding the logical_key lock (§5.2 +
+      lock-behavior table in §6.2) — a real deadlock.
+    - Rows with `target_id IS NULL AND no import_ticket` are still
+      skipped: they represent the residual pre-2.2.5 crash window
+      where we genuinely don't know what to delete.
+
+    The earlier `last_in_chat` name is renamed to make the
+    per-asker scope explicit; in groups, user A cannot undo user
+    B's actions through this tool.
   - `action_id: str` — explicit `bot_actions.id` to undo (used when the
     agent has just shown the user a list and they pointed to one).
     Allowed even when the asker isn't the original creator, IF the row
@@ -894,8 +945,11 @@ Dispatches on `action_type`:
   result.calendar_id>)...)` populated from
   `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a),
   then `client.calendar.v4.calendar_event_attendee.create(...
-  calendar_id(<same>).event_id(new_event_id)...)` for the original
-  attendees. The new event has a different `event_id` than the
+  calendar_id(<same>).event_id(new_event_id).user_id_type(
+  "open_id")...)` for the original attendees. The
+  `user_id_type("open_id")` qualifier matches §3.3 Phase 2.3 — the
+  snapshot stored attendee IDs as open_ids, so the restore call has
+  to round-trip through the same identity space. The new event has a different `event_id` than the
   original; the response includes `restore_caveats` (see §3.4) so
   the agent can warn the user. Audit linkage: we create a fresh
   `schedule_meeting` audit row with `target_id=new_event_id` and
@@ -906,12 +960,29 @@ Dispatches on `action_type`:
   attribute path; see §3.3bis), passing `record_ids` from
   `result.record_ids` along with the `app_token` and `table_id`
   recorded in the original `result`.
-- `create_meeting_doc` →
-  `client.drive.v1.file.delete(DeleteFileRequest.builder().file_token(
-  <from target_id>).type("docx").build())`. Both `file_token` and
-  `type` are required by the SDK (see
-  `lark_oapi/api/drive/v1/model/delete_file_request.py`); the
-  `type` is always `"docx"` for this tool's outputs.
+- `create_meeting_doc` → **dispatch on `target_kind`** because the
+  source-of-truth artifact depends on which Phase the row got stuck
+  at (see §3.8 for the four possible terminal shapes):
+  - `target_kind='docx'` (full success or post-step-6 partial):
+    `client.drive.v1.file.delete(DeleteFileRequest.builder()
+    .file_token(<target_id>).type("docx").build())`. Both
+    `file_token` and `type` are required by the SDK (see
+    `lark_oapi/api/drive/v1/model/delete_file_request.py`).
+  - `target_kind='file'` (step-3 partial: `.md` uploaded but
+    import never started): same call but `type="file"`. Using
+    `type="docx"` here would target a non-existent docx and
+    leave the orphan `.md` behind.
+  - `target_kind` IS NULL but `result.import_ticket` is set
+    (step-5 polling timed out, no doc_token yet): re-poll
+    `client.drive.v1.import_task.get(ticket=
+    result.import_ticket)` once with a short timeout
+    (~5 s).
+    - If completed and Feishu returned a `doc_token`: delete the
+      docx (`type="docx"`) and the source `.md` (`type="file"`).
+    - If still in progress or failed: delete just the source `.md`
+      (`type="file"`). Note the docx may still materialize after
+      we've moved on; this is an accepted residual risk
+      documented in §3.8.
 
 Without a `cancel_meeting` case, undoing an accidental cancel was
 impossible — see §1.4: the no-confirmation-gate trust model requires
@@ -1355,6 +1426,13 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
                 winner = e.existing_row
                 if winner["status"] == "success":
                     return _ok({**winner["result"], "deduplicated_from_logical_key": True})
+                if winner["status"] == "reconciled_unknown":
+                    # partial_success orphan — see Phase 0 above
+                    return _err(
+                        "a previous identical call left a partial result "
+                        "in Feishu (target_id={}); please ask me to undo "
+                        "before re-issuing".format(winner.get("target_id"))
+                    )
                 return _err("a previous identical call is in flight")
             if action_id is None:
                 return _err("a concurrent retry won the race; try again in a moment")
@@ -1395,6 +1473,14 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
             existing = e.existing_row  # found by SELECT ... WHERE logical_key=$1 AND logical_key_locked=true
             if existing["status"] == "success":
                 return _ok({**existing["result"], "deduplicated_from_logical_key": True})
+            if existing["status"] == "reconciled_unknown":
+                # partial_success orphan still holds the lock — same
+                # response as Phase 0's reconciled_unknown branch.
+                return _err(
+                    "a previous identical call left a partial result "
+                    "in Feishu (target_id={}); please ask me to undo "
+                    "before re-issuing".format(existing.get("target_id"))
+                )
             # status=='pending' on the winner — it's still in flight
             return _err("a previous identical call is in flight")
 
@@ -2022,6 +2108,12 @@ agent commonly mishandles. For traceability:
 | 54 | freebusy conflicts were stored as `status='failed'`, but Phase 1a's failed-status branch automatically reclaims and re-executes via `update_for_retry` — meaning a duplicate webhook would re-issue the freebusy call, and if the conflicting meeting got cancelled in the meantime, would silently schedule the new meeting (a behavior the user never reauthorized) | §3.3 Phase 2.1 now stores conflicts as `status='success'` + `result.outcome='conflict'` + `result.conflicts=[...]`. The idempotency check returns the cached conflict on retry without re-calling Feishu. The `outcome` discriminator on `result` is the same pattern used by `reconciliation_kind` in §5.3 — `status` retains pure semantics ("did the side-effect-or-decision land?") while richer business outcomes live in `result`. Caught in iter-10 Codex review. |
 | 55 | §11 step 2's helper list didn't enumerate the new DB primitives v9 introduced (`record_bot_action_target_pending` for intermediate persist, `mark_bot_action_reconciled_unknown(kind=...)` for partial-success vs stuck-pending) — implementers reading the spec would build only the helpers v8 mentioned and discover the gap mid-implementation | §11 step 2 rewritten as a one-line-per-helper checklist covering all v10 primitives, including the iter-10 additions. Caught in iter-10 Codex review. |
 | 56 | §3.3bis listed primarys URL as `/open-apis/calendar/v4/calendars/primary` (singular), but installed SDK uses `/calendars/primarys` (plural — `lark_oapi/api/calendar/v4/model/primarys_calendar_request.py:25`) | §3.3bis row corrected with cite. The SDK call snippet (`client.calendar.v4.calendar.primarys`) was already correct; only the URL column was wrong. Caught in iter-10 Codex review. |
+| 57 | `append_action_items` success rows had no `target_id`, but iter-10's `last_for_me` filter required `target_id IS NOT NULL` — so a user saying "撤销刚才那个" right after appending would skip the append row and undo an earlier event/doc instead, violating the §1.4 "every write tool must be undoable" contract | §3.6 now persists `target_kind='bitable_records'`, `target_id=<table_id>`, `result.record_ids=[...]` on success. Undo (§3.9) reads `target_id` for the table and `result.record_ids` for the rows to delete. Caught in iter-11 Codex review. |
+| 58 | doc partial rows that timed out at polling had `target_id=NULL` (no doc_token yet) but partial_success kept the logical_key locked — `last_for_me`'s `target_id IS NOT NULL` filter skipped them, leaving the user unable to undo while the lock blocked re-issuance | The "undoable" predicate now reads `target_id IS NOT NULL OR (status='reconciled_unknown' AND result ? 'import_ticket')` (§3.9, §11 helper sig). Undo dispatch for these rows re-polls the import_ticket, then deletes the docx (if found) or the source `.md`. Caught in iter-11 Codex review. |
+| 59 | undo dispatch for `create_meeting_doc` always called `file.delete(type="docx")`, but partial rows could store `target_kind='file'` (source `.md`) — `type="docx"` would target a non-existent docx and leave the orphan `.md` behind | §3.9 dispatch now branches on `target_kind`: `'docx'` → `type="docx"`; `'file'` → `type="file"`; NULL with `import_ticket` → re-poll first. Caught in iter-11 Codex review. |
+| 60 | Helper signatures didn't reflect v10's reality. `mark_bot_action_success` required `target_id`/`target_kind`, but freebusy-conflict-as-success rows have neither. `record_bot_action_target_pending` required `target_id`/`target_kind`, but doc Phase 2.1.5/2.2.5 only patch `result.source_file_token` / `result.import_ticket` | All three target params on these helpers are now optional. Result-only patches use `record_bot_action_target_pending(action_id, result_patch=...)` directly. Caught in iter-11 Codex review. |
+| 61 | Bitable Person fields (`owner` on `action_items`) need `user_id_type="open_id"` on every batch_create / search / list call; SDK defaults to `union_id` (different identity space) so without this the column would silently use IDs that don't match what `resolve_people` returns | §3.6 / §3.7 explicitly require `user_id_type="open_id"` on all bitable record calls; the SDK has the param on every relevant request model. Caught in iter-11 Codex review. |
+| 62 | iter-10 added `reconciled_unknown(partial_success)` to the partial UNIQUE index but `LogicalKeyConflict` catch arms in §5.1 still only branched on `success` vs `pending` — a real `partial_success` collision would return generic "in flight" instead of the correct "please undo first" guidance | Both catch arms (Phase 1b first-time-INSERT and the failed-retry path's `update_for_retry`) now have explicit `reconciled_unknown` branches returning the same "please undo first" message as Phase 0. Caught in iter-11 Codex review. |
 
 ---
 
@@ -2049,19 +2141,27 @@ internals.
      vs `bot_actions_logical_locked_uniq`, both defined in §6.2) and
      raises `MessageActionConflict` / `LogicalKeyConflict` carrying
      the existing row.
-   - `record_bot_action_target_pending(action_id, *, target_id,
-     target_kind, result_patch)` — **NEW (§3.3 Phase 2.2.5, §3.8
-     Phases 2.1.5/2.2.5/2.3.5)**: UPDATE the row with `target_id`,
-     `target_kind`, and a JSONB `result` patch (deep-merge), without
-     changing `status` (stays `pending`). Used after each successful
+   - `record_bot_action_target_pending(action_id, *, target_id=None,
+     target_kind=None, result_patch=None)` — **NEW (§3.3 Phase 2.2.5,
+     §3.8 Phases 2.1.5/2.2.5/2.3.5)**: UPDATE the row with optional
+     `target_id` / `target_kind` and a JSONB `result` patch
+     (deep-merge), without changing `status` (stays `pending`). All
+     three params are optional so this single helper covers the
+     §3.8 cases where only `result.source_file_token` or
+     `result.import_ticket` is being patched without a target yet.
+     Caller should provide at least one. Used after each successful
      intermediate Feishu call in a multi-step Phase 2 so a later
      failure has something to point at.
    - `update_for_retry(action_id, *, new_args, logical_key)` —
      transitions `failed → pending` and re-claims
      `logical_key_locked=true`; can raise `LogicalKeyConflict` if
      the slot was won by another caller.
-   - `mark_bot_action_success(action_id, *, target_id, target_kind,
-     result_patch)` — Phase 3 success terminal.
+   - `mark_bot_action_success(action_id, *, target_id=None,
+     target_kind=None, result_patch=None)` — Phase 3 success
+     terminal. **All three target params are optional** to support
+     the freebusy-conflict-as-success case in §3.3 Phase 2.1
+     (`target_id=NULL` because no Feishu artifact was created — the
+     "outcome" is stored in `result.outcome='conflict'`).
    - `mark_bot_action_failed(action_id, error)` — clears
      `logical_key_locked` (technical-error retry permitted).
    - `mark_bot_action_undone(action_id)` — clears the lock.
@@ -2073,11 +2173,24 @@ internals.
      `stuck_pending` clears the lock. Writes
      `result.reconciliation_kind` per the §5.3 contract.
    - `last_bot_action_for_sender_in_chat(chat_id, sender_open_id, *,
-     statuses=("success","reconciled_unknown"), require_target=True)` —
-     used by `cancel_meeting(last:true)` and
-     `undo_last_action(last_for_me)`. Must accept both `success` and
-     `reconciled_unknown` rows so partial_success orphans can be
-     undone (see §3.9).
+     statuses=("success","reconciled_unknown"), undoable_only=True,
+     action_type=None)` — used by `cancel_meeting(last:true)` and
+     `undo_last_action(last_for_me)`. When `undoable_only=True` (the
+     default), filters with the **"undoable" predicate** from §3.9:
+
+     ```sql
+     status IN $statuses
+     AND (
+       target_id IS NOT NULL
+       OR (status = 'reconciled_unknown'
+           AND result ? 'import_ticket')
+     )
+     ```
+
+     This catches partial-success doc rows where `target_id` is NULL
+     but `result.import_ticket` lets undo re-poll. `cancel_meeting`
+     additionally passes `action_type='schedule_meeting'` to
+     restrict to its own kind.
    - `compute_logical_key(*, chat_id, sender_open_id, action_type,
      canonical_args)` — pure hash function.
    - `get_locked_by_logical_key(logical_key)` — Phase 0 lookup;
