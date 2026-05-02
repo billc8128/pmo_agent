@@ -876,11 +876,25 @@ implementation:
      (verified in
      `lark_oapi/api/drive/v1/model/upload_all_file_request.py`); it
      does NOT accept the kwargs directly. SDK attribute is singular
-     `file`, not `files` — see §3.3bis.
+     `file`, not `files` — see §3.3bis. **The instant
+     `source_file_token` is in hand, log it to stderr at INFO level
+     BEFORE the Phase 2.1.5 UPDATE** (`logger.info("doc.upload ok
+     file_token=%s action=%s", source_file_token, action_id)`). If
+     the process crashes between this log line and Phase 2.1.5, the
+     log preserves enough info for an operator to manually delete
+     the orphan `.md` — same crash-window mitigation §3.3 Phase 2.2
+     uses for `event_id`.
   2. **Phase 2.1.5 persist** (intermediate state): UPDATE the
      `pending` row with `result.source_file_token=<from step 1>`.
      The `.md` is now a real artifact in Drive; if any later step
-     fails, we need to know its token to clean it up.
+     fails, we need to know its token to clean it up. (We do NOT
+     promote `source_file_token` to `target_id` at this stage — the
+     undoable predicate and undo dispatch in §3.9 explicitly accept
+     `result.source_file_token` as a partial-artifact handle. See
+     §3.9 / §5.3 for the predicate; the choice keeps `target_id`
+     reserved for the latest "primary" artifact handle, which is
+     why §3.8 leaves `target_id` NULL until Phase 2.3.5 promotes
+     `doc_token`.)
   3. **Create the import task**:
      ```python
      client.drive.v1.import_task.create(
@@ -906,7 +920,14 @@ implementation:
      `CreateImportTaskRequest` whose `request_body` is the
      `ImportTask` model itself (verified in
      `lark_oapi/api/drive/v1/model/create_import_task_request.py`).
-     SDK attribute is singular `import_task`.
+     SDK attribute is singular `import_task`. **The instant the
+     `ticket` comes back, log it to stderr at INFO level BEFORE the
+     Phase 2.2.5 UPDATE** (`logger.info("doc.import_task ok
+     ticket=%s file_token=%s action=%s", ticket, source_file_token,
+     action_id)`). If the process crashes between this log and Phase
+     2.2.5, the log preserves enough info for an operator to
+     manually re-poll the import and clean up — same crash-window
+     rationale as §3.3 Phase 2.2 and §3.8 Step 1.
   4. **Phase 2.2.5 persist**: UPDATE with
      `result.import_ticket=<from step 3>`. The async import is now
      in flight on Feishu's side; even if our process dies, we have
@@ -1004,7 +1025,8 @@ tool's **interface** — only its body.
     AND (
       target_id IS NOT NULL
       OR (status = 'reconciled_unknown'
-          AND result ? 'import_ticket')
+          AND (result ? 'import_ticket'
+               OR result ? 'source_file_token'))
     )
     ```
 
@@ -1012,17 +1034,26 @@ tool's **interface** — only its body.
       `schedule_meeting` / `cancel_meeting` (event_id);
       `append_action_items` (table_id, see §3.6);
       `create_meeting_doc` after step 6 (doc_token);
-      `create_meeting_doc` partial-success at step 3 only
-      (target_id=source_file_token, target_kind='file').
+      `create_meeting_doc` partial-success at step 3 cleanup
+      failure (target_id=source_file_token, target_kind='file').
     - The `result ? 'import_ticket'` arm covers the doc-partial
       case where polling timed out: `target_id` is NULL but we
-      have an `import_ticket` we can re-poll. Without this arm,
-      that orphan would be unreachable via `last_for_me` while
-      simultaneously holding the logical_key lock (§5.2 +
-      lock-behavior table in §6.2) — a real deadlock.
-    - Rows with `target_id IS NULL AND no import_ticket` are still
-      skipped: they represent the residual pre-2.2.5 crash window
-      where we genuinely don't know what to delete.
+      have an `import_ticket` we can re-poll.
+    - The `result ? 'source_file_token'` arm covers the **iter-13
+      crash window** between Phase 2.1.5 (upload succeeded) and
+      Phase 2.2.5 (import_task.create succeeded): the `.md` is in
+      Drive, but we don't have an import ticket yet, and `target_id`
+      is still NULL. Without this arm, content-aware GC (§5.3) would
+      mark the row `partial_success` (lock kept), but `last_for_me`
+      couldn't find it — same deadlock as iter-11 #2 in a different
+      window. Adding this arm closes the loop.
+    - Rows with `target_id IS NULL AND no import_ticket AND no
+      source_file_token` are still skipped: they represent the
+      residual pre-2.1.5 crash window (upload returned a token but
+      the process died before the stderr log + UPDATE) where we
+      genuinely don't know what to delete. The stderr log (§3.8
+      Step 1) is the manual-recovery fallback for this remaining
+      sliver.
 
     The earlier `last_in_chat` name is renamed to make the
     per-asker scope explicit; in groups, user A cannot undo user
@@ -1108,6 +1139,17 @@ Dispatches on `action_type`:
       (`type="file"`). Note the docx may still materialize after
       we've moved on; this is an accepted residual risk
       documented in §3.8.
+  - `target_kind` IS NULL AND no `import_ticket` AND
+    `result.source_file_token` IS set (the **iter-13 crash window**:
+    GC-detected partial after upload-OK / before import_task.create
+    completed — no async import was ever started server-side):
+    just delete the source `.md`
+    (`client.drive.v1.file.delete(file_token=
+    result.source_file_token, type="file")`). Symmetric with the
+    target_kind='file' branch above; the only reason this row didn't
+    land there is that the partial was discovered by content-aware
+    GC (§5.3) rather than by a synchronous Step-3 cleanup-failure
+    path that would have promoted to target_id directly.
 
 Without a `cancel_meeting` case, undoing an accidental cancel was
 impossible — see §1.4: the no-confirmation-gate trust model requires
@@ -2050,7 +2092,7 @@ clear":
 | `pending → failed` | `false` (cleared) | The Feishu call errored cleanly; retry on the same logical_key is safe. |
 | `pending → undone` | `false` (cleared) | The action was reversed; the logical request can be re-issued. |
 | `pending → reconciled_unknown(stuck_pending)` (case A in §5.3) | `false` (cleared) | We don't know what happened on Feishu; further info needs human verification. Retry with a fresh request is allowed (will create a new row). |
-| `pending → reconciled_unknown(partial_success)` (case B in §3.3 / §3.8) | **`true` (kept)** | Feishu artifact exists in a known location (`target_id` is set). A duplicate call would create a second artifact. Lock stays until undo runs (which transitions to `undone` and clears the lock). |
+| `pending → reconciled_unknown(partial_success)` (case B in §3.3 / §3.8) | **`true` (kept)** | A Feishu artifact exists in a recoverable location: either `target_id` is set, or `result.import_ticket` / `result.source_file_token` is set (the iter-13 GC-discovered Doc Phase 2.1.5/2.2.5 windows). Helper invariant guarantees at least one of those handles is present (see §6.2 helper SQL). A duplicate call would create a second artifact. Lock stays until undo runs (which transitions to `undone` and clears the lock). |
 
 The previous v9 design cleared `logical_key_locked` on every
 transition out of `pending`. That works for the three "no
@@ -2082,6 +2124,19 @@ UPDATE bot_actions
 -- promote to reconciled_unknown while ALSO recording (or filling
 -- in) the artifact handle. Optional result_patch: deep-merged into
 -- result alongside the reconciliation_kind tag.
+--
+-- INVARIANT (enforced in the helper, NOT in SQL): if kind =
+-- 'partial_success', the row AFTER this UPDATE must satisfy
+-- the §3.9 "undoable" predicate — i.e. at least one of:
+--   target_id IS NOT NULL   (current OR being set by $target_id)
+--   result ? 'import_ticket'  (current OR being added by $result_patch)
+--   result ? 'source_file_token' (current OR being added by $result_patch)
+-- A partial_success row that fails this check would be permanently
+-- locked AND unreachable from undo (the iter-13 deadlock pattern).
+-- The Python wrapper computes the post-update shape, refuses with a
+-- ValueError if it would violate the invariant, and the caller is
+-- expected to either (a) provide a handle in target_id / result_patch
+-- or (b) downgrade to kind='stuck_pending' so the lock is released.
 UPDATE bot_actions
    SET status='reconciled_unknown',
        error=$err,
@@ -2287,7 +2342,7 @@ agent commonly mishandles. For traceability:
 | 34 | v5's `archived` status conflated "successful action" with "expired dedup lock", forcing every audit/restore/undo query to start filtering `status IN ('success','archived')` and risking combinatorial drift as new statuses get added | Decoupled into two columns: `status` stays pure (success / failed / undone / pending / reconciled_unknown) and a separate `logical_key_locked: bool` controls dedup-index membership. All "find successful action" queries keep `status='success'`, unaffected by the dedup window expiring (§6.2, §5.2, §5.3). Caught in iter-6 Codex review. |
 | 35 | v5 leaked runner-pool internals to `app.py` (direct `_get_client` access + manual `slot.lock` + `slot.ctx` mutation) | `runner.answer_streaming(message_id, chat_id, sender_open_id, …)` is the public surface. The runner sets `slot.ctx` inside its existing `slot.lock` acquisition. `app.py` and other callers never touch private pool state (§5.0, §7, §11 step 5). Caught in iter-6 Codex review. |
 | 36 | §8 scope table embedded a literal scope string (`calendar:calendar.freebusy:read`) whose exact spelling was deferred to §11 step 0 verification — implementers might copy it before verifying | §8 marks the scope `TBD — see §11 step 0`; a ⚠️ note tells implementers not to paste any TBD entry into the Feishu admin console until lark-cli verification has run. Caught in iter-6 Codex review. |
-| 37 | Partial UNIQUE on `(logical_key) WHERE logical_key_locked=true` did not exclude failed/undone/reconciled_unknown rows; a `failed` row would block all retries on the same logical_key | Predicate now `WHERE logical_key_locked=true AND status IN ('pending','success')` (§6.2). Belt-and-suspenders: `mark_failed` / `mark_undone` / GC also clear `logical_key_locked` so non-active rows don't masquerade as locked. `update_for_retry` re-claims the lock by setting `logical_key_locked=true` when transitioning failed→pending (§5.1). Caught in iter-7 Codex review. |
+| 37 | Partial UNIQUE on `(logical_key) WHERE logical_key_locked=true` did not exclude failed/undone/reconciled_unknown rows; a `failed` row would block all retries on the same logical_key | (iter-7 fix — note: predicate later evolved in iter-10 to also include `'reconciled_unknown'` so partial_success orphans block duplicates; see row 52 / current §6.2 SQL.) The iter-7 baseline established `WHERE logical_key_locked=true AND status IN ('pending','success')`. Belt-and-suspenders: `mark_failed` / `mark_undone` / GC also clear `logical_key_locked` so non-active rows don't masquerade as locked. `update_for_retry` re-claims the lock by setting `logical_key_locked=true` when transitioning failed→pending (§5.1). Caught in iter-7 Codex review. |
 | 38 | `insert_bot_action_pending`'s UniqueViolation handler only re-read by `(message_id, action_type)`, so a logical_key conflict with a different message_id returned a generic "in flight" instead of the winner's result | `insert_bot_action_pending` inspects `e.diag.constraint_name` and raises `MessageActionConflict` or `LogicalKeyConflict` carrying the appropriate existing row (§5.1, §6.2 constraint-name contract). Caught in iter-7 Codex review. |
 | 39 | Spec used `freebusy.list` and `attendee.create_batch` — neither matches the lark-oapi Python SDK shape | `freebusy.batch` (§3.3 phase 2) and `attendee.create` with `body={attendees: [...]}` (§3.3 phase 4 / §3.9 cancel-restore). Verified against installed `lark_oapi/api/calendar/v4/resource/{freebusy,calendar_event_attendee}.py`. Caught in iter-7 Codex review. |
 | 40 | `cancel_meeting(event_id)` only required bot-ownership; anyone with the link could cancel a meeting scheduled in another chat | Added cross-chat guard: `bot_actions.chat_id` must equal `ctx.chat_id` (§3.4). Refuse with explanation otherwise; v1 has no override. Caught in iter-7 Codex review. |
@@ -2331,6 +2386,11 @@ agent commonly mishandles. For traceability:
 | 78 | `mark_bot_action_reconciled_unknown` helper signature (§11) listed optional `target_id` / `target_kind` / `result_patch` but the SQL snippet only updated `reconciliation_kind`. Implementer copying the SQL verbatim would lose the doc-partial flow's `source_file_token` / `import_ticket` fields | SQL now uses `COALESCE($target_id, target_id)` / `COALESCE($target_kind, target_kind)` and deep-merges `result_patch` via `result || COALESCE($result_patch::jsonb, '{}'::jsonb)` before applying the `reconciliation_kind` jsonb_set. Matches the helper's optional-parameter contract. Caught in iter-12 Codex review. |
 | 79 | "Two flavors of `reconciled_unknown`" table said `partial_success` only comes from sync attendee-invite failure (§3.3 Phase 2.3) and `target_id` is always set. v12 introduced async content-aware GC and doc-partial paths where `target_id` may be NULL but `result.import_ticket` is set — table no longer described actual reality | Table rewritten as three rows: `stuck_pending` (no handle, lock cleared), `partial_success` sync (any handle, lock kept), `partial_success` async via GC (same shape as sync). All three explicitly cite the §3.9 "undoable" predicate. Caught in iter-12 Codex review. |
 | 80 | Drive SDK calls in §3.8 Path A used pseudocode kwargs (`file.upload_all(file_name=..., size=...)`) instead of the builder shape the SDK actually requires. Implementer following the spec verbatim would get a `TypeError` because `upload_all` takes a single `UploadAllFileRequest` argument | All three Drive calls (`upload_all`, `import_task.create`, `import_task.get`) now show full builder syntax mirroring the calendar examples elsewhere in the spec; cite the request model files in `lark_oapi/api/drive/v1/model/`. Caught in iter-12 Codex review. |
+| 81 | iter-12's content-aware GC saved `logical_key_locked=true` for rows with `result.source_file_token` but no `target_id` and no `import_ticket` (Doc Phase 2.1.5 → 2.2.5 crash window). But `last_for_me`'s undoable predicate and §3.9 dispatch only recognized `target_id` and `import_ticket` — the GC would create a permanently locked + unreachable row, blocking all future requests with the same logical_key | Extended undoable predicate to `target_id IS NOT NULL OR (status='reconciled_unknown' AND (result ? 'import_ticket' OR result ? 'source_file_token'))`. Added a §3.9 dispatch branch for `target_kind IS NULL AND no import_ticket AND result.source_file_token IS set` → `file.delete(type='file')`. Caught in iter-13 Codex review. |
+| 82 | Doc Path A had two residual crash windows (after upload OK / before Phase 2.1.5; after `import_task.create` ticket / before Phase 2.2.5) where Feishu state existed but no DB record. §3.3 Phase 2.2 requires stderr-logging the event_id in the analogous window so an operator can recover, but §3.8 didn't | §3.8 Step 1 logs `source_file_token` to stderr immediately after `upload_all` returns; §3.8 Step 3 logs the import `ticket` immediately after `import_task.create` returns. Both happen BEFORE the Phase 2.X.5 UPDATE so a crash between Feishu success and DB persist still leaves a recoverable trail. Caught in iter-13 Codex review. |
+| 83 | `mark_bot_action_reconciled_unknown(kind='partial_success')` had no helper-level guard that the resulting row would actually be undoable. A typo at a callsite — passing `partial_success` when no handle exists — would create a permanently locked + unreachable row | Helper now enforces an INVARIANT in Python (cannot easily be expressed in pure SQL since it inspects the *combined* existing+patched state): if `kind='partial_success'`, the post-update row must have at least one of `target_id`, `result.import_ticket`, `result.source_file_token`. Otherwise `ValueError` is raised; caller must either provide a handle or downgrade to `kind='stuck_pending'`. Caught in iter-13 Codex review. |
+| 84 | §6.2 lock-behavior table claimed partial_success "artifact exists in a known location (`target_id` is set)" — outdated since iter-12 introduced GC-discovered partials where only `result.import_ticket` or `result.source_file_token` is set | Cell rewritten to enumerate all three handle locations (`target_id` OR `result.import_ticket` OR `result.source_file_token`) and cross-references the helper invariant in §6.2 SQL. Caught in iter-13 Codex review. |
+| 85 | Findings-table row #37 quoted the iter-7 baseline predicate `status IN ('pending','success')` without noting that iter-10 (row 52) extended it to include `'reconciled_unknown'`. A future reviewer scanning the findings table would believe the baseline still applies | Row #37 now annotated with a forward reference to row 52 / current §6.2 SQL. Caught in iter-13 Codex review. |
 
 ---
 
@@ -2389,6 +2449,14 @@ internals.
      `logical_key_locked = true` (orphan blocks duplicate);
      `stuck_pending` clears the lock. Writes
      `result.reconciliation_kind` per the §5.3 contract.
+     **Invariant**: when `kind='partial_success'` the helper
+     refuses (raises `ValueError`) if the post-update row would
+     have no undoable handle (no `target_id`, no
+     `result.import_ticket`, no `result.source_file_token`).
+     Without this guard, a typo at a callsite could create a
+     permanently locked + unreachable row. The check is in Python,
+     not SQL, because it inspects the *combined* (existing + patched)
+     state. See §6.2 SQL block for the rationale.
    - `last_bot_action_for_sender_in_chat(chat_id, sender_open_id, *,
      statuses=("success","reconciled_unknown"), undoable_only=True,
      action_type=None)` — used by `cancel_meeting(last:true)` and
@@ -2400,14 +2468,20 @@ internals.
      AND (
        target_id IS NOT NULL
        OR (status = 'reconciled_unknown'
-           AND result ? 'import_ticket')
+           AND (result ? 'import_ticket'
+                OR result ? 'source_file_token'))
      )
      ```
 
      This catches partial-success doc rows where `target_id` is NULL
-     but `result.import_ticket` lets undo re-poll. `cancel_meeting`
+     but `result.import_ticket` lets undo re-poll, plus the iter-13
+     window where only `result.source_file_token` is set (GC found
+     the row between upload and import_task.create). `cancel_meeting`
      additionally passes `action_type='schedule_meeting'` to
-     restrict to its own kind.
+     restrict to its own kind — schedule_meeting partials always
+     have `target_id=event_id`, so the source_file_token arm is
+     irrelevant for cancel and the predicate naturally excludes
+     unrelated doc partials.
    - `compute_logical_key(*, chat_id, sender_open_id, action_type,
      canonical_args)` — pure hash function.
    - `get_locked_by_logical_key(logical_key)` — Phase 0 lookup;
