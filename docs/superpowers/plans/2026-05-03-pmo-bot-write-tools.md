@@ -3059,7 +3059,7 @@ git commit -am "feat(tools): schedule_meeting Phase 2.0 with effective_attendees
 ```python
 @pytest.mark.asyncio
 async def test_phase_2_1_conflict_marks_success_outcome(
-    schedule_meeting, monkeypatch, fake_ctx,
+    schedule_meeting, monkeypatch, ctx,
 ):
     # ... mocks like above, but freebusy returns a busy slot overlapping
     # request window; assert mark_bot_action_success is called with
@@ -3147,6 +3147,24 @@ Spec §3.5:
 - `primarys` to get user's calendar_id → `calendar_event.list(user_id_type="open_id")`
 - Returns `{bot_known_events, user_calendar_events, visibility_note}`
 - `bot_known_events` joins `bot_actions WHERE action_type IN ('schedule_meeting','restore_schedule_meeting') AND status IN ('success','reconciled_unknown') AND target_id IS NOT NULL AND result.attendees ⊇ {target}`
+
+**JSON containment query in supabase-py**: PostgreSQL has the `@>`
+("contains") operator on jsonb. PostgREST exposes it via the `cs`
+(contains) filter. Concrete supabase-py call shape:
+
+```python
+sb_admin().table("bot_actions").select("*") \
+    .in_("action_type", ["schedule_meeting", "restore_schedule_meeting"]) \
+    .in_("status", ["success", "reconciled_unknown"]) \
+    .not_.is_("target_id", "null") \
+    .filter("result", "cs", json.dumps({"attendees": [target_open_id]})) \
+    .execute()
+```
+
+The `result @> '{"attendees": ["ou_xxx"]}'::jsonb` SQL expression is
+true iff `result.attendees` contains `"ou_xxx"` as one element. Note
+the `cs` filter expects the right side as a JSON-serialized string,
+not a Python dict.
 
 - [ ] Tests cover: self default, explicit target, primarys 0 results graceful return, visibility_note rendering.
 - [ ] Commit.
@@ -3284,7 +3302,7 @@ async def undo_last_action(args: dict) -> dict:
         if target is queries.LastWasUnreachable:
             return _err(
                 "你最近一次操作我没法自动撤销，请人工检查 — "
-                "我没有把更早的操作当成"刚才那个"去撤销"
+                "我没有把更早的操作当成『刚才那个』去撤销"
             )
         if target is None:
             return _err("我没找到你最近的操作")
@@ -3380,7 +3398,10 @@ async def test_undo_schedule_404_treated_as_success(undo, monkeypatch):
     # In the dispatch chain
     if source_row["action_type"] in ("schedule_meeting", "restore_schedule_meeting"):
         # If undoing a restore_schedule_meeting that's still partial_success,
-        # route to Case A handling — Task 9.1d. For success rows, plain delete.
+        # route to Case A handling — Task 9.1d.
+        # **For 9.1b only**: stub `_undo_restore_partial` as a NotImplemented
+        # raise so 9.1b's tests pass (they don't exercise the partial path).
+        # 9.1d will replace the stub with the real implementation.
         if source_row.get("status") == "reconciled_unknown" and source_row["action_type"] == "restore_schedule_meeting":
             return await _undo_restore_partial(source_row)  # 9.1d
         from feishu.calendar import EventNotFound, delete_event
