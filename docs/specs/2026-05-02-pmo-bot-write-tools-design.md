@@ -625,8 +625,8 @@ Resolution rules:
    that mismatch the open_id-based `attendee.create` call.
 
 4. **Phase 2a.5 — Persist snapshot AND target handle BEFORE
-   deletion** (iter-14 fix, hardened in iter-15): UPDATE the
-   `pending` row with **all four** of:
+   deletion** (iter-14 fix, hardened in iter-15 + iter-16): UPDATE
+   the `pending` row with **all five** of:
    - `target_id = <original_event_id>` (iter-15 #1 fix — without
      this, content-aware GC in §5.3 would see only `result.*`
      fields and not classify a stuck-mid-cancel row correctly. See
@@ -634,6 +634,19 @@ Resolution rules:
    - `target_kind = 'calendar_event_cancel'`
    - `result.pre_cancel_event_snapshot = <from Phase 2a>`
    - `result.calendar_id = <...>`
+   - **`result.original_schedule_action_id = <bot_actions.id of the
+     schedule_meeting row that produced original_event_id>`**
+     (iter-16 #1 fix — without this, a partial cancel that crashes
+     before Phase 3 leaves the original schedule row at `success`
+     with `logical_key_locked=true`. The §3.9 cancel-restore branch
+     needs this id to find and explicitly retire the original row
+     before INSERTing the fresh restored schedule row, otherwise R2
+     hits a `LogicalKeyConflict` AFTER R1 has already created a new
+     event in Feishu — orphan. See §3.9 cancel-restore "Retire
+     original schedule row" pre-step.)
+
+   This id is the same row Phase -1 already looked up to extract
+   `result.calendar_id` — just record its `id` here too.
 
    **The row stays `pending`** — this is the same intermediate-
    persist pattern as §3.3 Phase 2.2.5. Critical for the §1.4
@@ -1252,14 +1265,58 @@ Dispatches on `action_type`:
   audit row, and a crash mid-flight could leave a fresh orphan
   event on Feishu without a DB record):
 
-    R1. **Create the new event**:
-        `client.calendar.v4.calendar_event.create(...calendar_id(<from
-        result.calendar_id>)...)` populated from
-        `result.pre_cancel_event_snapshot`. Returns a `new_event_id`
-        with a NEW id distinct from the original.
+    **R0. Retire the original schedule row first** (iter-16 #1
+    fix — load-bearing for the partial-cancel path, see §3.4 Phase
+    2a.5 "result.original_schedule_action_id"): in a single UPDATE,
+    transition the original `schedule_meeting` row identified by
+    `result.original_schedule_action_id` from `success` to `undone`
+    AND clear its `logical_key_locked = false` (§6.2 lock-behavior
+    on `pending → undone`). This is what §3.4 Phase 3 *would* have
+    done if the cancel had completed cleanly; for the partial-
+    cancel path (Phase 2a.5 ran, Phase 3 didn't) the original
+    schedule row is still `success` with the lock held — without
+    R0, R2's INSERT would hit `LogicalKeyConflict` AFTER R1 has
+    already created a new event in Feishu, leaving an orphan.
+
+    Use `WHERE id = $original_schedule_action_id AND status =
+    'success'` to make this idempotent across retries: if the cancel
+    completed cleanly the first time (already `undone`, lock
+    cleared), the UPDATE is a no-op zero-row return and we proceed.
+
+    **R1. Build the create-event body from the snapshot using a
+    field whitelist**, NOT `**snapshot.dict()` (iter-16 #3 fix):
+    the `CalendarEvent` model carries server-side / read-only
+    fields (`event_id`, `organizer_calendar_id`, `status`,
+    `create_time`, `app_link`) and an `attendees` list. Round-
+    tripping the entire snapshot into the create body would either
+    have the API reject the read-only fields, or — for `attendees`
+    — have the create call invite everyone, then R3 invite them
+    again (duplicate notifications). Restore copies ONLY the
+    user-authored, writable fields:
+    - `summary`
+    - `description`
+    - `start_time`, `end_time` (with `time_zone` if present)
+    - `visibility`
+    - `attendee_ability` (we want to preserve "can_modify_event")
+    - `reminders`
+    - `location`
+    - `color` / `vchat` if set in snapshot
+
+    Explicitly **omit**: `event_id`, `organizer_calendar_id`,
+    `status`, `create_time`, `app_link`, `attendees`. Attendees
+    are invited in R3, not at create-time, so the create body's
+    `attendees` field stays unset.
+
+    `client.calendar.v4.calendar_event.create(CreateCalendarEventRequest
+    .builder().calendar_id(<from result.calendar_id>).request_body(
+    <whitelisted CalendarEvent>).build())` → returns
+    `new_event_id` distinct from the original.
+
     R2. **Phase R1.5 — Persist new_event_id to a fresh
-        `schedule_meeting` audit row**: INSERT a new row with
-        `action_type='schedule_meeting'`, `target_id=new_event_id`,
+        audit row** (iter-16 #4 fix — `action_type=
+        'restore_schedule_meeting'`, NOT `'schedule_meeting'`):
+        INSERT a new row with `action_type=
+        'restore_schedule_meeting'`, `target_id=new_event_id`,
         `target_kind='calendar_event'`, `status='pending'`,
         `result.calendar_id=<...>`,
         `result.predecessor_action_id=<original cancel
@@ -1269,6 +1326,21 @@ Dispatches on `action_type`:
         the row content-aware-GC-classifiable as `partial_success`
         rather than orphaning the event. Also log `new_event_id` to
         stderr for the residual pre-R2 crash window.
+
+        **Why a new action_type** (`restore_schedule_meeting`):
+        v17 used `'schedule_meeting'` here, which silently took
+        over §3.9's `schedule_meeting` undo dispatch (delete the
+        event). That broke the iter-16 #4 case where R3 fails and
+        the user retries undo: the literal §3.9 dispatch on the
+        partial restore row would `delete` the new event, NOT
+        `probe-then-finish-the-invite`. With a distinct
+        action_type, §3.9 gains a separate dispatch arm: undo of a
+        `restore_schedule_meeting` row probes via `attendee.list`
+        — if attendees are already on the event, the row's R3 was
+        actually fine and we just mark it `success`; if not, we
+        either re-issue the invite (best-effort) or delete the
+        new event and unwind. See "restore_schedule_meeting undo
+        branch" below for the full dispatch.
     R3. **Invite attendees**:
         `client.calendar.v4.calendar_event_attendee.create(...
         calendar_id(<same>).event_id(new_event_id).user_id_type(
@@ -1280,39 +1352,57 @@ Dispatches on `action_type`:
         through the same identity space.
 
         **If R3 fails after R2's persist landed**: do NOT mark the
-        new schedule row `failed` (that would invite a duplicate
-        retry — same iter-9 schedule_meeting bug). Instead transition
-        the new schedule row to `reconciled_unknown(partial_success)`
-        with `error="restore_attendee_invite_failed: ..."`. The
-        user can re-issue undo, which will see the new row's
-        partial_success state and probe its event_id (now valid)
-        and skip restore again, cycling through the existing partial
-        flow — eventually reaches manual cleanup or successful
-        re-invite via `cancel_meeting` on the new row plus a new
-        schedule.
-    R4. **Phase R3.5 — Persist completion**: mark the new
-        schedule_meeting row `status='success'`, augment `result`
-        with `link` (from R1's response) and `attendees` (from
-        snapshot, NOT API echo, per §3.3 Phase 3 contract); mark
-        the cancel_meeting source row `status='undone'`.
+        new restore row `failed` (that would invite a duplicate
+        retry — same iter-9 schedule_meeting bug). Instead
+        transition the new `restore_schedule_meeting` row to
+        `reconciled_unknown(partial_success)` with
+        `error="restore_attendee_invite_failed: ..."`. The user
+        can re-issue undo; the dedicated `restore_schedule_meeting`
+        undo branch (below) probes attendees and either finishes
+        or rolls back cleanly.
+    R4. **Phase R3.5 — Persist completion**: mark the
+        `restore_schedule_meeting` row `status='success'`, augment
+        `result` with `link` (from R1's response) and `attendees`
+        (from snapshot, NOT API echo, per §3.3 Phase 3 contract);
+        mark the cancel_meeting source row `status='undone'`. (R0
+        already retired the original schedule_meeting row.)
 
   Response carries `restore_caveats` (see §3.4) so the agent can
   warn the user about the new event_id, lost post-cancel edits,
   and the small probability that the original event was already
   re-created by another path.
 
-  **Logical_key collision check** (worth tracing through because
-  three rows interact): the new schedule audit row's logical_key is
-  computed from the snapshot's canonical_args, which match the
-  original schedule's logical_key. The original schedule row was
-  marked `undone` in §3.4 Phase 3, which cleared its
-  `logical_key_locked` per §6.2 lock-behavior table. So the new
-  schedule audit row INSERTs cleanly without a `LogicalKeyConflict`.
-  If for some reason the original row's lock wasn't cleared (edge
-  case: §3.4 Phase 3 crashed after marking cancel success but before
-  marking the original undone), the restore would surface as a
-  partial_success-style "please undo first" via the existing Phase
-  1b conflict handling — degrades gracefully, no spec gap.
+  **Logical_key trace** (post-iter-16): R0 unconditionally clears
+  the original schedule row's `logical_key_locked`. The new
+  `restore_schedule_meeting` row's logical_key is computed from
+  `(chat_id, sender_open_id, 'restore_schedule_meeting',
+  canonical_args=snapshot)` — note the `action_type` differs from
+  `'schedule_meeting'` so the logical_key is **also distinct**
+  from the original schedule's, and would not have collided even
+  without R0. R0 belt-and-suspenders the partial-cancel case:
+  even if a future change unifies action_types, R0 alone keeps
+  R2's INSERT clean.
+
+- `restore_schedule_meeting` (NEW iter-16) → **probe-attendees-
+  then-decide**: this branch handles undo of a partial restore (R3
+  failed) or, less commonly, of a successfully-restored row that
+  the user wants to roll back. Steps:
+  - `client.calendar.v4.calendar_event_attendee.list(...
+    calendar_id(<from result.calendar_id>).event_id(<from
+    target_id>).user_id_type("open_id").build())` → see who's
+    actually on the event.
+  - If the attendee list matches `result.attendees` (R3
+    succeeded): the partial was a false alarm; mark the row
+    `success` (transitioning out of `reconciled_unknown`) and
+    return — nothing to undo on the Feishu side.
+  - If the attendee list is empty / partial: the user is asking
+    to roll back the restore. Best-effort:
+    `calendar_event.delete(calendar_id, target_id)` to remove the
+    just-restored event; mark the `restore_schedule_meeting` row
+    `undone`; surface to user "我把恢复出来的会议又删掉了 — 你
+    原来取消的那个会还是没有恢复，要再 try 一次吗？"
+  - On any 404 from the probe (event already gone): mark the row
+    `undone`, no action needed.
 - `append_action_items` →
   `client.bitable.v1.app_table_record.batch_delete(...)` (flat SDK
   attribute path; see §3.3bis), passing `record_ids` from
@@ -2654,6 +2744,10 @@ agent commonly mishandles. For traceability:
 | 99 | `last_bot_action_for_sender_in_chat`'s post-GC behavior fell back to the second-most-recent undoable row when the asker's most recent row was non-undoable (`stuck_pending` / `failed` / `undone`). User says "撤销刚才那个" → bot silently undoes an unrelated earlier action. The user's intent ("the LATEST action") is violated by the literal-satisfaction-on-different-action interpretation | Helper now returns a `LastWasUnreachable` sentinel when the chronologically-newest row is non-undoable; the caller surfaces "你最近一次操作我没法自动撤销，请人工检查 — 我没有把更早的操作当成"刚才那个"去撤销". Caught in iter-15 Codex review. |
 | 100 | iter-14's `include_asker=True` made Phase 2.0 build `effective_attendees`, but Phase 3's `result.attendees` text still said "copied from the input `attendee_open_ids`". Implementer following Phase 3 verbatim would write the raw input (no asker) to `result.attendees`, undoing the iter-14 #90 fix where asker was supposed to appear in `bot_known_events` JOINs | Phase 3 now explicitly says `result.attendees = effective_attendees` with rationale tying back to iter-14 #90 / row 90. Caught in iter-15 Codex review. |
 | 101 | §6.2 `target_id` and `target_kind` schema comments were stale: didn't list `'calendar_event_cancel'` (iter-14), still said `record_id` for the bitable case (§3.6 actually stores table_id), didn't note that `'file'` covers BOTH the iter-13 upload-only partial AND the iter-12 step-5 cleanup-failure case. Implementer using the comment as the canonical enum spec would miss values | Both column comments rewritten to enumerate every legal `(target_id, target_kind)` pair with section cross-references. Caught in iter-15 Codex review. |
+| 102 | iter-15's cancel-restore relied on "the original schedule row is `undone` so its `logical_key_locked` is cleared" — but that's only true on the cancel happy path (§3.4 Phase 3 ran). On a partial cancel (Phase 2a.5 ran, Phase 2b deleted the event, Phase 3 crashed before marking undone), the original row is still `success` with the lock held. R2's INSERT then hits `LogicalKeyConflict` AFTER R1 has created a new event — fresh orphan. Plus the original row stays in `bot_known_events` JOIN | §3.4 Phase 2a.5 now persists `result.original_schedule_action_id`. §3.9 cancel-restore adds an explicit **R0 step** before R1: idempotent UPDATE the original row from `success → undone` (clears the lock); subsequent R1 / R2 are clean regardless of cancel-completion path. Caught in iter-16 Codex review. |
+| 103 | `last_bot_action_for_sender_in_chat`'s newest-row guard only fired after the 5-min stuck-pending GC. A live `pending` row (under 5 min) was still skipped by the undoable status filter; the helper would silently return the second-most-recent terminal row. User's "撤销刚才那个" while their latest action was still in flight would mutate the wrong action | Helper now distinguishes three newest-row cases: `pending AND age <5 min` → `LastIsInFlight` sentinel ("still running, wait or be specific"); non-undoable terminal → `LastWasUnreachable`; passes filter → return row. Never falls through to older terminal rows. Caught in iter-16 Codex review. |
+| 104 | §3.9 cancel-restore R1 said "populated from `result.pre_cancel_event_snapshot`" without specifying field whitelist. The `CalendarEvent` model carries server-side fields (`event_id`, `organizer_calendar_id`, `status`, `create_time`, `app_link`) and an `attendees` list. Round-tripping the full snapshot into `calendar_event.create` would either be rejected (read-only fields) or invite attendees twice (R1 + R3) | R1 now specifies an explicit whitelist: copy ONLY `summary` / `description` / `start_time` / `end_time` / `visibility` / `attendee_ability` / `reminders` / `location` / `color` / `vchat`; explicitly omit `event_id`, `organizer_calendar_id`, `status`, `create_time`, `app_link`, `attendees`. Caught in iter-16 Codex review. |
+| 105 | §3.9 cancel-restore R3 failure wrote a `reconciled_unknown(partial_success)` row with `action_type='schedule_meeting'`, but the spec text described a recovery path involving "probe event_id and skip restore". The literal §3.9 dispatch on `schedule_meeting` rows is `delete event` — not probe-then-finish-invite. The text and dispatch contradicted each other; an implementer following dispatch verbatim would delete the just-restored event instead of completing the invite | New `action_type='restore_schedule_meeting'` for the R2-inserted audit row; new §3.9 dispatch arm `restore_schedule_meeting` → probe-attendees-then-decide (if attendees match → finalize; if not → delete and tell user; if 404 → mark undone). Action_type also produces a distinct `logical_key`, so the conflict-trace in §3.9 simplifies. Caught in iter-16 Codex review. |
 
 ---
 
@@ -2759,24 +2853,38 @@ internals.
      - `stuck_pending` — the row has no handle. Skip from undoable,
        but **DO NOT silently fall back to an older terminal row**.
 
-     **Stuck-pending fall-through guard** (iter-15 Codex #3): if,
-     after the GC pre-step, the asker's chronologically newest row
-     in this chat is now `reconciled_unknown(stuck_pending)` (or any
-     non-undoable terminal status — `failed`, `undone`, or
-     `reconciled_unknown(stuck_pending)`), the helper returns a
-     **special `LastWasUnreachable` sentinel** instead of falling
-     through to the second-most-recent undoable row. The caller
-     (`undo_last_action(last_for_me)` or `cancel_meeting(last:true)`)
-     surfaces this to the agent as "你最近一次操作我没法自动撤销
-     ([reason])，请人工检查 — 我没有把更早的操作当成"刚才那个"
-     去撤销，避免误删。" rather than silently mutating an unrelated
-     earlier action. "撤销刚才那个" means the LATEST action; if
-     the latest can't be undone, the right answer is to tell the
-     user, not to satisfy the request literally on a different
-     action.
+     **Newest-row fall-through guard** (iter-15 Codex #3,
+     extended in iter-16 #2): the helper inspects the asker's
+     chronologically-newest row in this chat (BEFORE applying the
+     undoable filter). Three cases:
 
-     The caller can fall back to "show me a list" UX (out of v1 scope)
-     or have the user be more specific.
+     - `status='pending' AND created_at >= now() - interval '5 min'`
+       → **live pending**, action still in flight (iter-16 #2 fix).
+       Helper returns a `LastIsInFlight` sentinel. Caller surfaces
+       "你最新一次操作还在进行中——稍等一下再说要撤销，或者告
+       诉我具体撤销哪一个". This case is NOT covered by the
+       stuck-pending GC (which only fires at 5+ min). Without it,
+       the undoable filter would skip the pending row and silently
+       fall through to a successful older action.
+     - Newest row is non-undoable terminal (`failed`, `undone`, or
+       `reconciled_unknown(stuck_pending)` — i.e. has no
+       recoverable handle and the §3.9 "undoable" predicate
+       excludes it; this set is checked **after** running
+       `_lazy_gc_stuck_pending` on the row first, in case it was a
+       still-`pending` row that just aged out) → helper returns a
+       `LastWasUnreachable` sentinel. Caller surfaces "你最近
+       一次操作我没法自动撤销 ([reason])，请人工检查 — 我没有把
+       更早的操作当成"刚才那个"去撤销，避免误删".
+     - Newest row passes the undoable filter (`success` or
+       `reconciled_unknown(partial_success)` with a handle) →
+       return that row.
+
+     The caller never falls through to "second-most-recent". The
+     user's "撤销刚才那个" is a directive about the LATEST action;
+     if the latest can't be undone or is still running, the right
+     answer is to surface the situation, not to mutate an
+     unrelated earlier action. Future "show me a list" UX (out of
+     v1 scope) can let the user pick explicitly.
    - `compute_logical_key(*, chat_id, sender_open_id, action_type,
      canonical_args)` — pure hash function.
    - `get_locked_by_logical_key(logical_key)` — Phase 0 lookup;
