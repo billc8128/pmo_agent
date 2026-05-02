@@ -180,6 +180,11 @@ the run). Without timezone the model has no safe way to interpret
 }
 ```
 
+**Tool description directive**: "Always call this before passing any
+datetime to `schedule_meeting` or any time-window argument to
+`list_my_meetings` / `query_action_items`. The asker's timezone is the
+correct frame for interpreting relative phrases like '下周三 3 点'."
+
 ### 3.3 `schedule_meeting`
 
 **Inputs**:
@@ -192,27 +197,48 @@ the run). Without timezone the model has no safe way to interpret
 
 **Internal sequence** (the three-phase pattern, see §5):
 
-1. **Pre-check**: call `calendar.v4.freebusy.list` for all attendees over
-   the requested window. If any conflict, return
-   `{conflict: [{open_id, busy_event_summary}]}` and DO NOT create the
-   event. The agent reasks the user.
-2. **Idempotency**: insert `bot_actions(message_id, action_type=
-   "schedule_meeting", status="pending", args=...)`. UNIQUE
-   `(message_id, action_type)` constraint surfaces duplicates.
-3. **Create event**: `calendar.v4.calendar_event.create` against the
-   bot's primary calendar with `attendee_ability=can_modify_event`.
-4. **Invite attendees**: `calendar.v4.calendar_event.attendee.create_batch`.
-5. **Persist**: update `bot_actions` to `status=success`, store
-   `target_id=event_id`, `result={event_id, calendar_id, link, attendees}`.
+1. **Phase 1 — Idempotency check + pending insert**: look up
+   `bot_actions` by `(message_id, "schedule_meeting")`; on hit return
+   the cached result. Otherwise insert a `pending` row keyed on
+   `(message_id, action_type)` — UNIQUE constraint serializes concurrent
+   retries. **All subsequent steps including freebusy run only after
+   this row exists**, so a webhook retry sees `pending` and bails out
+   without re-issuing any Feishu calls.
+2. **Phase 2 — Freebusy pre-check**: call `calendar.v4.freebusy.list`
+   for all attendees over the requested window. If any conflict, mark
+   the row `failed` (with `error="conflict"` and the conflict payload
+   stored in `result`) and return `{conflict: [{open_id,
+   busy_event_summary}]}` to the agent. The agent reasks the user; a
+   subsequent retry uses a *new* message_id so a fresh row is created.
+3. **Phase 2 — Create event**: `calendar.v4.calendar_event.create`
+   against the bot's primary calendar with
+   `attendee_ability=can_modify_event`.
+4. **Phase 2 — Invite attendees**:
+   `calendar.v4.calendar_event.attendee.create_batch`.
+5. **Phase 3 — Persist terminal state**: update `bot_actions` to
+   `status=success`, store `target_id=event_id`, `target_kind=
+   "calendar_event"`, `result={event_id, calendar_id, link, attendees}`.
 6. Return event details to the agent.
 
 ### 3.4 `cancel_meeting`
 
-**Inputs**: `event_id` OR `last:true` (cancels most recent
-bot-scheduled meeting in the conversation).
+**Inputs**: `event_id` OR `last:true` (cancels the most recent
+bot-scheduled meeting **in the current conversation**).
 
-Looks up the event in `bot_actions` by `target_id` to confirm it was
-bot-scheduled; refuses to delete events the bot did not create.
+Resolution rules:
+- If `event_id` is given: look up `bot_actions WHERE target_kind=
+  'calendar_event' AND target_id=event_id`. If no row → refuse
+  ("only cancel meetings I created"). If row exists but
+  `status='undone'` → no-op, return idempotent success.
+- If `last:true`: look up `bot_actions WHERE chat_id=<current> AND
+  action_type='schedule_meeting' AND status='success' ORDER BY
+  created_at DESC LIMIT 1`. Requires `chat_id` column on `bot_actions`
+  (see §6.2).
+
+Internally follows the three-phase pattern: pending insert keyed on
+`(message_id, "cancel_meeting")` → `calendar_event.delete` →
+mark `success`, and update the original `schedule_meeting` row's
+`status` to `undone` for traceability.
 
 ### 3.5 `list_my_meetings`
 
@@ -228,8 +254,30 @@ attendees, location.
 - `meeting_event_id?: str` (optional link to an event in the same conversation)
 
 Writes one record per item to the `action_items` table in the bot's
-Bitable base. Three-phase pattern. `project` defaults to the
-project most active in the asker's recent turns (see §6).
+Bitable base. Three-phase pattern.
+
+**Default-project resolution** (per item with no `project` provided):
+
+1. Look at the asker's `turns` rows in the **last 7 days**, group by
+   `project_root`, take the one with highest count.
+2. **Tie-break**: prefer the project whose latest turn is most recent.
+3. **Threshold**: if the top project has fewer than 3 turns in the
+   window, treat as no signal — fall through to step 4.
+4. Leave `project` null on the record AND mark
+   `default_project_resolution: "ambiguous"` in the tool's return
+   value so the agent reasks the user: "Which project should I file
+   these under?"
+
+**Return shape** always includes the resolved project per item so the
+agent can confirm with the user before considering the operation done:
+
+```json
+{
+  "records": [
+    {"record_id": "rec_xxx", "title": "...", "project_used": "/Users/a/Desktop/vibelive", "project_source": "auto_recent_turns" | "user_explicit" | "ambiguous"}
+  ]
+}
+```
 
 ### 3.7 `query_action_items`
 
@@ -242,23 +290,57 @@ Reads from the `action_items` table; no write side effects.
 
 **Inputs**:
 - `title: str`
-- `markdown_body: str` — Feishu Docx accepts a Markdown import; we use it.
+- `markdown_body: str` — markdown source the agent produced.
 - `meeting_event_id?: str`
 
 Three-phase pattern. Creates a Docx in the bot's "文档柜" folder, returns
 `{doc_token, url}`. The agent embeds the link in its reply.
 
+**Implementation note — Markdown to Docx**: the standard
+`docx.v1.document.create` endpoint creates an **empty** document and
+does NOT accept Markdown directly. Two viable paths, to confirm during
+implementation:
+
+- **Path A (preferred)**: `drive.v1.import_tasks.create` with
+  `type="docx"`, `file_extension="md"`, body=Markdown bytes. This is
+  Feishu's documented Markdown import flow, async — you poll
+  `import_tasks.get` until done, then receive the `doc_token`.
+- **Path B (fallback)**: `docx.v1.document.create` (empty doc), then
+  parse Markdown into Docx blocks ourselves and call
+  `docx.v1.document.block.children.create` to append. More code, no
+  async polling.
+
+Pick A first; fall back to B only if import permissions can't be
+granted in production. The choice does not affect this tool's
+**interface** — only its body.
+
 ### 3.9 `undo_last_action`
 
-**Inputs**: `message_id?: str` (defaults to current).
+**Inputs**:
+- `target` (one of):
+  - `last_in_chat: true` — undo the most recent `success` row in the
+    current conversation (resolved via `chat_id`, see §6.2).
+  - `action_id: str` — explicit `bot_actions.id` to undo (used when the
+    agent has just shown the user a list and they pointed to one).
+  - `target_id: str` + `target_kind: str` — undo by Feishu-side ID
+    (e.g. user pasted an event link).
 
-Looks up the most recent `bot_actions` row for the message, dispatches
-on `action_type` to the right "compensating" Feishu call:
+The "lookup most recent for the same message_id" semantic from earlier
+drafts is removed: `UNIQUE (message_id, action_type)` means a single
+message_id has at most one row per action_type, so "most recent for
+message" is ambiguous when an utterance triggered multiple action
+types. Conversation scope (`chat_id`) is the right unit.
+
+Dispatches on `action_type`:
 - `schedule_meeting` → `calendar_event.delete`
-- `append_action_items` → `bitable.app.table.record.delete` (one per row)
+- `append_action_items` → `bitable.app.table.record.batch_delete`
+  (one record_id per appended item, all stored in `result.record_ids`)
 - `create_meeting_doc` → `drive.v1.file.delete`
 
-Marks the row `status=undone`. Idempotent (calling it again is a no-op).
+Marks the source row `status=undone`. Records its own `undo_last_action`
+row with `target_id=<original action_id>` for traceability.
+
+Idempotent: calling it on an already-`undone` row is a no-op success.
 
 ---
 
@@ -290,6 +372,29 @@ cached 60s). If a resource has been deleted by a human, re-run the
 bootstrap path for the missing piece, update `bot_workspace`, and
 post-message the asker: "我的工作台被删了，刚重建了一份在这里：[link]".
 
+**Concurrency**: re-bootstrap is wrapped in a Postgres transaction-
+scoped advisory lock so two concurrent write tools that both observe
+a missing resource don't each create a new one. Pseudocode:
+
+```python
+with conn.transaction():
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", [BOT_WORKSPACE_LOCK_KEY])
+    if not feishu_resource_still_exists(...):
+        new_ids = await rebootstrap_missing_pieces(...)
+        queries.update_bot_workspace(new_ids)
+```
+
+`BOT_WORKSPACE_LOCK_KEY` is a fixed bigint (e.g. `0x504D4F00` —
+"PMO\0"). The lock is released automatically at transaction end.
+
+**Data loss is real**: when a resource is deleted by a human, the
+records inside it (e.g. previously-written `action_items` rows in the
+old base) are **gone**. Self-healing rebuilds the container, not the
+contents. The post-message warning to the asker exists precisely so
+users can decide whether to recreate critical entries by hand. We
+intentionally do not attempt to back up Bitable contents to Postgres
+in MVP — that is a future-work item if this becomes a real problem.
+
 ---
 
 ## 5. The three-phase write pattern
@@ -297,9 +402,54 @@ post-message the asker: "我的工作台被删了，刚重建了一份在这里�
 This is the single most important pattern in this spec. **Every write
 tool's body follows this shape**, not a generic post-hoc listener.
 
+### 5.0 Per-run context propagation (`contextvars`, not module globals)
+
+Existing code uses a module-level `_current_conversation_key_var`
+(`bot/agent/tools.py:29-31`) set via `set_current_conversation` before
+each agent run. That works today because agent runs are serialized
+per-conversation (`bot/agent/runner.py` slot lock). It does **not**
+generalize: two concurrent runs in different conversations would
+race on the same global, and adding `message_id` doubles the surface.
+
+This spec switches both fields to `contextvars.ContextVar` — the
+standard Python primitive for per-task state in async code. Each
+`asyncio.create_task(_handle_message(...))` gets its own copy
+automatically; tools read the current task's value with no locks and
+no interference between concurrent runs.
+
+```python
+# bot/agent/tools.py
+import contextvars
+
+_message_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pmo_message_id", default="",
+)
+_conversation_key_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pmo_conversation_key", default="",
+)
+_chat_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pmo_chat_id", default="",
+)
+
+def set_current_request(*, message_id: str, conversation_key: str, chat_id: str) -> None:
+    _message_id_ctx.set(message_id)
+    _conversation_key_ctx.set(conversation_key)
+    _chat_id_ctx.set(chat_id)
+```
+
+`app.py` calls `set_current_request(...)` at the top of
+`_handle_message` (replacing the existing
+`set_current_conversation`). The existing call site at
+`tools.py:29-31` is migrated to the new API; one call site in
+`agent/imaging.py` (used by `generate_image`) is updated to read from
+`_conversation_key_ctx.get()` instead of the module global.
+
+### 5.1 Tool body skeleton
+
 ```python
 async def schedule_meeting(args: dict) -> dict[str, Any]:
-    message_id = _current_message_id_var          # injected by app.py
+    message_id = _message_id_ctx.get()
+    chat_id = _chat_id_ctx.get()
     action_type = "schedule_meeting"
 
     # Phase 1: idempotency check + pending insert
@@ -309,10 +459,20 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
             return _ok(existing["result"])
         if existing["status"] == "pending":
             return _err("a previous identical call is in flight")
+        if existing["status"] == "reconciled_unknown":
+            # GC'd row — we don't know if Feishu side succeeded.
+            return _err(
+                "an earlier identical call was orphaned; please verify "
+                "in your Feishu calendar and ask me again with a fresh "
+                "instruction if it didn't happen"
+            )
         # 'failed' → fall through, retry permitted
 
     action_id = queries.insert_bot_action_pending(
-        message_id=message_id, action_type=action_type, args=args,
+        message_id=message_id,
+        chat_id=chat_id,
+        action_type=action_type,
+        args=args,
     )  # raises UniqueViolation if a concurrent insert beat us
 
     # Phase 2: do the actual side effect
@@ -324,7 +484,10 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
 
     # Phase 3: persist terminal state
     queries.mark_bot_action_success(
-        action_id, target_id=result["event_id"], result=result,
+        action_id,
+        target_id=result["event_id"],
+        target_kind="calendar_event",
+        result=result,
     )
     return _ok(result)
 ```
@@ -363,16 +526,26 @@ They cover different failure modes. Both stay.
 ### 5.3 Reconciling stuck `pending` rows
 
 A row stuck in `pending` for >5 minutes is almost certainly orphaned
-(process died mid-call). A simple GC pass marks them `failed` with
-`error="reconciled: pending too long"`. We do not auto-retry — the
-side effect may or may not have happened, and re-attempting could
-create duplicates on the Feishu side. The agent surfaces these to
-the user the next time `undo_last_action` or `query_action_items`
-runs.
+(process died mid-call). A simple GC pass marks them
+`reconciled_unknown` (a distinct status, **not** `failed`) with
+`error="reconciled: pending too long"`.
+
+The distinction matters: `failed` means "we know the Feishu call
+errored, retry is safe". `reconciled_unknown` means "we don't know
+if the Feishu side succeeded — retrying could create a duplicate".
+
+The tool skeleton (§5.1) treats `reconciled_unknown` as a hard stop:
+return an error to the agent that explains the ambiguity and asks the
+user to verify on the Feishu side before issuing a fresh request.
+This deliberately surfaces a rare case to the user rather than silently
+risking a duplicate meeting.
 
 A separate cron/loop is **not** added in MVP; the GC happens lazily
 in `get_bot_action` itself (if it returns a row >5min old in pending,
-mark it failed before returning). YAGNI.
+mark it `reconciled_unknown` before returning). YAGNI.
+
+The `status` CHECK constraint in §6.2 includes `reconciled_unknown` for
+this reason.
 
 ---
 
@@ -399,11 +572,19 @@ ALTER TABLE bot_workspace ENABLE ROW LEVEL SECURITY;
 
 ```sql
 -- backend/supabase/migrations/0011_bot_actions.sql
+
+-- gen_random_uuid() lives in pgcrypto. Supabase usually has it
+-- pre-installed, but be explicit so this migration is portable.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 CREATE TABLE bot_actions (
     id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     message_id   text NOT NULL,                    -- Feishu message that triggered the action
+    chat_id      text NOT NULL,                    -- Feishu chat id (group / p2p) — scope for "last in conversation"
     action_type  text NOT NULL,                    -- 'schedule_meeting' | 'append_action_items' | ...
-    status       text NOT NULL CHECK (status IN ('pending','success','failed','undone')),
+    status       text NOT NULL CHECK (
+                   status IN ('pending','success','failed','undone','reconciled_unknown')
+                 ),
     args         jsonb NOT NULL,                   -- tool inputs (sanitized)
     target_id    text,                             -- Feishu side ID (event_id, record_id, doc_token)
     target_kind  text,                             -- 'calendar_event' | 'bitable_record' | 'docx'
@@ -416,6 +597,9 @@ CREATE TABLE bot_actions (
 CREATE INDEX bot_actions_target_idx ON bot_actions (target_kind, target_id);
 CREATE INDEX bot_actions_pending_idx ON bot_actions (status, created_at)
   WHERE status = 'pending';
+-- "last bot action in this conversation" — used by cancel_meeting:last
+-- and undo_last_action:last_in_chat
+CREATE INDEX bot_actions_chat_recent_idx ON bot_actions (chat_id, created_at DESC);
 ALTER TABLE bot_actions ENABLE ROW LEVEL SECURITY;
 -- Service role only; no end-user policy.
 ```
@@ -423,6 +607,12 @@ ALTER TABLE bot_actions ENABLE ROW LEVEL SECURITY;
 `UNIQUE (message_id, action_type)` is the hard idempotency guarantee.
 Two concurrent inserts race; one wins, the other gets a violation and
 falls through to "read existing row, return its result".
+
+`chat_id` is **required** (NOT NULL) because both `cancel_meeting`
+(§3.4) and `undo_last_action` (§3.9) need to scope "last action" to
+the conversation that issued the request. Without it the tools would
+either operate globally (wrong) or fall back to message_id-only
+(ambiguous when one message triggered multiple action types).
 
 ---
 
@@ -434,15 +624,20 @@ these places:
 | Concern | Lives in | Existing or new |
 | --- | --- | --- |
 | Feishu webhook handling | `bot/feishu/events.py`, `bot/app.py` | unchanged |
-| `set_current_message_id` injection | `bot/app.py` (call site), `bot/agent/tools.py` (storage) | one new line each |
+| Per-run context (`message_id`, `chat_id`, `conversation_key`) via `contextvars.ContextVar` (see §5.0) | `bot/agent/tools.py` (storage), `bot/app.py` (set call) | one block in tools.py, one call in app.py; existing `set_current_conversation` is migrated, not duplicated |
 | Tool schema + LLM-visible behavior | `bot/agent/tools.py` | new tools, three-phase pattern in each |
 | Feishu API wrappers (calendar, bitable, docx, contact) | `bot/feishu/client.py` | new methods |
 | `bot_actions` / `bot_workspace` SQL | `bot/db/queries.py` | new functions, all via `sb_admin()` |
-| Workspace bootstrap script | `bot/scripts/bootstrap_bot_workspace.py` | new file |
+| Workspace bootstrap script | `bot/scripts/bootstrap_bot_workspace.py` | new file (and the `bot/scripts/` directory itself, created in step 4 of §11) |
 | Schema | `backend/supabase/migrations/0010_*.sql`, `0011_*.sql` | new |
 
-Things explicitly NOT changed: `bot/feishu/cards.py`, `bot/agent/runner.py`,
-`bot/agent/imaging.py`, `bot/db/client.py`, the existing read tools.
+Things explicitly NOT changed in their **interfaces**: `bot/feishu/cards.py`,
+`bot/agent/runner.py`, `bot/db/client.py`, the existing read tools.
+
+Touched **internally only** for the contextvars migration:
+`bot/agent/imaging.py` reads the conversation key from
+`_conversation_key_ctx` instead of the old module global. No public
+API change; one-line edit.
 
 ---
 
@@ -500,18 +695,23 @@ agent commonly mishandles. For traceability:
 
 | # | Risk | Mitigation in this spec |
 | --- | --- | --- |
-| 1 | Timezone ambiguity | `today_iso` returns `user_timezone`; system prompt enforces RFC3339+offset |
-| 2 | Webhook retry double-action | `bot_actions UNIQUE(message_id, action_type)` |
-| 3 | Booking on top of existing meetings | `freebusy.list` pre-check inside `schedule_meeting` |
-| 4 | Orphaned half-completed multi-step actions | `bot_actions` audit log + `undo_last_action` |
-| 5 | Silent name-resolution failures | `resolve_people` returns `resolved/ambiguous/unresolved` separately |
-| 6 | Missing defaults for meeting duration / reminder | 30 min / 15 min, set in tool description |
-| 7 | "Which project" missing context | `append_action_items` defaults `project` to most active project in asker's recent turns |
-| 8 | Bot's workspace resources deleted by humans | Self-healing re-bootstrap on missing resource |
+| 1 | Timezone ambiguity | `today_iso` returns `user_timezone` (§3.2); system prompt enforces RFC3339+offset (§9) |
+| 2 | Webhook retry double-action | `bot_actions UNIQUE(message_id, action_type)` (§6.2) |
+| 3 | Booking on top of existing meetings | `freebusy.list` pre-check **after** pending insert (§3.3 phase 2) |
+| 4 | Orphaned half-completed multi-step actions | `bot_actions` audit log + `undo_last_action` (§3.9) |
+| 5 | Silent name-resolution failures | `resolve_people` returns `resolved/ambiguous/unresolved` separately (§3.1) |
+| 6 | Missing defaults for meeting duration / reminder | 30 min / 15 min, set in tool description (§3.3) |
+| 7 | "Which project" missing context | Tightened default rule with tie-break, threshold, and ambiguous return (§3.6) |
+| 8 | Bot's workspace resources deleted by humans | Self-healing re-bootstrap behind advisory lock (§4); orphan acknowledgement |
 | 9 | Recurring meetings | Out of scope (§1.3) |
 | 10 | Meeting rooms / VC links | Out of scope (§1.3) |
-| 11 | Cross-language fuzzy matching | Out of scope; agent re-asks |
-| 12 | Doc attachments / images | Out of scope; markdown-only Docx body |
+| 11 | Cross-language fuzzy matching | Out of scope; agent re-asks (§3.1) |
+| 12 | Doc attachments / images | Out of scope; markdown-only Docx body (§3.8) |
+| 13 | Per-task isolation of `message_id`/`chat_id` for concurrent runs | `contextvars.ContextVar` instead of module globals (§5.0) |
+| 14 | Stuck `pending` rows after process crash | Lazy GC marks them `reconciled_unknown`, surfaced to user, never silently retried (§5.3) |
+| 15 | Concurrent re-bootstrap creating duplicate workspace resources | `pg_advisory_xact_lock` around re-bootstrap (§4) |
+| 16 | "Last meeting in conversation" undefined without conversation scope | `chat_id` column on `bot_actions` + `(chat_id, created_at DESC)` index (§6.2) |
+| 17 | Markdown-to-Docx assumption unverified | Two-path implementation note, A preferred (§3.8) |
 
 ---
 
@@ -520,18 +720,33 @@ agent commonly mishandles. For traceability:
 Suggested order (each step independently testable):
 
 1. **Migrations** `0010` + `0011` — schema first, no app changes.
-2. **`db/queries.py`** — add the 6 new functions for bot_actions/workspace.
+2. **`db/queries.py`** — add the new functions for `bot_actions`
+   (`get_bot_action`, `insert_bot_action_pending`,
+   `mark_bot_action_success`, `mark_bot_action_failed`,
+   `mark_bot_action_undone`, `last_bot_action_in_chat`) and
+   `bot_workspace` (`get_bot_workspace`, `update_bot_workspace`).
 3. **`feishu/client.py`** — wrap calendar/bitable/docx/contact endpoints.
-4. **`bootstrap_bot_workspace.py`** — run once against dev env, verify
-   the calendar/base/folder appear correctly.
-5. **`agent/tools.py`** — add the 9 tools, register on the MCP server.
-6. **`app.py`** — inject `message_id` into tools at the same time as
-   `conversation_key`.
-7. **System prompt** — append §9 directives.
-8. **End-to-end smoke test** in a private Feishu group.
+4. **Create `bot/scripts/` directory + `bootstrap_bot_workspace.py`** —
+   run once against dev env, verify the calendar/base/folder appear
+   correctly. Re-runnable: detects existing workspace row and exits.
+5. **Contextvars migration in `bot/agent/tools.py`** — introduce
+   `_message_id_ctx`, `_chat_id_ctx`, `_conversation_key_ctx` and
+   `set_current_request(...)`; remove `_current_conversation_key_var`
+   module global. Update `bot/agent/imaging.py` (one line) to read
+   from `_conversation_key_ctx.get()`. This step has zero behavioral
+   change — purely refactor — so it can ship and bake first.
+6. **`agent/tools.py`** — add the 9 new tools, register on the MCP
+   server. Each follows the §5.1 skeleton.
+7. **`app.py`** — replace the existing `set_current_conversation` call
+   in `_handle_message` with `set_current_request(message_id=...,
+   chat_id=..., conversation_key=...)`.
+8. **System prompt** — append §9 directives in `bot/agent/runner.py`.
+9. **End-to-end smoke test** in a private Feishu group: ask the bot
+   to schedule, append items, and create a doc; then ask it to undo;
+   confirm the rows in `bot_actions` reflect the lifecycle.
 
-Each step touches at most one file. No step depends on a later step's
-internals.
+Each step touches at most one file (step 5 touches two: `tools.py`
+and `imaging.py`). No step depends on a later step's internals.
 
 ---
 
