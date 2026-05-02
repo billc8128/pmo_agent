@@ -479,14 +479,21 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
 7. **Phase 3 — Persist terminal success**: update `bot_actions` to
    `status=success`, augment `result` with:
    - `link`: the Feishu calendar event URL.
-   - **`attendees: List[str]`**: the **open_ids** the agent passed
-     in to Phase 2.3 — copied from the *input* `attendee_open_ids`,
-     NOT from the API response. This guarantees the field is in the
-     open_id identity space regardless of what `user_id_type` the
-     API echoed back. The §3.5 `bot_known_events` JOIN matches
-     against this field via `result.attendees ⊇ {open_id}`; if it
-     came from the API response in a different identity space, the
-     JOIN would silently miss.
+   - **`attendees: List[str] = effective_attendees`** (iter-15 #4
+     fix): use the post-`include_asker` union from Phase 2.0,
+     **not** the raw `args.attendee_open_ids` and **not** the API
+     response. The original LLM input is preserved in
+     `bot_actions.args` for audit; `result.attendees` must mirror
+     what was actually invited (the effective list) so:
+     - The §3.5 `bot_known_events` JOIN — `result.attendees ⊇
+       {target_open_id}` — finds the meeting when the asker
+       queries their own calendar (the asker is in
+       effective_attendees because of `include_asker=True`,
+       but absent from `args.attendee_open_ids` since the LLM
+       can't supply its own open_id; see iter-14 #5 / row 90).
+     - Storing the effective list also keeps the open_id identity
+       space stable regardless of what `user_id_type` the API
+       echoed back, so the JOIN doesn't silently miss.
    - `target_id` and `result.calendar_id` were already persisted
      in Phase 2.2.5; this UPDATE only adds the post-create fields.
 8. Return event details to the agent.
@@ -617,19 +624,41 @@ Resolution rules:
    would either have no attendee list at all, or have union_ids
    that mismatch the open_id-based `attendee.create` call.
 
-4. **Phase 2a.5 — Persist snapshot BEFORE deletion** (iter-14 fix):
-   UPDATE the `pending` row with `result.pre_cancel_event_snapshot=<from
-   2a>` and `result.calendar_id=<...>`. **The row stays `pending`**
-   — this is the same intermediate-persist pattern as §3.3 Phase
-   2.2.5. Critical for the §1.4 "cancel must be undoable" contract:
-   if the process crashes between `delete` (step 4) and Phase 3
-   (step 5), the snapshot is already in DB and undo can still run.
-   Without 2a.5, a crash in that window would leave the event
+4. **Phase 2a.5 — Persist snapshot AND target handle BEFORE
+   deletion** (iter-14 fix, hardened in iter-15): UPDATE the
+   `pending` row with **all four** of:
+   - `target_id = <original_event_id>` (iter-15 #1 fix — without
+     this, content-aware GC in §5.3 would see only `result.*`
+     fields and not classify a stuck-mid-cancel row correctly. See
+     "GC classification of cancel partials" below.)
+   - `target_kind = 'calendar_event_cancel'`
+   - `result.pre_cancel_event_snapshot = <from Phase 2a>`
+   - `result.calendar_id = <...>`
+
+   **The row stays `pending`** — this is the same intermediate-
+   persist pattern as §3.3 Phase 2.2.5. Critical for the §1.4
+   "cancel must be undoable" contract: if the process crashes
+   between `delete` (step 5) and Phase 3 (step 6), the snapshot
+   AND the artifact handle are already in DB and undo can still
+   run. Without 2a.5, a crash in that window would leave the event
    deleted on Feishu with no DB record of how to restore it —
    directly violating §1.4. Also log
    `pre_cancel_event_snapshot.event_id + attendees` to stderr at
-   INFO level just before the UPDATE for the residual upload-style
-   crash window between Feishu return and DB write.
+   INFO level just before the UPDATE for the residual crash window
+   between Feishu return and DB write.
+
+   **GC classification of cancel partials** (iter-15 #1): when
+   §5.3 case (a) lazy GC fires on a row in this state (5+ minutes
+   stuck `pending`, `target_id` set, `target_kind=
+   'calendar_event_cancel'`), the content-aware predicate sees
+   `target_id IS NOT NULL` → classifies as `partial_success`,
+   keeps `logical_key_locked = true`. Undo can then reach it via
+   `last_for_me`. **But the cancel partial is semantically
+   different from the schedule partial**: schedule partial means
+   "event was created, attendees missing"; cancel partial means
+   "either delete fired or didn't, we don't know". §3.9's
+   `calendar_event_cancel` undo branch must therefore **probe the
+   event first** before deciding what to do — see §3.9.
 5. **Phase 2b — Delete**:
    `client.calendar.v4.calendar_event.delete(DeleteCalendarEventRequest
    .builder().calendar_id(calendar_id).event_id(event_id).build())`.
@@ -1192,23 +1221,85 @@ Dispatches on `action_type`:
   .builder().calendar_id(<from result.calendar_id>).event_id(
   <from target_id>).build())`. Both path params are mandatory (see
   `lark_oapi/api/calendar/v4/model/delete_calendar_event_request.py`).
-- `cancel_meeting` → **restore-from-snapshot**:
-  `client.calendar.v4.calendar_event.create(...calendar_id(<from
-  result.calendar_id>)...)` populated from
-  `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a.5,
-  before the delete — so this branch is reachable even if the
-  process crashed between delete and Phase 3),
-  then `client.calendar.v4.calendar_event_attendee.create(...
-  calendar_id(<same>).event_id(new_event_id).user_id_type(
-  "open_id")...)` for the original attendees. The
-  `user_id_type("open_id")` qualifier matches §3.3 Phase 2.3 — the
-  snapshot stored attendee IDs as open_ids, so the restore call has
-  to round-trip through the same identity space. The new event has a different `event_id` than the
-  original; the response includes `restore_caveats` (see §3.4) so
-  the agent can warn the user. Audit linkage: we create a fresh
-  `schedule_meeting` audit row with `target_id=new_event_id` and
-  `result.predecessor_action_id=<original schedule action_id>`; the
-  cancel row stays `undone`.
+- `cancel_meeting` → **probe-then-restore-from-snapshot**:
+
+  **Pre-step (iter-15 #1) — probe the original event before
+  acting**: a cancel row can reach undo in two distinct shapes:
+  (a) Phase 3 ran cleanly: `status='success'`, the delete
+  definitely fired, the event is gone server-side. Restore is
+  the right action.
+  (b) Phase 2a.5 ran but Phase 2b (delete) is uncertain: the row
+  is `reconciled_unknown(partial_success)` (set by content-aware
+  GC after 5+ min stuck `pending`). The delete may have fired
+  before the crash, or may not have. We don't know.
+
+  Before issuing any write, call
+  `client.calendar.v4.calendar_event.get(GetCalendarEventRequest
+  .builder().calendar_id(<from result.calendar_id>)
+  .event_id(<from target_id>).build())`. If the response is **404
+  (event gone)** → delete did fire; proceed to restore (steps
+  below). If the response **succeeds with the event present** →
+  delete didn't fire; the cancel never actually happened on
+  Feishu, so undo just transitions the cancel row to `undone`
+  (clears the lock, no Feishu write needed) and tells the user
+  "我没有真的取消那个会，它还在你的日历里" rather than
+  unhelpfully creating a duplicate event.
+
+  **Restore path** (only if probe returned 404), structured as a
+  multi-step write following the same Phase 2.X.5 intermediate
+  persist pattern as §3.3 (iter-15 #2 fix — restore is itself a
+  multi-step side effect: create event + invite attendees + write
+  audit row, and a crash mid-flight could leave a fresh orphan
+  event on Feishu without a DB record):
+
+    R1. **Create the new event**:
+        `client.calendar.v4.calendar_event.create(...calendar_id(<from
+        result.calendar_id>)...)` populated from
+        `result.pre_cancel_event_snapshot`. Returns a `new_event_id`
+        with a NEW id distinct from the original.
+    R2. **Phase R1.5 — Persist new_event_id to a fresh
+        `schedule_meeting` audit row**: INSERT a new row with
+        `action_type='schedule_meeting'`, `target_id=new_event_id`,
+        `target_kind='calendar_event'`, `status='pending'`,
+        `result.calendar_id=<...>`,
+        `result.predecessor_action_id=<original cancel
+        action_id>`, `result.attendees=<from snapshot>`. **Same
+        rationale as §3.3 Phase 2.2.5**: the moment a new Feishu
+        artifact exists, persist its handle so a later crash leaves
+        the row content-aware-GC-classifiable as `partial_success`
+        rather than orphaning the event. Also log `new_event_id` to
+        stderr for the residual pre-R2 crash window.
+    R3. **Invite attendees**:
+        `client.calendar.v4.calendar_event_attendee.create(...
+        calendar_id(<same>).event_id(new_event_id).user_id_type(
+        "open_id")...)` for the original attendees. The
+        `user_id_type("open_id")` qualifier matches §3.3 Phase 2.3
+        — the snapshot stored attendee IDs as open_ids (it was
+        captured with `need_attendee=True, user_id_type="open_id"`,
+        see §3.4 Phase 2a), so the restore call has to round-trip
+        through the same identity space.
+
+        **If R3 fails after R2's persist landed**: do NOT mark the
+        new schedule row `failed` (that would invite a duplicate
+        retry — same iter-9 schedule_meeting bug). Instead transition
+        the new schedule row to `reconciled_unknown(partial_success)`
+        with `error="restore_attendee_invite_failed: ..."`. The
+        user can re-issue undo, which will see the new row's
+        partial_success state and probe its event_id (now valid)
+        and skip restore again, cycling through the existing partial
+        flow — eventually reaches manual cleanup or successful
+        re-invite via `cancel_meeting` on the new row plus a new
+        schedule.
+    R4. **Phase R3.5 — Persist completion**: mark the new
+        schedule_meeting row `status='success'`, augment `result`
+        with `link` (from R1's response) and `attendees` (from
+        snapshot, NOT API echo, per §3.3 Phase 3 contract); mark
+        the cancel_meeting source row `status='undone'`.
+
+  Response carries `restore_caveats` (see §3.4) so the agent can
+  warn the user about the new event_id, lost post-cancel edits,
+  and the small probability that the original event was already
+  re-created by another path.
 
   **Logical_key collision check** (worth tracing through because
   three rows interact): the new schedule audit row's logical_key is
@@ -2115,8 +2206,8 @@ CREATE TABLE bot_actions (
                                                     -- keep working after lock expires
                                                     -- (§5.2 / §5.3 case b).
     args            jsonb NOT NULL,                -- tool inputs (sanitized)
-    target_id       text,                          -- Feishu side ID (event_id, record_id, doc_token)
-    target_kind     text,                          -- 'calendar_event' (§3.3/§3.4) | 'bitable_records' (§3.6, plural — one row per N records) | 'docx' (§3.8 success) | 'file' (§3.8 partial: source .md uploaded but import didn't start) | 'workspace_bootstrap' (§4) | NULL (freebusy conflict §3.3 Phase 2.1, or doc poll-timeout partial §3.8)
+    target_id       text,                          -- Feishu side ID. Concrete forms: event_id (target_kind='calendar_event' / 'calendar_event_cancel'); table_id of action_items (target_kind='bitable_records'; individual record_ids live in result.record_ids per §3.6); doc_token (target_kind='docx'); source_file_token (target_kind='file'); workspace bootstrap lock sentinel (target_kind='workspace_bootstrap'). NULL is legal for freebusy-conflict success rows and the doc poll-timeout partial.
+    target_kind     text,                          -- 'calendar_event' (§3.3 schedule, §3.4 cancelled-by-user) | 'calendar_event_cancel' (§3.4 cancel_meeting success row, iter-14; §3.9 dispatch routes to restore-from-snapshot, NOT delete) | 'bitable_records' (§3.6, plural — one row per N records, target_id is the table_id) | 'docx' (§3.8 success) | 'file' (§3.8 partial: source .md uploaded but import didn't start, OR step-5 cleanup-failure orphan) | 'workspace_bootstrap' (§4) | NULL (freebusy conflict §3.3 Phase 2.1, or doc poll-timeout partial §3.8 where only result.import_ticket / result.source_file_token is set)
     result          jsonb,                         -- Feishu response keys we'll need later
     error           text,                          -- failure detail
     created_at      timestamptz NOT NULL DEFAULT now(),
@@ -2558,6 +2649,11 @@ agent commonly mishandles. For traceability:
 | 94 | §3.3 Phase 2.1 freebusy body said `user_ids: List[str]` without specifying which list. iter-14 introduced `effective_attendees` (asker auto-included) but Phase 2.1 didn't say it was the freebusy input. Implementer might pass `args.attendee_open_ids` (raw LLM input, no asker), missing the case where asker is double-booked at the requested time | Phase 2.1 now explicitly reads `user_ids=effective_attendees` with rationale that asker double-booking should surface as conflict. Caught in iter-15 self-review. |
 | 95 | `cancel_meeting(last:true)` after a successful cancel of meeting X had no idempotency guard. A retry (double-tap, duplicated webhook missed by the LRU dedup) would resolve `last:true` to the next-most-recent uncancelled meeting (the schedule row of X is `undone` so falls out) and silently cancel an unrelated *earlier* meeting | §3.4 `last:true` rule prepended with a check: if the asker's most recent action in this chat is itself a successful `cancel_meeting` < ~5 min old, return idempotent no-op with "I already cancelled X — did you mean an earlier one?" Caught in iter-15 self-review. |
 | 96 | §5.3 prose quote of the §3.9 "undoable" predicate was missing the iter-13 `source_file_token` arm. Reader establishing mental model from §5.3 alone would miss the doc Phase 2.1.5 / 2.2.5 partial case | §5.3 quote now includes the full `(result ? 'import_ticket' OR result ? 'source_file_token')` clause. Caught in iter-15 self-review. |
+| 97 | `cancel_meeting` Phase 2a.5 only persisted `result.pre_cancel_event_snapshot` and `result.calendar_id`, not `target_id` / `target_kind`. If the process crashed between Phase 2a.5 and Phase 3, the row sat at `pending` with no Feishu artifact handle in the columns content-aware GC inspects — GC would classify it as `stuck_pending` (lock cleared) instead of `partial_success`. The §3.4 claim "snapshot is in DB, undo can still run" was actually broken: undo couldn't reach the row via `last_for_me` because the lock was released and the row was in the wrong terminal class | §3.4 Phase 2a.5 now writes all four (`target_id=<original_event_id>`, `target_kind='calendar_event_cancel'`, `result.pre_cancel_event_snapshot`, `result.calendar_id`) so GC classifies the row as `partial_success` and undo finds it. §3.9 cancel-restore branch adds a probe-step: `calendar_event.get` to detect whether the delete actually fired — 404 means restore is the right move, success means the cancel never landed and undo just clears the cancel row. Caught in iter-15 Codex review. |
+| 98 | `undo_last_action`'s cancel-restore branch was itself a multi-step write (create event + invite attendees + write fresh schedule audit row) but had no intermediate persist or partial-success handling. A crash between create and invite would leave a fresh orphan event on Feishu; a subsequent undo retry would create a second orphan. Same iter-9 schedule_meeting bug shape, in the restore path | §3.9 cancel-restore now follows the §3.3 Phase 2.X.5 pattern: R1 create → R2 persist new_event_id to a fresh `schedule_meeting` row → R3 invite (failure → reconciled_unknown(partial_success), NOT failed) → R4 finalize. Caught in iter-15 Codex review. |
+| 99 | `last_bot_action_for_sender_in_chat`'s post-GC behavior fell back to the second-most-recent undoable row when the asker's most recent row was non-undoable (`stuck_pending` / `failed` / `undone`). User says "撤销刚才那个" → bot silently undoes an unrelated earlier action. The user's intent ("the LATEST action") is violated by the literal-satisfaction-on-different-action interpretation | Helper now returns a `LastWasUnreachable` sentinel when the chronologically-newest row is non-undoable; the caller surfaces "你最近一次操作我没法自动撤销，请人工检查 — 我没有把更早的操作当成"刚才那个"去撤销". Caught in iter-15 Codex review. |
+| 100 | iter-14's `include_asker=True` made Phase 2.0 build `effective_attendees`, but Phase 3's `result.attendees` text still said "copied from the input `attendee_open_ids`". Implementer following Phase 3 verbatim would write the raw input (no asker) to `result.attendees`, undoing the iter-14 #90 fix where asker was supposed to appear in `bot_known_events` JOINs | Phase 3 now explicitly says `result.attendees = effective_attendees` with rationale tying back to iter-14 #90 / row 90. Caught in iter-15 Codex review. |
+| 101 | §6.2 `target_id` and `target_kind` schema comments were stale: didn't list `'calendar_event_cancel'` (iter-14), still said `record_id` for the bitable case (§3.6 actually stores table_id), didn't note that `'file'` covers BOTH the iter-13 upload-only partial AND the iter-12 step-5 cleanup-failure case. Implementer using the comment as the canonical enum spec would miss values | Both column comments rewritten to enumerate every legal `(target_id, target_kind)` pair with section cross-references. Caught in iter-15 Codex review. |
 
 ---
 
@@ -2655,15 +2751,32 @@ internals.
      undoable filter above, scan for rows matching `chat_id=$1 AND
      sender_open_id=$2 AND status='pending' AND created_at < now() -
      interval '5 minutes'` and run `_lazy_gc_stuck_pending` on each.
-     This ensures a stuck-pending row newer than the candidate the
-     filter would otherwise return doesn't get silently skipped:
-     after GC, content-aware kind assignment either promotes it to
-     `partial_success` (in which case it becomes the new "last
-     undoable" candidate, correctly representing the user's most
-     recent action) or to `stuck_pending` (in which case it's
-     correctly skipped because it has no recoverable handle). Without
-     this pre-step, "撤销刚才那个" after a crashed-mid-flight call
-     would silently undo an older action instead.
+     After GC, content-aware kind assignment yields one of two
+     outcomes per row:
+     - `partial_success` — the row has a recoverable handle
+       (target_id, import_ticket, or source_file_token). Becomes
+       the new "last undoable" candidate.
+     - `stuck_pending` — the row has no handle. Skip from undoable,
+       but **DO NOT silently fall back to an older terminal row**.
+
+     **Stuck-pending fall-through guard** (iter-15 Codex #3): if,
+     after the GC pre-step, the asker's chronologically newest row
+     in this chat is now `reconciled_unknown(stuck_pending)` (or any
+     non-undoable terminal status — `failed`, `undone`, or
+     `reconciled_unknown(stuck_pending)`), the helper returns a
+     **special `LastWasUnreachable` sentinel** instead of falling
+     through to the second-most-recent undoable row. The caller
+     (`undo_last_action(last_for_me)` or `cancel_meeting(last:true)`)
+     surfaces this to the agent as "你最近一次操作我没法自动撤销
+     ([reason])，请人工检查 — 我没有把更早的操作当成"刚才那个"
+     去撤销，避免误删。" rather than silently mutating an unrelated
+     earlier action. "撤销刚才那个" means the LATEST action; if
+     the latest can't be undone, the right answer is to tell the
+     user, not to satisfy the request literally on a different
+     action.
+
+     The caller can fall back to "show me a list" UX (out of v1 scope)
+     or have the user be more specific.
    - `compute_logical_key(*, chat_id, sender_open_id, action_type,
      canonical_args)` — pure hash function.
    - `get_locked_by_logical_key(logical_key)` — Phase 0 lookup;
