@@ -273,17 +273,26 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    retries. **All subsequent steps including freebusy run only after
    this row exists**, so a webhook retry sees `pending` and bails out
    without re-issuing any Feishu calls.
-2. **Phase 2 — Freebusy pre-check**: call `calendar.v4.freebusy.list`
-   for all attendees over the requested window. If any conflict, mark
-   the row `failed` (with `error="conflict"` and the conflict payload
-   stored in `result`) and return `{conflict: [{open_id,
-   busy_event_summary}]}` to the agent. The agent reasks the user; a
-   subsequent retry uses a *new* message_id so a fresh row is created.
+2. **Phase 2 — Freebusy pre-check**: call `calendar.v4.freebusy.batch`
+   (the SDK method is `freebusy.batch(BatchFreebusyRequest)`, NOT
+   `freebusy.list` — the latter is a single-user variant) with body
+   `{user_id_list: [open_id, ...], time_min, time_max,
+   include_external_calendar: false}`. If any returned slot overlaps
+   the requested window, mark the row `failed` (with
+   `error="conflict"` and the conflict payload stored in `result`)
+   and return `{conflict: [{open_id, busy_event_summary}]}` to the
+   agent. The agent reasks the user; a subsequent retry uses a *new*
+   message_id so a fresh row is created.
 3. **Phase 2 — Create event**: `calendar.v4.calendar_event.create`
    against the bot's primary calendar with
    `attendee_ability=can_modify_event`.
 4. **Phase 2 — Invite attendees**:
-   `calendar.v4.calendar_event.attendee.create_batch`.
+   `calendar.v4.calendar_event.attendee.create(event_id, body=
+   {attendees: [{type: "user", user_id: open_id}, ...],
+   need_notification: true})`. The SDK method is `attendee.create`,
+   NOT `attendee.create_batch` (the latter does not exist;
+   `batch_delete` does, but for create the single endpoint accepts a
+   list in the body).
 5. **Phase 3 — Persist terminal state**: update `bot_actions` to
    `status=success`, store `target_id=event_id`, `target_kind=
    "calendar_event"`, `result={event_id, calendar_id, link, attendees}`.
@@ -298,7 +307,15 @@ Resolution rules:
 - If `event_id` is given: look up `bot_actions WHERE target_kind=
   'calendar_event' AND target_id=event_id`. If no row → refuse
   ("only cancel meetings I created"). If row exists but
-  `status='undone'` → no-op, return idempotent success.
+  `status='undone'` → no-op, return idempotent success. **Cross-chat
+  guard**: if the row's `chat_id ≠ ctx.chat_id`, refuse with a
+  message explaining "this meeting was scheduled in <other chat>;
+  please ask me there to cancel it." The `event_id` knowing-it-is-
+  bot-owned check alone is not enough — anyone in any chat who has
+  the link could otherwise cancel a meeting scheduled by a different
+  team. v1 keeps this strict (no override flag); a future "I'm sure,
+  cancel anyway" path can be added once UX supports cross-chat
+  confirmations.
 - If `last:true`: look up `bot_actions WHERE chat_id=<current> AND
   sender_open_id=<current> AND action_type='schedule_meeting' AND
   status='success' ORDER BY created_at DESC LIMIT 1`. **The
@@ -520,18 +537,44 @@ Three-phase pattern. Creates a Docx in the bot's "文档柜" folder, returns
 does NOT accept Markdown directly. Two viable paths, to confirm during
 implementation:
 
-- **Path A (preferred)**: `drive.v1.import_tasks.create` with
-  `type="docx"`, `file_extension="md"`, body=Markdown bytes. This is
-  Feishu's documented Markdown import flow, async — you poll
-  `import_tasks.get` until done, then receive the `doc_token`.
+- **Path A (preferred)**: a **3-step** flow, NOT a single call. The
+  v6 spec described this as a one-shot `import_tasks.create` with
+  body=Markdown bytes — that was wrong. The actual `ImportTask` model
+  (`lark_oapi/api/drive/v1/model/import_task.py`) takes
+  `file_token`, `file_extension`, `type`, `file_name`, `point` —
+  i.e. the markdown source has to live in Drive first as a file
+  whose token we then hand to the importer.
+
+  1. **Upload the markdown source as a `.md` file**:
+     `drive.v1.files.upload_all(file_name="meeting-notes.md",
+     parent_type="explorer", parent_node=<bot_workspace.docs_folder_token>,
+     size=<bytes>, file=<bytes_io>)` → returns `file_token`.
+  2. **Create the import task**:
+     `drive.v1.import_tasks.create(import_task=ImportTask(
+     file_token=<from step 1>, file_extension="md", type="docx",
+     file_name="<title>.docx", point=ImportTaskMountPoint(
+     mount_type=1, mount_key=<docs_folder_token>)))` →
+     returns `ticket` (the async task id).
+  3. **Poll for completion**: `drive.v1.import_tasks.get(ticket=<...>)`
+     every ~500 ms until `job_status == 0` (success) or terminal
+     failure. The completed result includes `token` (the new docx's
+     `doc_token`) and `url`.
+
+  All three calls happen inside Phase 2 of the three-phase write
+  pattern (§5.1). If any step fails, mark `bot_actions` `failed`
+  with which step errored. The intermediate `.md` file in Drive can
+  be deleted on success (best-effort cleanup) or left as a backup
+  of the source markdown — implementation choice, leave it for v1
+  simplicity.
+
 - **Path B (fallback)**: `docx.v1.document.create` (empty doc), then
   parse Markdown into Docx blocks ourselves and call
   `docx.v1.document.block.children.create` to append. More code, no
-  async polling.
+  async polling, no intermediate file in Drive.
 
-Pick A first; fall back to B only if import permissions can't be
-granted in production. The choice does not affect this tool's
-**interface** — only its body.
+Pick A first; fall back to B only if `drive:drive` import permissions
+can't be granted in production. The choice does not affect this
+tool's **interface** — only its body.
 
 ### 3.9 `undo_last_action`
 
@@ -563,7 +606,8 @@ Dispatches on `action_type`:
 - `cancel_meeting` → **restore-from-snapshot**:
   `calendar_event.create(...)` populated from
   `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a), then
-  `attendee.create_batch(...)` for the original attendees. The new
+  `attendee.create(event_id=new_event_id, body={attendees: [...],
+  need_notification: true})` for the original attendees. The new
   event has a different `event_id` than the original; the response
   includes `restore_caveats` (see §3.4) so the agent can warn the
   user. Also unsets the original `schedule_meeting` row's `undone`
@@ -1003,7 +1047,18 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
         elif existing["status"] == "undone":
             return _err("this action has been undone; submit as a fresh request")
     else:
-        # Phase 1b: pending insert (first-time path)
+        # Phase 1b: pending insert (first-time path).
+        # insert_bot_action_pending may raise two distinct UniqueViolations:
+        #   - on bot_actions_message_action_uniq → exact-message retry
+        #   - on bot_actions_logical_locked_uniq → another caller holds
+        #     the logical_key dedup slot (different message_id, same
+        #     logical request)
+        # The helper inspects e.diag.constraint_name and dispatches:
+        #   - message conflict → returns the existing row keyed by
+        #     (message_id, action_type)
+        #   - logical conflict → returns the active row keyed by
+        #     logical_key (its message_id is different from ours)
+        # See §6.2 for the constraint-name contract.
         try:
             action_id = queries.insert_bot_action_pending(
                 message_id=message_id,
@@ -1013,12 +1068,21 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
                 args=args,
                 logical_key=logical_key,
             )
-        except queries.UniqueViolation:
-            # Concurrent insert beat us — re-read and dispatch on its status.
-            existing = queries.get_bot_action(message_id, action_type)
-            if existing and existing["status"] == "success":
+        except queries.MessageActionConflict as e:
+            # Same message_id retry that we somehow missed in Phase 1a
+            # (rare: race between Phase 1a SELECT and Phase 1b INSERT).
+            existing = e.existing_row
+            if existing["status"] == "success":
                 return _ok(existing["result"])
             return _err("a concurrent call is in flight; try again in a moment")
+        except queries.LogicalKeyConflict as e:
+            # A different message with the same logical_key won. Surface
+            # the winner's outcome.
+            existing = e.existing_row  # found by SELECT ... WHERE logical_key=$1 AND logical_key_locked=true
+            if existing["status"] == "success":
+                return _ok({**existing["result"], "deduplicated_from_logical_key": True})
+            # status=='pending' on the winner — it's still in flight
+            return _err("a previous identical call is in flight")
 
     # Phase 2: do the actual side effect (freebusy pre-check, create
     # event, invite attendees — see §3.3 for schedule_meeting specifics)
@@ -1045,7 +1109,13 @@ idempotency. Retrying a `failed` row therefore must be an UPDATE, not
 an INSERT. The `attempt_count` column (§6.2) is bumped on each retry
 so the audit trail still shows how many tries it took.
 
-`update_for_retry`'s SQL:
+`update_for_retry`'s SQL — note the `logical_key_locked = true`
+re-acquisition: a `failed` row had its lock cleared by `mark_bot_action_failed`
+(§6.2 "lock clearing on terminal status"); transitioning back to
+`pending` re-claims the logical_key slot. If another caller has won
+the slot in the meantime, the UPDATE will then conflict on the
+partial UNIQUE — wrap it in a transaction and surface that as a
+retry-too-late condition.
 
 ```sql
 UPDATE bot_actions
@@ -1053,13 +1123,22 @@ UPDATE bot_actions
        attempt_count = attempt_count + 1,
        args = $new_args,
        error = NULL,
+       logical_key_locked = true,
        updated_at = now()
  WHERE id = $id AND status = 'failed'
  RETURNING id;
 ```
 
-The `WHERE status='failed'` clause is the lock: only one concurrent
-caller's UPDATE returns a row, others get 0 and bail.
+Two locks layer here:
+- `WHERE status='failed'` — only one concurrent caller's UPDATE
+  returns a row, others get 0 and bail.
+- The partial UNIQUE on `logical_key` — if a different message
+  acquired the slot since this row failed, the UPDATE raises a
+  PostgREST 409 the helper turns into `LogicalKeyConflict` (same
+  mechanism as the first-time-INSERT path in §5.1 Phase 1b). The
+  caller's existing `LogicalKeyConflict` catch arm handles it
+  uniformly: return the winner's success result or the
+  "in flight" error, depending on the winner's status.
 
 ### 5.1bis Why this and not a post-hoc listener
 
@@ -1272,16 +1351,26 @@ CREATE INDEX bot_actions_chat_sender_recent_idx
   ON bot_actions (chat_id, sender_open_id, created_at DESC);
 
 -- Logical-key cross-process exclusion (§5.2): at most ONE row per
--- logical_key may currently hold the dedup lock. Two concurrent
--- INSERTs race on this UNIQUE; loser gets UniqueViolation. Lazy GC
--- (§5.3 case b) flips logical_key_locked to false on success rows
--- older than 60 s to free the key for legitimate repeat requests.
--- Crucially: status is left at 'success' so all "find successful
--- action" queries (last_for_me, bot_known_events, target_id
--- lookups) keep working regardless of lock state.
+-- logical_key may currently hold the dedup lock AND be in an active
+-- (pending or success) state. Two concurrent INSERTs race on this
+-- UNIQUE; loser gets UniqueViolation. Lazy GC (§5.3 case b) flips
+-- logical_key_locked to false on success rows older than 60 s to
+-- free the key for legitimate repeat requests.
+--
+-- The `status IN ('pending','success')` clause matters: it ensures
+-- failed / undone / reconciled_unknown rows do NOT continue to hold
+-- the dedup slot, even if their logical_key_locked column hasn't
+-- been cleared yet. (Defense in depth: the status-changing helpers
+-- below ALSO clear the lock, but the predicate makes that redundant
+-- rather than load-bearing.)
+--
+-- Crucially: a row's `status='success'` is preserved by the
+-- expiry GC (only logical_key_locked flips), so all "find
+-- successful action" queries (last_for_me, bot_known_events,
+-- target_id lookups) keep working regardless of lock state.
 CREATE UNIQUE INDEX bot_actions_logical_locked_uniq
   ON bot_actions (logical_key)
-  WHERE logical_key_locked = true;
+  WHERE logical_key_locked = true AND status IN ('pending', 'success');
 
 ALTER TABLE bot_actions ENABLE ROW LEVEL SECURITY;
 -- Service role only; no end-user policy.
@@ -1296,6 +1385,85 @@ collide. Implementation in `db/queries.py:compute_logical_key`.
 `UNIQUE (message_id, action_type)` is the hard idempotency guarantee.
 Two concurrent inserts race; one wins, the other gets a violation and
 falls through to "read existing row, return its result".
+
+**Constraint names** (relied on by `insert_bot_action_pending` to
+dispatch `UniqueViolation`s in §5.1):
+- `bot_actions_message_action_uniq` — same `(message_id, action_type)`
+  conflict. The conflicting row is the **same row** the caller is
+  trying to write again; re-read by `(message_id, action_type)`.
+- `bot_actions_logical_locked_uniq` — different message but same
+  active logical_key. The conflicting row has a **different**
+  `message_id`; re-read by `(logical_key)` filtered to
+  `logical_key_locked = true`.
+
+**How constraint names are extracted in this codebase**: `bot/db/
+client.py` uses **supabase-py** (PostgREST), not raw `psycopg`.
+PostgREST surfaces unique-constraint failures as HTTP 409 responses
+whose JSON body looks like:
+
+```json
+{
+  "code": "23505",
+  "details": "Key (logical_key)=(...) already exists.",
+  "hint": null,
+  "message": "duplicate key value violates unique constraint \"bot_actions_logical_locked_uniq\""
+}
+```
+
+So `db/queries.py:insert_bot_action_pending` does the dispatch by
+**string-matching the constraint name in `error.message`** (or, more
+robustly, parsing it out with a regex like
+`r'unique constraint "([^"]+)"'`). The helper:
+
+1. Tries the INSERT.
+2. On HTTP 409, regex-extracts the constraint name from the message.
+3. Looks up the existing row (by `(message_id, action_type)` for
+   `bot_actions_message_action_uniq`, by `logical_key` filtered to
+   `logical_key_locked = true` for `bot_actions_logical_locked_uniq`).
+4. Raises `MessageActionConflict(existing_row)` or
+   `LogicalKeyConflict(existing_row)` as appropriate.
+
+**Defensive fallback**: if the message doesn't match either known
+constraint name (e.g. PostgREST changes its phrasing in a future
+version), the helper raises a generic `BotActionInsertConflict` with
+the raw error attached. The skeleton's catch arms are written to
+treat that as a hard error rather than silently choosing one branch.
+
+If a future migration moves `bot/db/queries.py` to direct `psycopg`
+or `asyncpg`, the same dispatch logic applies but reads
+`exception.diag.constraint_name` directly — swap the regex for the
+attribute access; nothing else changes.
+
+**Lock clearing on terminal status**: every helper that transitions
+a row to a terminal status (`failed`, `undone`, `reconciled_unknown`)
+**must also set `logical_key_locked = false`** in the same UPDATE.
+The partial UNIQUE predicate (`AND status IN ('pending','success')`)
+makes this redundant for index correctness — a non-active row would
+fall out of the index regardless — but explicit lock clearing makes
+queries that bypass the index (e.g. ad-hoc admin SELECTs filtering on
+`logical_key_locked` directly) behave intuitively. Belt and
+suspenders.
+
+```sql
+-- mark_bot_action_failed
+UPDATE bot_actions
+   SET status='failed', error=$err,
+       logical_key_locked=false, updated_at=now()
+ WHERE id=$id;
+
+-- mark_bot_action_undone
+UPDATE bot_actions
+   SET status='undone', logical_key_locked=false, updated_at=now()
+ WHERE id=$id;
+
+-- get_bot_action lazy GC for stuck pending
+UPDATE bot_actions
+   SET status='reconciled_unknown',
+       error='reconciled: pending too long',
+       logical_key_locked=false, updated_at=now()
+ WHERE id=$id AND status='pending'
+   AND created_at < now() - interval '5 minutes';
+```
 
 `chat_id` is **required** (NOT NULL) because both `cancel_meeting`
 (§3.4) and `undo_last_action` (§3.9) need to scope "last action" to
@@ -1416,7 +1584,7 @@ agent commonly mishandles. For traceability:
 | --- | --- | --- |
 | 1 | Timezone ambiguity | `today_iso` returns `user_timezone` (§3.2); system prompt enforces RFC3339+offset (§9) |
 | 2 | Webhook retry double-action | `bot_actions UNIQUE(message_id, action_type)` (§6.2) |
-| 3 | Booking on top of existing meetings | `freebusy.list` pre-check **after** pending insert (§3.3 phase 2) |
+| 3 | Booking on top of existing meetings | `freebusy.batch` (NOT `.list`) pre-check **after** pending insert (§3.3 phase 2) |
 | 4 | Orphaned half-completed multi-step actions | `bot_actions` audit log + `undo_last_action` (§3.9) |
 | 5 | Silent name-resolution failures | `resolve_people` returns `resolved/ambiguous/unresolved` separately (§3.1) |
 | 6 | Missing defaults for meeting duration / reminder | 30 min / 15 min, set in tool description (§3.3) |
@@ -1450,6 +1618,11 @@ agent commonly mishandles. For traceability:
 | 34 | v5's `archived` status conflated "successful action" with "expired dedup lock", forcing every audit/restore/undo query to start filtering `status IN ('success','archived')` and risking combinatorial drift as new statuses get added | Decoupled into two columns: `status` stays pure (success / failed / undone / pending / reconciled_unknown) and a separate `logical_key_locked: bool` controls dedup-index membership. All "find successful action" queries keep `status='success'`, unaffected by the dedup window expiring (§6.2, §5.2, §5.3). Caught in iter-6 Codex review. |
 | 35 | v5 leaked runner-pool internals to `app.py` (direct `_get_client` access + manual `slot.lock` + `slot.ctx` mutation) | `runner.answer_streaming(message_id, chat_id, sender_open_id, …)` is the public surface. The runner sets `slot.ctx` inside its existing `slot.lock` acquisition. `app.py` and other callers never touch private pool state (§5.0, §7, §11 step 5). Caught in iter-6 Codex review. |
 | 36 | §8 scope table embedded a literal scope string (`calendar:calendar.freebusy:read`) whose exact spelling was deferred to §11 step 0 verification — implementers might copy it before verifying | §8 marks the scope `TBD — see §11 step 0`; a ⚠️ note tells implementers not to paste any TBD entry into the Feishu admin console until lark-cli verification has run. Caught in iter-6 Codex review. |
+| 37 | Partial UNIQUE on `(logical_key) WHERE logical_key_locked=true` did not exclude failed/undone/reconciled_unknown rows; a `failed` row would block all retries on the same logical_key | Predicate now `WHERE logical_key_locked=true AND status IN ('pending','success')` (§6.2). Belt-and-suspenders: `mark_failed` / `mark_undone` / GC also clear `logical_key_locked` so non-active rows don't masquerade as locked. `update_for_retry` re-claims the lock by setting `logical_key_locked=true` when transitioning failed→pending (§5.1). Caught in iter-7 Codex review. |
+| 38 | `insert_bot_action_pending`'s UniqueViolation handler only re-read by `(message_id, action_type)`, so a logical_key conflict with a different message_id returned a generic "in flight" instead of the winner's result | `insert_bot_action_pending` inspects `e.diag.constraint_name` and raises `MessageActionConflict` or `LogicalKeyConflict` carrying the appropriate existing row (§5.1, §6.2 constraint-name contract). Caught in iter-7 Codex review. |
+| 39 | Spec used `freebusy.list` and `attendee.create_batch` — neither matches the lark-oapi Python SDK shape | `freebusy.batch` (§3.3 phase 2) and `attendee.create` with `body={attendees: [...]}` (§3.3 phase 4 / §3.9 cancel-restore). Verified against installed `lark_oapi/api/calendar/v4/resource/{freebusy,calendar_event_attendee}.py`. Caught in iter-7 Codex review. |
+| 40 | `cancel_meeting(event_id)` only required bot-ownership; anyone with the link could cancel a meeting scheduled in another chat | Added cross-chat guard: `bot_actions.chat_id` must equal `ctx.chat_id` (§3.4). Refuse with explanation otherwise; v1 has no override. Caught in iter-7 Codex review. |
+| 41 | Markdown-to-Docx import was described as a single `import_tasks.create` call with `body=Markdown bytes`; SDK actually requires upload-then-import-then-poll (3 steps) | §3.8 Path A rewritten as 3 steps: `files.upload_all` → `import_tasks.create(file_token=...)` → `import_tasks.get` poll. Verified against installed `lark_oapi/api/drive/v1/model/import_task.py`. Caught in iter-7 Codex review. |
 
 ---
 
