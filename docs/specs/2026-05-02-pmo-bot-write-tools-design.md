@@ -85,18 +85,28 @@ without a confirmation gate, this tool *is* the safety net. v1
 acceptance criteria for `undo_last_action`:
 
 - Must be implemented, callable, and exposed in the agent's allowlist
-  in the same release as `schedule_meeting` / `append_action_items` /
-  `create_meeting_doc`. It does not ship later.
-- Must work for every other write tool's outputs (one compensating
-  call per `action_type`, see §3.9).
+  in the same release as `schedule_meeting` / `cancel_meeting` /
+  `append_action_items` / `create_meeting_doc`. It does not ship later.
+- Must work for every other write tool's outputs **including
+  `cancel_meeting`** — undo of an accidental cancel restores the
+  event from the pre-cancel snapshot (§3.4, §3.9). Without this case,
+  cancellation would be a one-way door, violating the trust model.
 - Must be tested end-to-end during the §11 step-9 smoke test before
-  the bot is exposed to other groups.
+  the bot is exposed to other groups, with explicit coverage of:
+  schedule → undo, cancel → undo (restore), append → undo, create_doc
+  → undo.
 - Must remain usable even when the original message is older than
   `_seen_events` LRU window — i.e., scoped by `chat_id` +
   `sender_open_id`, not `message_id`.
 
 If any of those conditions can't be met for a release, that release
 defers the corresponding write tool, not the undo.
+
+**Cancel/restore is best-effort, not perfect** (§3.4 caveats): the
+restored event has a different `event_id`, and any post-cancel edits
+others made are lost. This is documented so the agent can warn the
+user when the restore happens. It is still strictly better than
+"sorry, no undo for cancel".
 
 ---
 
@@ -161,15 +171,34 @@ person references, always go through `resolve_people` first.
 **Purpose**: Map free-form names ("albert", "@bcc", "李四", "研发的小王")
 to Feishu `open_id`s before any write tool runs.
 
-**Resolution order** (per input string):
+**Resolution order** (per input string — choose path based on the
+input's *shape*, not just sequence):
 
-1. **`profiles` + `feishu_links` join** in Supabase — handles people who
-   already use pmo_agent. Highest confidence.
-2. **Feishu `contact.v3.user.batch_get_id`** by name — fast exact match
-   against the directory.
-3. **Feishu `contact.v3.user.search`** — fuzzy fallback, scoped to the
-   whole org (we chose B in brainstorming over the narrower "only
-   visible to bot" option).
+1. **`profiles` + `feishu_links` join** in Supabase — handles people
+   who already use pmo_agent. Highest confidence. Matches against
+   `handle` (with or without leading `@`), `display_name`, and the
+   linked `feishu_email`.
+2. **Email or phone shape** → `contact.v3.user.batch_get_id`. This
+   endpoint accepts ONLY `emails[]` or `mobiles[]` per Feishu's docs;
+   it does NOT take names. Use it when the input string looks like
+   `name@host.tld` or matches a phone-number regex.
+3. **Otherwise (free-form name / handle / Chinese name)** →
+   `contact.v3.user.search` (the `/open-apis/search/v1/user` endpoint;
+   this is what `lark-cli contact +search-user --query "<name>"` calls
+   under the hood). Returns a list of candidates ranked by relevance;
+   if exactly one match → `resolved`; if 2+ → `ambiguous`; if 0 →
+   `unresolved`.
+
+**Spec-vs-reality note**: an earlier draft of this spec described
+`batch_get_id` as a "by name" lookup. That was wrong — Feishu's docs
+explicitly list only `emails` and `mobiles` as inputs. Caught in
+review iteration 5; the fixed order above is what the implementation
+must follow.
+
+The org-wide search scope (chosen during brainstorming over the
+narrower "visible to bot only" option) means Step 3 can return any
+employee in the directory, not just people the bot has been added
+to chats with.
 
 **Return shape** (split explicitly to make agent reasoning clean):
 
@@ -182,7 +211,7 @@ to Feishu `open_id`s before any write tool runs.
       "display_name": "Albert Wang",
       "department": "研发",
       "email": "albert@example.com",
-      "source": "profiles" | "directory_exact" | "directory_search"
+      "source": "profiles" | "directory_email_or_phone" | "directory_search"
     }
   ],
   "ambiguous": [
@@ -277,14 +306,70 @@ Resolution rules:
   could cancel a meeting user B asked the bot to schedule. Requires
   `(chat_id, sender_open_id)` on `bot_actions` (see §6.2).
 
-Internally follows the three-phase pattern: pending insert keyed on
-`(message_id, "cancel_meeting")` → `calendar_event.delete` →
-mark `success`, and update the original `schedule_meeting` row's
-`status` to `undone` for traceability.
+**Internal sequence**:
+
+1. **Phase -1 — pre-flight**: validate that `event_id` (or the
+   resolved-from-`last`) exists and is bot-owned (`bot_actions` row
+   present). Refuse if not.
+2. **Phase 1 — pending insert** keyed on `(message_id, "cancel_meeting")`.
+3. **Phase 2a — Read full event before delete**:
+   `calendar.v4.calendar_event.get(event_id)` →
+   `pre_cancel_event_snapshot`. **Critical for undo**: without this
+   snapshot, undo cannot restore the event; once Feishu deletes, the
+   event is gone server-side. This call must succeed before we delete.
+4. **Phase 2b — Delete**: `calendar.v4.calendar_event.delete(event_id)`.
+5. **Phase 3 — Persist terminal state**: mark this `cancel_meeting`
+   row `success` with `result={original_event_id, pre_cancel_event_snapshot}`.
+   Mark the original `schedule_meeting` row `status='undone'` for
+   traceability (and so it stops appearing in `last_for_me` lookups).
+
+**Why snapshot, not just rely on Feishu trash/recovery**: Feishu
+calendar events do not have a "recently deleted" recovery window
+exposed through tenant_access_token APIs. Once deleted, restoration
+must come from data we saved before the delete. The snapshot is the
+data.
+
+**Restore behavior** (`undo_last_action` on a `cancel_meeting` row):
+re-creates the event via `calendar_event.create` from the snapshot,
+then re-invites the original attendees. **Caveats** (must surface to
+user):
+- The restored event has a **new** `event_id`. Anyone who had a link
+  to the old one needs the new link.
+- Any modifications other attendees made *after* cancellation but
+  before restore are lost.
+- If 5+ minutes elapsed between cancel and restore, attendees may
+  already have removed it from their own UIs / accepted other
+  bookings for the slot.
+
+These caveats are encoded in the agent's reply when undo runs (the
+tool's return value includes `restore_caveats: [...]`).
 
 ### 3.5 `list_my_meetings`
 
-**Inputs**: `user_open_id`, `since`, `until`.
+**Inputs**:
+- `target?: "self" | str` — defaults to `"self"`, which the tool body
+  resolves to `ctx.sender_open_id`. The agent does NOT need to look
+  up its own open_id; the asker's identity is already in the
+  `RequestContext`. If the agent passes a Feishu `open_id` (resolved
+  via `resolve_people` first), the tool checks "is this someone other
+  than the asker" — see "scope check" below.
+- `since: str` (RFC3339)
+- `until: str` (RFC3339)
+
+**Why default to self**: the prompt-injected `[asker]` line gives the
+LLM only a pmo `user_id` / `handle` / `display_name` — never a Feishu
+`open_id`. Without the `"self"` default, the natural request "我下午
+有啥会" would force the agent into an awkward dance: call
+`resolve_people` on the asker's own handle just to get their own
+open_id back. The default short-circuits that.
+
+**Scope check** (when `target ≠ "self"`): looking up someone else's
+calendar is **not** privileged in Feishu's data model — the bot can
+ask the API regardless — but the spec treats it as a soft permission
+boundary. The tool description directs the LLM: "Only pass an
+explicit `target` open_id when the user clearly asked about another
+person's calendar (e.g. 'albert 下周三有空吗?'). For any first-person
+question, leave `target` unset."
 
 **Visibility model — read carefully, this is subtle**: a tenant_access_token
 under `calendar:calendar.event:read` does NOT see every event on a
@@ -303,8 +388,9 @@ can be honest about provenance:
   "until": "...",
   "bot_known_events": [
     // Events the bot itself scheduled (joined from bot_actions WHERE
-    // action_type='schedule_meeting' AND attendees ⊇ {user_open_id}).
-    // These are 100% complete from the bot's POV.
+    // action_type='schedule_meeting' AND status='success' AND
+    // attendees ⊇ {resolved_target_open_id}). These are 100% complete
+    // from the bot's POV.
   ],
   "user_calendar_events": [
     // Events from calendar.v4.calendar_event.list against the user's
@@ -347,14 +433,19 @@ Bitable base. Three-phase pattern.
    window, treat as no signal — the **whole tool call** halts before
    writing anything (see "ambiguous flow" below).
 
-**Ambiguous flow** (no auto-write, no orphan records):
+**Ambiguous flow** (no auto-write, no orphan records, no `bot_actions` row):
 
 When **any** item lacks a project AND auto-resolution can't pick one
-confidently, the tool returns **without writing anything**:
+confidently, the tool returns **without writing anything** — including
+no row in `bot_actions`. This decision happens in **Phase -1** (§5.1),
+which is the spec-mandated location for "early reject before any
+side effect or bookkeeping".
+
+Return shape:
 
 ```json
 {
-  "needs_project": true,
+  "needs_input": "project",
   "items_pending": [
     {"title": "review API design", "owner_open_id": "ou_xxx"},
     {"title": "send timeline to client", "owner_open_id": "ou_yyy"}
@@ -367,11 +458,20 @@ confidently, the tool returns **without writing anything**:
 
 The agent reasks the user. When the user answers, the agent calls
 `append_action_items` *again* with `project` populated explicitly on
-each item. Because the call has the same `(chat_id, sender_open_id,
-action_type, canonical_args)` shape as the first call **only if the
-user's intent is unchanged** (and `project` is part of canonical_args,
-so a different project produces a different `logical_key`), there is
-no logical_key collision — both calls execute cleanly.
+each item. Since the new message has a different `message_id` AND the
+canonical_args are different (project is set), neither the
+`(message_id, action_type)` UNIQUE nor the `logical_key` partial
+UNIQUE collides — the second call executes cleanly through Phase 0
+and Phase 1, lands a single `success` row.
+
+**Critical sequencing**: if Phase -1 weren't a thing — i.e. if the
+tool followed a naïve "always insert pending first" pattern — then
+returning `needs_input` after the insert would leave a `pending` row
+with no terminal state. That row would either drift into
+`reconciled_unknown` after 5 min (false alarm to the user about an
+"orphaned call") or, worse, block re-attempts via the logical_key
+UNIQUE constraint. The Phase -1 / Phase 0 separation in §5.1 exists
+specifically to avoid this.
 
 **Why not write-then-update**: an earlier draft proposed writing rows
 with `project=null` and asking the agent to update them later. That
@@ -459,10 +559,29 @@ message" is ambiguous when an utterance triggered multiple action
 types. Conversation scope (`chat_id`) is the right unit.
 
 Dispatches on `action_type`:
-- `schedule_meeting` → `calendar_event.delete`
+- `schedule_meeting` → `calendar_event.delete(target_id)`
+- `cancel_meeting` → **restore-from-snapshot**:
+  `calendar_event.create(...)` populated from
+  `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a), then
+  `attendee.create_batch(...)` for the original attendees. The new
+  event has a different `event_id` than the original; the response
+  includes `restore_caveats` (see §3.4) so the agent can warn the
+  user. Also unsets the original `schedule_meeting` row's `undone`
+  status back to `success` IF a row remains and its
+  `target_id=original_event_id` — but since we're issuing a **new**
+  event_id, we instead create a fresh `schedule_meeting` audit row
+  with `target_id=new_event_id` and `result={...}` and link both via
+  `target_id` lookups.
 - `append_action_items` → `bitable.app.table.record.batch_delete`
-  (one record_id per appended item, all stored in `result.record_ids`)
+  (one `record_id` per appended item, all stored in `result.record_ids`)
 - `create_meeting_doc` → `drive.v1.file.delete`
+
+Without a `cancel_meeting` case, undoing an accidental cancel was
+impossible — see §1.4: the no-confirmation-gate trust model requires
+*every* destructive write tool to have a compensating action. A
+`cancel_meeting` followed by `undo_last_action` is now a closed loop
+even though the underlying Feishu API has no "restore" endpoint, by
+virtue of the snapshot saved before deletion.
 
 Marks the source row `status=undone`. Records its own `undo_last_action`
 row with `target_id=<original action_id>` for traceability.
@@ -761,28 +880,62 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
     sender_open_id = ctx.sender_open_id
     action_type = "schedule_meeting"
 
+    # ── Phase -1: pre-flight validation. ────────────────────────────
+    # Runs BEFORE any bot_actions row is created or any external API
+    # is called. If the tool can already tell — from args alone or
+    # from quick local lookups — that it cannot proceed, return now,
+    # leaving NO trace in bot_actions. This is what
+    # append_action_items uses to surface needs_project without
+    # writing orphan rows.
+    #
+    # Allowed pre-flight checks:
+    #   - Schema validation of args (types, required fields).
+    #   - "needs_project" / "needs_open_ids" / "needs_<X>" returns
+    #     where the tool requires extra info from the user.
+    #   - Local-DB lookups that don't mutate (e.g.
+    #     find_default_project_for_user). Reads of bot_actions are OK.
+    #
+    # NOT allowed in pre-flight:
+    #   - Any Feishu API call. Those go in Phase 2.
+    #   - Any DB write. Pre-flight must be free of side effects so
+    #     that returning early leaves zero footprint.
+    pre = await _preflight_schedule_meeting(args, ctx)
+    if pre.kind == "needs_input":
+        return _ok({"needs_input": pre.field, "agent_directive": pre.directive})
+
     # Compute logical_key for repeat-utterance dedup (see §5.2 / §6.2).
     logical_key = queries.compute_logical_key(
         chat_id=chat_id,
         sender_open_id=sender_open_id,
         action_type=action_type,
-        canonical_args=args,
+        canonical_args=pre.canonical_args,  # canonicalized in pre-flight
     )
 
-    # Phase 0: short-window logical dedup
-    # Runs *before* Phase 1a (message_id check) deliberately: if a
-    # prior success exists for this logical_key, the side effect
-    # already happened. Whether the *current* message_id has a row
-    # (failed, pending, none) is moot — re-firing the API call would
-    # produce a duplicate.
-    recent = queries.get_recent_success_by_logical_key(logical_key, window_seconds=60)
+    # ── Phase 0: short-window logical dedup. ────────────────────────
+    # Now backed by a partial UNIQUE index, not just a read-then-act:
+    # see §5.2.
+    # Two parallel "first" inserts (across two processes or a single
+    # process under concurrent webhooks) race on the UNIQUE
+    # constraint; the loser falls through to read the existing row
+    # and either returns its result (if success) or short-circuits
+    # (if pending). The 60s "window" is enforced by lazy GC: a
+    # success row > 60 s old is transitioned to status='archived' so
+    # it leaves the partial UNIQUE index, freeing the logical_key for
+    # the next legitimate request.
+    recent = queries.get_active_by_logical_key(logical_key)  # status IN ('pending','success')
     if recent:
-        return _ok({**recent["result"], "deduplicated_from_logical_key": True})
+        if recent["status"] == "success":
+            return _ok({**recent["result"], "deduplicated_from_logical_key": True})
+        # status == 'pending' — another caller is in flight.
+        return _err("a previous identical call is in flight")
 
     # Phase 1a: idempotency check
     existing = queries.get_bot_action(message_id, action_type)
     if existing:
-        if existing["status"] == "success":
+        if existing["status"] in ("success", "archived"):
+            # 'archived' is just 'success' aged out of the logical_key
+            # partial UNIQUE index — same payload, same idempotency
+            # semantics for a per-message_id retry.
             return _ok(existing["result"])
         if existing["status"] == "pending":
             return _err("a previous identical call is in flight")
@@ -888,20 +1041,44 @@ The three-phase pattern gives:
 | --- | --- | --- | --- |
 | **Transport** | `bot/feishu/events.py:_seen_events` LRU (`event_id`) | Feishu webhook redeliveries within the same process | Process restarts; user retypes the same instruction |
 | **Per-message idempotency** | `bot_actions UNIQUE(message_id, action_type)` | The same Feishu `message_id` reaching us twice (cross-process, cross-restart) | A *new* user message that says the same thing — different `message_id`, no constraint hit |
-| **Logical short-window dedup** | `bot_actions.logical_key` + 60-second look-back (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args | Anything older than the window; intentional re-issuance later |
+| **Logical short-window exclusion** | `bot_actions` partial UNIQUE on `logical_key WHERE status IN ('pending','success')` (§6.2) | "User typed the request again 3 seconds later because nothing visibly happened" — same chat, same sender, same canonical args. **Cross-process and cross-instance**: enforced by Postgres, not by app-layer reads. | Anything older than 60 s (the success row gets archived out of the index); intentional re-issuance after that |
 
 `logical_key` is a stable hash over `(chat_id, sender_open_id,
 action_type, canonical_args)` — the same parameters that uniquely
-identify a logical request from a human's POV. The tool body's Phase
-0 (§5.1) checks for a `success` row with the same `logical_key`
-within 60s and returns its result instead of firing the side effect
-again.
+identify a logical request from a human's POV.
 
-**Why a window, not another UNIQUE constraint**: the user might
-*legitimately* want to schedule "another 30-minute meeting with
-albert about the same topic" later in the day. Hard-blocking forever
-would surprise them. 60 seconds catches the "I pressed enter twice"
-case without trapping legitimate repeat scheduling.
+**Why a partial UNIQUE, not a "read then act"** (the v4 approach,
+caught as racy in iter-5 review): a Phase 0 read that does
+`SELECT ... WHERE logical_key=... AND status='success' AND created_at
+> now() - 60s` followed by an INSERT only gives mutual exclusion
+*within the same process and only when the Postgres reader sees the
+prior commit*. Two webhook tasks racing in different processes (or
+in the same process, at the same instant before the first INSERT
+commits) both see "no recent success" and both insert. The DB layer
+must enforce the exclusion or it isn't enforced.
+
+The fix: the tool body **always tries to INSERT** the `pending` row.
+If the partial UNIQUE constraint fires (because another caller is in
+flight on the same logical key, or another caller succeeded within
+the last 60 s), the loser's INSERT raises `UniqueViolation`. The
+loser then `SELECT`s the existing row and dispatches:
+- `status='success'` → return the prior result.
+- `status='pending'` → return `"a previous identical call is in flight"`.
+
+**The 60-second window is enforced by lazy GC, not by the index
+predicate**: the index predicate is just `status IN ('pending',
+'success')`. To "expire" a success row out of the index, the GC
+transitions it to `status='archived'` (a new value in the CHECK enum
+in §6.2), which removes it from the partial index and frees the
+logical_key for the next legitimate request. GC runs lazily inside
+`get_active_by_logical_key` — when it walks past a success row > 60 s
+old, it archives it before checking the next row.
+
+**Why a window at all**: the user might *legitimately* want to
+schedule "another 30-minute meeting with albert about the same topic"
+later in the day. Hard-blocking forever would surprise them. 60
+seconds catches the "I pressed enter twice" case without trapping
+legitimate repeat scheduling.
 
 **Honesty about coverage**: in the no-confirmation-gate trust model
 (§1.4), **truly intentional re-issuance more than 60 seconds apart
@@ -909,12 +1086,15 @@ will execute twice**. We accept that — the cost of intercepting it is
 asking the user "did you mean to schedule again?" on every legitimate
 follow-up, which would erode the very fluidity §1.4 is paying for.
 
-### 5.3 Reconciling stuck `pending` rows
+### 5.3 Lazy GC: stuck `pending` and aged-out `success`
 
-A row stuck in `pending` for >5 minutes is almost certainly orphaned
-(process died mid-call). A simple GC pass marks them
-`reconciled_unknown` (a distinct status, **not** `failed`) with
-`error="reconciled: pending too long"`.
+Two distinct GC actions, both lazy (run inside the read functions
+that surface them):
+
+**(a) Stuck pending → `reconciled_unknown`**: a row stuck in
+`pending` for >5 minutes is almost certainly orphaned (process died
+mid-call). The GC marks it `reconciled_unknown` (a distinct status,
+**not** `failed`) with `error="reconciled: pending too long"`.
 
 The distinction matters: `failed` means "we know the Feishu call
 errored, retry is safe". `reconciled_unknown` means "we don't know
@@ -926,12 +1106,35 @@ user to verify on the Feishu side before issuing a fresh request.
 This deliberately surfaces a rare case to the user rather than silently
 risking a duplicate meeting.
 
-A separate cron/loop is **not** added in MVP; the GC happens lazily
-in `get_bot_action` itself (if it returns a row >5min old in pending,
-mark it `reconciled_unknown` before returning). YAGNI.
+GC happens in `get_bot_action` itself: if a row matches `status=
+'pending' AND created_at < now() - interval '5 minutes'`, the function
+runs an atomic `UPDATE ... SET status='reconciled_unknown' WHERE id=
+$id AND status='pending' RETURNING *` before returning the row. The
+`WHERE status='pending'` predicate avoids races with a still-live
+caller about to commit a success.
 
-The `status` CHECK constraint in §6.2 includes `reconciled_unknown` for
-this reason.
+**(b) Aged success → `archived`** (§5.2 logical_key window): a
+`success` row older than 60 s should leave the partial UNIQUE index
+on `logical_key`, freeing the key for a legitimate repeat request.
+The GC transitions it to `archived` (same payload, different status
+value, no longer in the index).
+
+GC happens in `get_active_by_logical_key` itself: when the function
+finds a candidate row matching the requested `logical_key`, it
+checks `created_at`. If `status='success' AND created_at < now() -
+interval '60 seconds'`, it runs `UPDATE ... SET status='archived'
+WHERE id=$id AND status='success'` and treats the row as not-found
+(returning NULL to the caller, which then proceeds with its INSERT).
+
+**Why both GCs are lazy and not a cron**: the rates are too low to
+justify a loop. Stuck-pending events fire only on process crash;
+aged-success rotations only matter to the next caller of the same
+logical_key. Doing them inside the read function means we pay
+exactly when needed, and we don't introduce a new long-running task
+to monitor.
+
+The `status` CHECK constraint in §6.2 includes both
+`reconciled_unknown` and `archived` for these reasons.
 
 ---
 
@@ -972,7 +1175,10 @@ CREATE TABLE bot_actions (
     attempt_count   int  NOT NULL DEFAULT 1,       -- bumped on retry-after-failure (see §5.1)
     action_type     text NOT NULL,                 -- 'schedule_meeting' | 'append_action_items' | ...
     status          text NOT NULL CHECK (
-                      status IN ('pending','success','failed','undone','reconciled_unknown')
+                      -- 'archived' = formerly 'success', aged out of the logical_key
+                      -- partial UNIQUE index after the 60s window. Same payload as
+                      -- 'success' for audit purposes, just no longer locks the key.
+                      status IN ('pending','success','failed','undone','reconciled_unknown','archived')
                     ),
     args            jsonb NOT NULL,                -- tool inputs (sanitized)
     target_id       text,                          -- Feishu side ID (event_id, record_id, doc_token)
@@ -991,11 +1197,16 @@ CREATE INDEX bot_actions_pending_idx ON bot_actions (status, created_at)
 -- Per-sender scoping prevents user A from undoing user B's action.
 CREATE INDEX bot_actions_chat_sender_recent_idx
   ON bot_actions (chat_id, sender_open_id, created_at DESC);
--- Logical-key dedup: "did this user just say the same thing?"
--- Partial index because we only ever look up succeeded rows here.
-CREATE INDEX bot_actions_logical_recent_idx
-  ON bot_actions (logical_key, created_at DESC)
-  WHERE status = 'success';
+
+-- Logical-key cross-process exclusion (§5.2): at most ONE row per
+-- logical_key may exist in 'pending' or 'success' state. Two
+-- concurrent INSERTs race; loser gets UniqueViolation. Lazy GC
+-- transitions success rows older than 60 s to 'archived' so they
+-- exit this index and free the key for legitimate repeat requests.
+CREATE UNIQUE INDEX bot_actions_logical_active_uniq
+  ON bot_actions (logical_key)
+  WHERE status IN ('pending', 'success');
+
 ALTER TABLE bot_actions ENABLE ROW LEVEL SECURITY;
 -- Service role only; no end-user policy.
 ```
@@ -1103,6 +1314,10 @@ Hard rules:
   the visibility limitation; the bot can only see meetings it
   scheduled or events on calendars the user has shared with the
   @包工头 app.
+- For first-person calendar questions ("我下午有啥会", "我下周三有空吗"),
+  call list_my_meetings with **no** `target` argument. The tool
+  defaults to the asker via RequestContext. Never call resolve_people
+  on the asker's own handle just to derive their open_id.
 ```
 
 ---
@@ -1142,6 +1357,11 @@ agent commonly mishandles. For traceability:
 | 26 | `contextvars.ContextVar` does not survive claude-agent-sdk's tool-call dispatch path | Per-`_PooledClient` `RequestContext` dataclass + closure-based `build_pmo_mcp(ctx)` factory (§5.0). Verified by inspecting `claude_agent_sdk/_internal/query.py:196` `start_soon` semantics. |
 | 27 | Bootstrap lock row left in `success` state forever, blocking all future rebuilds (v3 bug) | Release the lock by `DELETE`, audit by separate row (§4). Caught in iter-4 review. |
 | 28 | `append_action_items` ambiguous-project flow wrote orphan rows in v3 | Refactored to halt-and-ask: returns `needs_project` without writing (§3.6). Caught in iter-4 review. |
+| 29 | `cancel_meeting` had no compensating undo path, breaking the §1.4 trust model | Added `pre_cancel_event_snapshot` capture before delete (§3.4); undo dispatcher restores via `calendar_event.create` (§3.9). Caveats documented. Caught in iter-5 Codex review. |
+| 30 | Logical-key dedup was a read-then-act race across processes | Replaced with a partial UNIQUE index `WHERE status IN ('pending','success')` (§6.2); concurrent inserts are serialized by Postgres, not by app reads. Lazy GC archives success rows >60 s old (§5.3). Caught in iter-5 Codex review. |
+| 31 | Naïve "always insert pending first" leaked rows when validation failed | New explicit Phase -1 in tool body skeleton (§5.1) for pre-flight checks that may return without writing `bot_actions`. `append_action_items` ambiguous flow lives in Phase -1. Caught in iter-5 Codex review. |
+| 32 | `list_my_meetings` required `user_open_id` but the LLM never has the asker's own open_id | Default `target` is `"self"`, resolved to `ctx.sender_open_id` (§3.5). Caught in iter-5 Codex review. |
+| 33 | Spec mis-stated `contact.v3.user.batch_get_id` as a "by name" lookup; it actually accepts only emails / phones | Resolution chain split by input shape: profiles → emails/phones via `batch_get_id` → names via `contact.v3.user.search` (§3.1). Caught in iter-5 Codex review. |
 
 ---
 
@@ -1162,10 +1382,13 @@ internals.
    scopes are live**; without them every Feishu API call 401s.
 1. **Migrations** `0010` + `0011` — schema first, no app changes.
 2. **`db/queries.py`** — add the new functions for `bot_actions`
-   (`get_bot_action`, `insert_bot_action_pending`, `update_for_retry`,
+   (`get_bot_action`, `insert_bot_action_pending` — must catch
+   `UniqueViolation` on both `(message_id, action_type)` and the
+   logical_key partial UNIQUE; `update_for_retry`,
    `mark_bot_action_success`, `mark_bot_action_failed`,
    `mark_bot_action_undone`, `last_bot_action_for_sender_in_chat`,
-   `compute_logical_key`, `get_recent_success_by_logical_key`,
+   `compute_logical_key`, `get_active_by_logical_key` — must
+   inline-archive success rows >60 s old before returning,
    `acquire_bootstrap_lock`, `release_bootstrap_lock`) and
    `bot_workspace` (`get_bot_workspace`, `update_bot_workspace`).
 3. **`feishu/client.py`** — wrap calendar/bitable/docx/contact endpoints.
@@ -1224,17 +1447,39 @@ internals.
       `undo_last_action` row exists pointing at each original
       `action_id` (the audit trail per §3.9). (This is the §1.4
       safety-net check; do NOT skip it.)
-    - Logical_key dedup: ask the bot the same scheduling request
-      twice within 60s; confirm the second call returns the prior
-      result with `deduplicated_from_logical_key: true` and **no
-      second meeting** appears in Feishu.
+    - **Cancel-then-undo restore**: schedule a meeting, then
+      `cancel_meeting`, then `undo_last_action` → confirm a NEW
+      Feishu event exists with the original title/time/attendees and
+      a different `event_id`; agent's reply mentions
+      `restore_caveats`. (§3.4 / §3.9 / §1.4.)
+    - Logical_key dedup, single-process: ask the same scheduling
+      request twice within 60 s; confirm the second call returns the
+      prior result with `deduplicated_from_logical_key: true` and
+      **no second meeting** appears in Feishu.
+    - Logical_key dedup, simulated cross-process: send two webhooks
+      with the same `logical_key`-producing content but different
+      `message_id`s in rapid succession (use a script that POSTs
+      directly to `/feishu/webhook` to bypass Feishu UI throttling).
+      Confirm one INSERT succeeds, the other receives a
+      `UniqueViolation` and falls through to "deduplicated" — no
+      second meeting created.
+    - Logical_key window expiry: schedule a meeting, wait >60 s,
+      send the same request again. Confirm the second call DOES
+      execute and creates a second meeting (the window has
+      legitimately expired).
     - Group chat: user A schedules a meeting, user B says "取消刚才那个会"
       → bot must refuse / say it can only undo user B's own actions.
+    - Ambiguous append: send "记一下要发邮件" with no project
+      hint and no recent project activity. Confirm `needs_input:
+      "project"` is returned, **no row in `bot_actions` exists**, and
+      no rows in the action_items table appeared. Then provide a
+      project; confirm the second call writes the rows cleanly.
     - Bootstrap recovery: manually delete the bot's Bitable base in
       Feishu, then issue a write request; confirm the bot self-heals
       (re-creates the base, posts the warning message, completes the
       original request). Run two such requests concurrently and
-      confirm only **one** new base is created.
+      confirm only **one** new base is created (the lock row in
+      `bot_actions` mediates).
 
 Each step touches at most one or two files. Step 5 is the largest
 single touch (4 files), and is intentionally separated from new-
