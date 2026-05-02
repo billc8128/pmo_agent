@@ -304,44 +304,100 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    retries. **All subsequent steps including freebusy run only after
    this row exists**, so a webhook retry sees `pending` and bails out
    without re-issuing any Feishu calls.
-2. **Phase 2 — Freebusy pre-check**: call `calendar.v4.freebusy.batch`
-   (the SDK method is `freebusy.batch(BatchFreebusyRequest)`, NOT
-   `freebusy.list` — the latter is a single-user variant) with body
-   built via `BatchFreebusyRequestBody.builder()`. The body fields,
-   per `lark_oapi/api/calendar/v4/model/batch_freebusy_request_body.py`:
+2. **Phase 2.0 — Read bot's calendar_id**: load
+   `bot_workspace.calendar_id` (cached in process for the request).
+   Every later Calendar SDK call needs **both** `calendar_id` AND
+   `event_id` as path params (`/calendars/:calendar_id/events/:event_id/...`)
+   — the SDK request builders all require both, see
+   `lark_oapi/api/calendar/v4/model/{create_calendar_event_attendee_request,
+   get_calendar_event_request, delete_calendar_event_request}.py`. We
+   thread the bot's own `calendar_id` through every step here, then
+   record it in `result.calendar_id` so cancel/undo can re-read it
+   later without going back to `bot_workspace`.
+3. **Phase 2.1 — Freebusy pre-check**: call
+   `client.calendar.v4.freebusy.batch(BatchFreebusyRequest)` (SDK
+   method is `freebusy.batch`, NOT `freebusy.list` — the latter is a
+   single-user variant) with body built via
+   `BatchFreebusyRequestBody.builder()`. Body fields per
+   `lark_oapi/api/calendar/v4/model/batch_freebusy_request_body.py`:
    `user_ids: List[str]` (NOT `user_id_list`), `time_min: str`,
    `time_max: str`, `include_external_calendar: bool` (we pass
-   `false`), `only_busy: bool` (we pass `true` to get a smaller
-   payload). If any returned slot overlaps the requested window,
-   mark the row `failed` (with `error="conflict"` and the conflict
-   payload stored in `result`) and return `{conflict: [{open_id,
-   busy_event_summary}]}` to the agent. The agent reasks the user;
-   a subsequent retry uses a *new* message_id so a fresh row is
-   created.
-3. **Phase 2 — Create event**: `calendar.v4.calendar_event.create`
-   against the bot's primary calendar with
-   `attendee_ability=can_modify_event`.
-4. **Phase 2 — Invite attendees**:
-   `calendar.v4.calendar_event_attendee.create(event_id, body=
-   {attendees: [{type: "user", user_id: open_id}, ...],
-   need_notification: true})`. **Note the SDK attribute path**: the
-   resource is exposed as `calendar.v4.calendar_event_attendee` (one
-   attribute, with underscore — see
-   `lark_oapi/api/calendar/v4/version.py`), NOT
-   `calendar.v4.calendar_event.attendee` (that path doesn't exist).
-   The HTTP-endpoint URL is `/open-apis/calendar/v4/calendars/{...}/
-   events/{...}/attendees`, but the **Python SDK collapses it into a
-   flat resource name**. Same applies to other nested-looking paths
-   in this spec — see "API endpoint vs SDK attribute path" callout
-   below.
+   `false`), `only_busy: bool` (we pass `true`). Use
+   `user_id_type="open_id"` on the request. If any returned slot
+   overlaps the requested window, mark the row `failed` (with
+   `error="conflict"` and the conflict payload in `result`) and
+   return `{conflict: [{open_id, busy_event_summary}]}` to the
+   agent. The agent reasks; a subsequent retry uses a *new*
+   message_id so a fresh row is created.
+4. **Phase 2.2 — Create event**:
+   `client.calendar.v4.calendar_event.create(CreateCalendarEventRequest
+   .builder().calendar_id(bot_calendar_id).request_body(...).build())`
+   with `attendee_ability=can_modify_event`. Returns
+   `event_id`.
+5. **Phase 2.2.5 — Intermediate persist (atomicity)**: as soon as
+   `event_id` is in hand, run an UPDATE that records
+   `target_id=event_id`, `target_kind='calendar_event'`,
+   `result.calendar_id=<bot_calendar_id>`, `result.event_id=<event_id>`
+   on the still-`pending` row. **This update is NOT a status
+   change — the row stays `pending`** — but if the process crashes
+   or the next sub-step fails between here and Phase 2.3, we still
+   have a record that "we created event X". This protects against
+   the v8-and-earlier silent-duplicate bug where a failed attendee
+   step would mark the row `failed` while the event sat orphaned in
+   Feishu, and a retry would gleefully create event Y.
 
-   Also note the method is `.create` (not `.create_batch`); the body
-   accepts a list in the `attendees` field. `batch_delete` exists for
-   removing multiple attendees but there is no `batch_create`.
-5. **Phase 3 — Persist terminal state**: update `bot_actions` to
-   `status=success`, store `target_id=event_id`, `target_kind=
-   "calendar_event"`, `result={event_id, calendar_id, link, attendees}`.
-6. Return event details to the agent.
+   **Residual crash window — pre-2.2.5**: if the process dies
+   between Phase 2.2 (event created in Feishu) and Phase 2.2.5 (DB
+   UPDATE that records `target_id`), the row is `pending` with no
+   `target_id` and the event is orphaned in Feishu. The §5.3 GC will
+   later transition this row to `reconciled_unknown` after 5 min,
+   but undo cannot target the orphan because `target_id` is NULL.
+   This window is small (one DB roundtrip) but real. **Mitigation**:
+   log the new `event_id` to stderr at INFO level the moment it
+   comes back from Feishu, before issuing the UPDATE, so an operator
+   can manually delete the orphan from logs after a crash. We do not
+   try to recover automatically — that would require an out-of-band
+   reconciler that the §1.4 trust model doesn't currently warrant.
+6. **Phase 2.3 — Invite attendees**:
+   `client.calendar.v4.calendar_event_attendee.create(
+   CreateCalendarEventAttendeeRequest.builder().calendar_id(
+   bot_calendar_id).event_id(event_id).request_body(
+   CreateCalendarEventAttendeeRequestBody.builder().attendees([
+   CalendarEventAttendee(type="user", user_id=open_id), ...]).
+   need_notification(true).build()).user_id_type("open_id").build())`.
+   The SDK exposes this as `calendar.v4.calendar_event_attendee`
+   (flat attribute, with underscore — see
+   `lark_oapi/api/calendar/v4/version.py`), NOT as a nested
+   `calendar_event.attendee` path. The method is `.create` (not
+   `.create_batch`); the body accepts a list in the `attendees`
+   field. `batch_delete` exists for the inverse, but there's no
+   `batch_create`.
+
+   **If this step fails after Phase 2.2.5 has persisted the
+   event_id**: do NOT mark the row `failed` (which would invite a
+   retry that creates a duplicate event). Instead transition to
+   `reconciled_unknown` with `error="attendee_invite_failed:
+   <details>"` and `result.reconciliation_kind = "partial_success"`
+   (the discriminator that §5.3 documents — see the "Two flavors of
+   `reconciled_unknown`" table). The agent surfaces this to the user
+   with a message like "I created the event but couldn't invite
+   everyone — please check the calendar and reinvite manually, or
+   ask me to undo". `last_for_me` (§3.9) finds the row because it
+   filters `status IN ('success', 'reconciled_unknown') AND
+   target_id IS NOT NULL`; undo deletes the orphan event using the
+   persisted `target_id` and `result.calendar_id`.
+
+   **Why not auto-compensate** (delete the event we just created)?
+   Doing so would silently destroy a successful side effect that
+   *is* visible to whoever's already on the calendar, which could
+   surprise someone who saw the invite arrive on the bot's own
+   calendar. `reconciled_unknown` keeps the human in the loop. v2
+   may add an explicit "rollback on partial failure" mode once we
+   see how often this fires in practice.
+7. **Phase 3 — Persist terminal success**: update `bot_actions` to
+   `status=success`, augment `result` with `link` and `attendees`
+   (target_id and calendar_id already in place from Phase 2.2.5).
+8. Return event details to the agent.
 
 #### 3.3bis API endpoint vs lark-oapi SDK attribute path
 
@@ -352,9 +408,13 @@ path** in code, not the URL-style name:
 | Concept | API endpoint URL | lark-oapi Python SDK path |
 |---|---|---|
 | Create calendar | `/open-apis/calendar/v4/calendars` | `client.calendar.v4.calendar.create(...)` |
-| Create calendar event | `/open-apis/calendar/v4/calendars/{...}/events` | `client.calendar.v4.calendar_event.create(...)` |
-| Add attendees | `/open-apis/calendar/v4/calendars/{...}/events/{...}/attendees` | `client.calendar.v4.calendar_event_attendee.create(...)` (flat, NOT `.calendar_event.attendee`) |
-| Batch freebusy | `/open-apis/calendar/v4/freebusy/batch_query` | `client.calendar.v4.freebusy.batch(...)` |
+| Resolve user's primary calendar | `/open-apis/calendar/v4/calendars/primary` | `client.calendar.v4.calendar.primarys(...)` (note plural method name; takes `user_ids: List[str]`) |
+| Get calendar event | `/open-apis/calendar/v4/calendars/{...}/events/{...}` | `client.calendar.v4.calendar_event.get(...)` (requires both `calendar_id` and `event_id`) |
+| Create calendar event | `/open-apis/calendar/v4/calendars/{...}/events` | `client.calendar.v4.calendar_event.create(...)` (requires `calendar_id`) |
+| Delete calendar event | `/open-apis/calendar/v4/calendars/{...}/events/{...}` | `client.calendar.v4.calendar_event.delete(...)` (requires both `calendar_id` and `event_id`) |
+| List events on calendar | `/open-apis/calendar/v4/calendars/{...}/events` | `client.calendar.v4.calendar_event.list(...)` (requires `calendar_id`) |
+| Add attendees | `/open-apis/calendar/v4/calendars/{...}/events/{...}/attendees` | `client.calendar.v4.calendar_event_attendee.create(...)` (flat, NOT `.calendar_event.attendee`; requires both `calendar_id` and `event_id`) |
+| Batch freebusy | `/open-apis/calendar/v4/freebusy/batch` | `client.calendar.v4.freebusy.batch(...)` (the URL path is `/batch`, NOT `/batch_query` — verified in `lark_oapi/api/calendar/v4/model/batch_freebusy_request.py`) |
 | Create Drive folder | `/open-apis/drive/v1/files/create_folder` | `client.drive.v1.file.create_folder(...)` |
 | Upload Drive file | `/open-apis/drive/v1/files/upload_all` | `client.drive.v1.file.upload_all(...)` (singular `file`, NOT plural `files`) |
 | Create import task | `/open-apis/drive/v1/import_tasks` | `client.drive.v1.import_task.create(...)` (singular `import_task`, NOT plural `import_tasks`) |
@@ -410,18 +470,26 @@ Resolution rules:
 
 1. **Phase -1 — pre-flight**: validate that `event_id` (or the
    resolved-from-`last`) exists and is bot-owned (`bot_actions` row
-   present). Refuse if not.
+   present). Refuse if not. Also extract `calendar_id` from the
+   original `schedule_meeting` row's `result.calendar_id` (saved
+   during §3.3 Phase 2.2.5). Both `calendar_id` and `event_id` are
+   required by every Calendar SDK call.
 2. **Phase 1 — pending insert** keyed on `(message_id, "cancel_meeting")`.
 3. **Phase 2a — Read full event before delete**:
-   `calendar.v4.calendar_event.get(event_id)` →
-   `pre_cancel_event_snapshot`. **Critical for undo**: without this
-   snapshot, undo cannot restore the event; once Feishu deletes, the
-   event is gone server-side. This call must succeed before we delete.
-4. **Phase 2b — Delete**: `calendar.v4.calendar_event.delete(event_id)`.
+   `client.calendar.v4.calendar_event.get(GetCalendarEventRequest
+   .builder().calendar_id(calendar_id).event_id(event_id).build())`
+   → `pre_cancel_event_snapshot`. **Critical for undo**: without
+   this snapshot, undo cannot restore the event; once Feishu
+   deletes, the event is gone server-side. This call must succeed
+   before we delete.
+4. **Phase 2b — Delete**:
+   `client.calendar.v4.calendar_event.delete(DeleteCalendarEventRequest
+   .builder().calendar_id(calendar_id).event_id(event_id).build())`.
 5. **Phase 3 — Persist terminal state**: mark this `cancel_meeting`
-   row `success` with `result={original_event_id, pre_cancel_event_snapshot}`.
-   Mark the original `schedule_meeting` row `status='undone'` for
-   traceability (and so it stops appearing in `last_for_me` lookups).
+   row `success` with `result={original_event_id, calendar_id,
+   pre_cancel_event_snapshot}`. Mark the original `schedule_meeting`
+   row `status='undone'` for traceability (and so it stops appearing
+   in `last_for_me` lookups).
 
 **Why snapshot, not just rely on Feishu trash/recovery**: Feishu
 calendar events do not have a "recently deleted" recovery window
@@ -470,6 +538,42 @@ boundary. The tool description directs the LLM: "Only pass an
 explicit `target` open_id when the user clearly asked about another
 person's calendar (e.g. 'albert 下周三有空吗?'). For any first-person
 question, leave `target` unset."
+
+**Resolving the user's primary calendar_id**: `calendar_event.list`
+requires a `calendar_id` path param (see
+`lark_oapi/api/calendar/v4/model/list_calendar_event_request.py`),
+which must be the user's *primary* calendar — not the bot's. The
+SDK exposes a dedicated lookup for this:
+
+```python
+client.calendar.v4.calendar.primarys(
+    PrimarysCalendarRequest.builder()
+      .user_id_type("open_id")
+      .request_body(
+          PrimarysCalendarRequestBody.builder()
+            .user_ids([resolved_target_open_id])
+            .build()
+      )
+      .build()
+)
+```
+
+Returns a list of `{user_id, calendar: {calendar_id, ...}}`; pick
+the entry whose `user_id` matches and pull `calendar.calendar_id`.
+Cache per-request (one resolution per `list_my_meetings` call).
+
+**Failure modes for primarys**:
+- Empty list returned (e.g., user is external to the org / has
+  never logged in / hasn't provisioned a Feishu calendar) → return
+  `{user_calendar_events: [], visibility_note: "我没找到这个人的
+  飞书主日历——可能他还没用过日历功能。我只能列出我自己安排的会。",
+  bot_known_events: <still queryable from bot_actions>}`. Do NOT
+  raise; the bot's own `bot_known_events` data path is independent
+  and still works.
+- HTTP 4xx/5xx → log and treat the same as empty list. The bot
+  remains useful for the bot_known_events portion.
+- Multiple entries (shouldn't happen for a single user_id but
+  defensive) → use the first match by `user_id`.
 
 **Visibility model — read carefully, this is subtle**: a tenant_access_token
 under `calendar:calendar.event:read` does NOT see every event on a
@@ -612,7 +716,12 @@ Reads from the `action_items` table; no write side effects.
 - `markdown_body: str` — markdown source the agent produced.
 - `meeting_event_id?: str`
 
-Three-phase pattern. Creates a Docx in the bot's "文档柜" folder, returns
+Three-phase pattern. On success the row's `target_kind="docx"` and
+`target_id=<doc_token>` so undo can call
+`client.drive.v1.file.delete(file_token=target_id, type="docx")` —
+both fields are mandatory in `DeleteFileRequest` (see §3.9 +
+`lark_oapi/api/drive/v1/model/delete_file_request.py`). Creates a
+Docx in the bot's "文档柜" folder, returns
 `{doc_token, url}`. The agent embeds the link in its reply.
 
 **Implementation note — Markdown to Docx**: the standard
@@ -666,11 +775,20 @@ tool's **interface** — only its body.
 
 **Inputs**:
 - `target` (one of):
-  - `last_for_me: true` — undo the most recent `success` row in the
-    current conversation **that the current asker created**. Scoped by
-    `(chat_id, sender_open_id)`, see §6.2. The earlier `last_in_chat`
-    name is renamed to make the per-asker scope explicit; in groups,
-    user A cannot undo user B's actions through this tool.
+  - `last_for_me: true` — undo the most recent **terminal** row in
+    the current conversation **that the current asker created**.
+    Scoped by `(chat_id, sender_open_id)`, see §6.2. The lookup
+    filter is `status IN ('success', 'reconciled_unknown') AND
+    target_id IS NOT NULL`, **not** just `status='success'`: the
+    `reconciled_unknown` arm catches partial-Phase-2 failures from
+    §3.3 (event was created in Feishu but attendees couldn't be
+    invited). Without this, the user has no way to clean up the
+    orphan event via the safety-net path. Rows with `target_id IS
+    NULL` are skipped — they represent the residual pre-2.2.5 crash
+    window where we don't know what to delete. The earlier
+    `last_in_chat` name is renamed to make the per-asker scope
+    explicit; in groups, user A cannot undo user B's actions through
+    this tool.
   - `action_id: str` — explicit `bot_actions.id` to undo (used when the
     agent has just shown the user a list and they pointed to one).
     Allowed even when the asker isn't the original creator, IF the row
@@ -688,23 +806,34 @@ message" is ambiguous when an utterance triggered multiple action
 types. Conversation scope (`chat_id`) is the right unit.
 
 Dispatches on `action_type`:
-- `schedule_meeting` → `calendar_event.delete(target_id)`
+- `schedule_meeting` →
+  `client.calendar.v4.calendar_event.delete(DeleteCalendarEventRequest
+  .builder().calendar_id(<from result.calendar_id>).event_id(
+  <from target_id>).build())`. Both path params are mandatory (see
+  `lark_oapi/api/calendar/v4/model/delete_calendar_event_request.py`).
 - `cancel_meeting` → **restore-from-snapshot**:
-  `calendar_event.create(...)` populated from
-  `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a), then
-  `attendee.create(event_id=new_event_id, body={attendees: [...],
-  need_notification: true})` for the original attendees. The new
-  event has a different `event_id` than the original; the response
-  includes `restore_caveats` (see §3.4) so the agent can warn the
-  user. Also unsets the original `schedule_meeting` row's `undone`
-  status back to `success` IF a row remains and its
-  `target_id=original_event_id` — but since we're issuing a **new**
-  event_id, we instead create a fresh `schedule_meeting` audit row
-  with `target_id=new_event_id` and `result={...}` and link both via
-  `target_id` lookups.
-- `append_action_items` → `client.bitable.v1.app_table_record.batch_delete` (flat SDK attribute path; see §3.3bis)
-  (one `record_id` per appended item, all stored in `result.record_ids`)
-- `create_meeting_doc` → `drive.v1.file.delete`
+  `client.calendar.v4.calendar_event.create(...calendar_id(<from
+  result.calendar_id>)...)` populated from
+  `result.pre_cancel_event_snapshot` (saved by §3.4 Phase 2a),
+  then `client.calendar.v4.calendar_event_attendee.create(...
+  calendar_id(<same>).event_id(new_event_id)...)` for the original
+  attendees. The new event has a different `event_id` than the
+  original; the response includes `restore_caveats` (see §3.4) so
+  the agent can warn the user. Audit linkage: we create a fresh
+  `schedule_meeting` audit row with `target_id=new_event_id` and
+  `result.predecessor_action_id=<original schedule action_id>`; the
+  cancel row stays `undone`.
+- `append_action_items` →
+  `client.bitable.v1.app_table_record.batch_delete(...)` (flat SDK
+  attribute path; see §3.3bis), passing `record_ids` from
+  `result.record_ids` along with the `app_token` and `table_id`
+  recorded in the original `result`.
+- `create_meeting_doc` →
+  `client.drive.v1.file.delete(DeleteFileRequest.builder().file_token(
+  <from target_id>).type("docx").build())`. Both `file_token` and
+  `type` are required by the SDK (see
+  `lark_oapi/api/drive/v1/model/delete_file_request.py`); the
+  `type` is always `"docx"` for this tool's outputs.
 
 Without a `cancel_meeting` case, undoing an accidental cancel was
 impossible — see §1.4: the no-confirmation-gate trust model requires
@@ -1123,12 +1252,20 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
             )
         if existing["status"] == "failed":
             # Retry: claim the existing row by transitioning it back to
-            # pending. update_for_retry uses an atomic UPDATE ... WHERE
-            # status='failed' RETURNING id; if it returns 0 rows another
-            # caller already claimed it, fall through to read again.
-            action_id = queries.update_for_retry(
-                existing["id"], new_args=args,
-            )
+            # pending AND re-acquire the logical_key lock. This UPDATE
+            # can ALSO raise LogicalKeyConflict if a different message
+            # acquired the slot in the meantime (since the failed row
+            # released its lock per §6.2). Same handling as Phase 1b's
+            # logical-conflict path.
+            try:
+                action_id = queries.update_for_retry(
+                    existing["id"], new_args=args, logical_key=logical_key,
+                )
+            except queries.LogicalKeyConflict as e:
+                winner = e.existing_row
+                if winner["status"] == "success":
+                    return _ok({**winner["result"], "deduplicated_from_logical_key": True})
+                return _err("a previous identical call is in flight")
             if action_id is None:
                 return _err("a concurrent retry won the race; try again in a moment")
         elif existing["status"] == "undone":
@@ -1171,11 +1308,23 @@ async def schedule_meeting(args: dict) -> dict[str, Any]:
             # status=='pending' on the winner — it's still in flight
             return _err("a previous identical call is in flight")
 
-    # Phase 2: do the actual side effect (freebusy pre-check, create
-    # event, invite attendees — see §3.3 for schedule_meeting specifics)
+    # Phase 2: do the actual side effect.
+    # IMPORTANT for tools with multiple sequential side effects (e.g.
+    # schedule_meeting = freebusy → create event → invite attendees):
+    # the moment any sub-step PRODUCES a Feishu artifact (event,
+    # record, doc), persist its identifier to bot_actions BEFORE
+    # attempting the next sub-step. If a later sub-step fails, the
+    # row goes to `reconciled_unknown` (not `failed`), so retry is
+    # blocked and undo can target the persisted artifact.
+    #
+    # See §3.3 phases 2.0–2.3 for the canonical sequence; the
+    # skeleton shows just the single-call shape for tools that don't
+    # have multi-step Phase 2.
     try:
         result = await feishu_client.create_calendar_event(...)
     except Exception as e:
+        # Pre-creation failure (no Feishu artifact yet) → safe to
+        # mark failed; retry can re-issue.
         queries.mark_bot_action_failed(action_id, str(e))
         return _err(f"飞书订会失败: {e}")
 
@@ -1222,10 +1371,13 @@ Two locks layer here:
 - The partial UNIQUE on `logical_key` — if a different message
   acquired the slot since this row failed, the UPDATE raises a
   PostgREST 409 the helper turns into `LogicalKeyConflict` (same
-  mechanism as the first-time-INSERT path in §5.1 Phase 1b). The
-  caller's existing `LogicalKeyConflict` catch arm handles it
-  uniformly: return the winner's success result or the
-  "in flight" error, depending on the winner's status.
+  mechanism as the first-time-INSERT path in §5.1 Phase 1b).
+  **`update_for_retry` is structurally outside Phase 1b's `try`
+  block**, so the caller wraps `update_for_retry` in its own
+  `try/except queries.LogicalKeyConflict` (see the §5.1 skeleton's
+  failed-status branch). The dispatch logic is identical to Phase
+  1b: return the winner's success result or the "in flight" error
+  depending on the winner's status.
 
 ### 5.1bis Why this and not a post-hoc listener
 
@@ -1325,7 +1477,9 @@ that surface them):
 **(a) Stuck pending → `reconciled_unknown`**: a row stuck in
 `pending` for >5 minutes is almost certainly orphaned (process died
 mid-call). The GC marks it `reconciled_unknown` (a distinct status,
-**not** `failed`) with `error="reconciled: pending too long"`.
+**not** `failed`) with `error="reconciled: pending too long"` and
+`result.reconciliation_kind = "stuck_pending"` (see "Two flavors of
+reconciled_unknown" below).
 
 The distinction matters: `failed` means "we know the Feishu call
 errored, retry is safe". `reconciled_unknown` means "we don't know
@@ -1370,6 +1524,19 @@ to monitor.
 The `status` CHECK constraint in §6.2 includes `reconciled_unknown`
 for case (a). Case (b) does NOT touch `status` — it mutates only
 `logical_key_locked`, which is a separate column.
+
+**Two flavors of `reconciled_unknown`** (do not collapse them):
+
+| `result.reconciliation_kind` | Source | `target_id` | Undo behavior |
+|---|---|---|---|
+| `"stuck_pending"` | §5.3 case (a) lazy GC after 5 min | NULL or set | Undo can only act if `target_id IS NOT NULL`. With NULL, surface to the user that we don't know what was created — let them check Feishu manually. |
+| `"partial_success"` | §3.3 Phase 2.3 attendee invite failed after Phase 2.2.5 persisted the event_id | always set (the orphan event_id) | Undo deletes the orphan event using the persisted `target_id` and `result.calendar_id`. |
+
+Both kinds are visible to `last_for_me` (§3.9 explicitly filters
+`status IN ('success', 'reconciled_unknown') AND target_id IS NOT
+NULL`). Code that branches on reconciliation reason should test
+`result.reconciliation_kind` rather than parsing the `error` string,
+which is meant for human display.
 
 ---
 
@@ -1719,6 +1886,12 @@ agent commonly mishandles. For traceability:
 | 43 | freebusy body field was named `user_id_list` in spec; SDK's `BatchFreebusyRequestBody.user_ids` would silently receive empty input, returning a 400 or no-op | Fixed to `user_ids: List[str]` per `lark_oapi/api/calendar/v4/model/batch_freebusy_request_body.py`. §3.3 phase 2 cites the model file directly. Caught in iter-8 Codex review. |
 | 44 | Several "API endpoint" path strings in spec didn't match lark-oapi Python SDK attribute paths (`calendar_event.attendee.create` instead of `calendar_event_attendee.create`; `drive.v1.files` instead of `drive.v1.file`; `drive.v1.import_tasks` instead of `drive.v1.import_task`; `bitable.v1.app.table` instead of `bitable.v1.app_table`; `docx.v1.document.block.children` instead of `docx.v1.document_block_children`) | All paths corrected to SDK attribute style; new §3.3bis "API endpoint vs lark-oapi SDK attribute path" callout table maps URL paths to SDK paths so future implementers can spot a mismatch quickly. Caught in iter-8 Codex review. |
 | 45 | `contact.v3.user.search` doesn't exist in lark-oapi Python SDK (verified in `lark_oapi/api/contact/v3/resource/user.py` — only `batch`, `batch_get_id`, `get`, `list`, `find_by_department` are exposed) | §3.1 step 3 now specifies a raw HTTP call to `/open-apis/search/v1/user` via `httpx` (already a dependency, see `feishu/client.py:67`) with `Bearer <tenant_access_token>`. Caught in iter-8 Codex review. |
+| 46 | `schedule_meeting`'s Phase 2 had multiple sub-steps (create event, invite attendees) but a single coarse "any failure → mark_failed" arm. If event creation succeeded and attendee creation failed, the Feishu event persisted while `bot_actions.target_id` stayed NULL — retry would gleefully create a duplicate event | New Phase 2.2.5 "intermediate persist" step in §3.3: `target_id` written to `bot_actions` immediately after event creation. If a later sub-step fails, transition to `reconciled_unknown` (not `failed`) so retry is blocked and undo can target the orphan. §5.1 skeleton updated with explicit guidance for multi-step Phase 2 tools. Caught in iter-9 Codex review. |
+| 47 | Calendar SDK calls (`calendar_event.create/get/delete`, `calendar_event_attendee.create`) all require `calendar_id` AND `event_id` path params (verified in `lark_oapi/api/calendar/v4/model/{create,get,delete}_calendar_event_request.py` and friends), but spec only said `event_id` | `bot_workspace.calendar_id` is read in §3.3 Phase 2.0; threaded through every Calendar call in §3.3 / §3.4 / §3.9. `result.calendar_id` is persisted so cancel/undo can re-read it without going back to `bot_workspace`. Caught in iter-9 Codex review. |
+| 48 | `update_for_retry` could raise `LogicalKeyConflict` (when transitioning failed→pending re-acquires the slot but a different message has won it), but the §5.1 skeleton's catch was structurally only around `insert_bot_action_pending` in Phase 1b — Phase 1a's failed-retry branch had no catch | §5.1 skeleton wraps `update_for_retry` in its own `try/except queries.LogicalKeyConflict` with identical dispatch logic. Caught in iter-9 Codex review. |
+| 49 | `list_my_meetings` needed the user's primary `calendar_id` to call `calendar_event.list`, but spec didn't say how to get it | §3.5 explicitly invokes `client.calendar.v4.calendar.primarys(user_ids=[target], user_id_type="open_id")` and pulls `calendar.calendar_id` from the response. Added to the §3.3bis SDK callout table. Caught in iter-9 Codex review. |
+| 50 | Doc undo said `drive.v1.file.delete` but `DeleteFileRequest` requires both `file_token` and `type` (verified in `lark_oapi/api/drive/v1/model/delete_file_request.py`) | §3.8 records `target_id=<doc_token>` + `target_kind="docx"`; §3.9 calls `client.drive.v1.file.delete(file_token=target_id, type="docx")`. Caught in iter-9 Codex review. |
+| 51 | §3.3bis listed freebusy URL as `/open-apis/calendar/v4/freebusy/batch_query`, but installed SDK uses `/freebusy/batch` (`lark_oapi/api/calendar/v4/model/batch_freebusy_request.py:25`) | §3.3bis row updated; verification cite added inline. Caught in iter-9 Codex review. |
 
 ---
 
