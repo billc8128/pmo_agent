@@ -265,9 +265,14 @@ before invoking any other tool that takes person inputs."
 ### 3.2 `today_iso` (extended)
 
 Existing tool gains one field: `user_timezone`, fetched once via
-`contact.v3.user.get` for the asker's open_id (cached in-process for
-the run). Without timezone the model has no safe way to interpret
-"下周三 3 点".
+`client.contact.v3.user.get(GetUserRequest.builder()
+.user_id(ctx.sender_open_id).user_id_type("open_id").build())`
+(cached in-process for the run). The **`user_id_type="open_id"`**
+qualifier is mandatory — the SDK's default is `union_id`, which
+doesn't match the open_id stored in `RequestContext`, and the call
+404s without it. Same identity-space gotcha as Bitable Person fields
+(§3.6) and Calendar attendees (§3.3 Phase 2.3). Without timezone
+the model has no safe way to interpret "下周三 3 点".
 
 ```json
 {
@@ -419,8 +424,18 @@ correct frame for interpreting relative phrases like '下周三 3 点'."
    may add an explicit "rollback on partial failure" mode once we
    see how often this fires in practice.
 7. **Phase 3 — Persist terminal success**: update `bot_actions` to
-   `status=success`, augment `result` with `link` and `attendees`
-   (target_id and calendar_id already in place from Phase 2.2.5).
+   `status=success`, augment `result` with:
+   - `link`: the Feishu calendar event URL.
+   - **`attendees: List[str]`**: the **open_ids** the agent passed
+     in to Phase 2.3 — copied from the *input* `attendee_open_ids`,
+     NOT from the API response. This guarantees the field is in the
+     open_id identity space regardless of what `user_id_type` the
+     API echoed back. The §3.5 `bot_known_events` JOIN matches
+     against this field via `result.attendees ⊇ {open_id}`; if it
+     came from the API response in a different identity space, the
+     JOIN would silently miss.
+   - `target_id` and `result.calendar_id` were already persisted
+     in Phase 2.2.5; this UPDATE only adds the post-create fields.
 8. Return event details to the agent.
 
 #### 3.3bis API endpoint vs lark-oapi SDK attribute path
@@ -485,17 +500,21 @@ Resolution rules:
   confirmations.
 - If `last:true`: look up `bot_actions WHERE chat_id=<current> AND
   sender_open_id=<current> AND action_type='schedule_meeting' AND
-  status='success' AND target_id IS NOT NULL ORDER BY created_at
-  DESC LIMIT 1`. **The `sender_open_id` filter matters in groups**:
-  without it, user A could cancel a meeting user B asked the bot
-  to schedule. **The `target_id IS NOT NULL` filter matters
-  post-iter-10**: §3.3 Phase 2.1 now stores freebusy conflicts as
-  `success` rows with `target_id=NULL` (they're "I checked and
-  there was a conflict" no-ops, not actual scheduled meetings).
-  Without this filter, `last:true` would resolve to a conflict row
-  that has no event to cancel. Both filters together match the
-  `last_bot_action_for_sender_in_chat` helper's `undoable_only=True`
-  default (§11 step 2). Requires `(chat_id, sender_open_id)` on
+  status IN ('success','reconciled_unknown') AND target_id IS NOT
+  NULL ORDER BY created_at DESC LIMIT 1`. **The `sender_open_id`
+  filter matters in groups**: without it, user A could cancel a
+  meeting user B asked the bot to schedule. **The `target_id IS
+  NOT NULL` filter matters post-iter-10**: §3.3 Phase 2.1 now
+  stores freebusy conflicts as `success` rows with `target_id=NULL`
+  (they're "I checked and there was a conflict" no-ops, not actual
+  scheduled meetings). **The `reconciled_unknown` arm matters
+  post-iter-9**: a `partial_success` schedule row (event created
+  on Feishu, attendee invite failed) has `target_id=event_id` and
+  represents a real meeting that the user should be able to cancel
+  via "取消刚才那个会"; excluding it would force the user to use
+  `undo_last_action` instead — confusing when both should work
+  symmetrically. The combined filter matches the §3.9 "undoable"
+  predicate exactly. Requires `(chat_id, sender_open_id)` on
   `bot_actions` (see §6.2).
 
 **Internal sequence**:
@@ -623,16 +642,30 @@ can be honest about provenance:
   "since": "...",
   "until": "...",
   "bot_known_events": [
-    // Events the bot itself scheduled (joined from bot_actions WHERE
-    // action_type='schedule_meeting' AND status='success' AND
-    // attendees ⊇ {resolved_target_open_id}). These are 100% complete
-    // from the bot's POV.
+    // Events the bot itself scheduled (joined from bot_actions
+    // WHERE action_type='schedule_meeting' AND status IN
+    // ('success','reconciled_unknown') AND target_id IS NOT NULL
+    // AND result.attendees ⊇ {resolved_target_open_id}).
+    // The reconciled_unknown arm includes partial_success rows:
+    // those are real meetings on Feishu (Phase 2.2.5 already
+    // created the event) — only the attendee invite step failed.
+    // Excluding them would mean the user asks "我下午有啥会" and
+    // the bot pretends it doesn't know about its own orphan event.
   ],
   "user_calendar_events": [
-    // Events from calendar.v4.calendar_event.list against the user's
-    // primary calendar. May be empty (no sharing), partial (only
-    // events bot is invited to), or complete (calendar shared with
-    // bot app).
+    // Events from `client.calendar.v4.calendar_event.list(
+    // ListCalendarEventRequest.builder().calendar_id(<user's
+    // primary, from primarys lookup above>).user_id_type(
+    // "open_id")...build())` against the user's primary calendar.
+    // **The `user_id_type="open_id"` qualifier is mandatory** —
+    // SDK default is union_id, which mismatches the identity space
+    // used everywhere else in this spec (resolved attendees,
+    // bot_known_events join, etc.). Without it, the events would
+    // come back with union_id-shaped attendee lists that don't
+    // intersect with our open_id stores.
+    //
+    // May be empty (no sharing), partial (only events bot is
+    // invited to), or complete (calendar shared with bot app).
     {"event_id": "...", "title": "...", "source": "user_primary"}
   ],
   "visibility_note": "string the agent should pass to the user when
@@ -657,8 +690,24 @@ can reply truthfully ("我看到的有 A, B；如果还有别的，可能是我�
 - `items: [{title: str, owner_open_id: str, due_date?: str, project?: str}]`
 - `meeting_event_id?: str` (optional link to an event in the same conversation)
 
+**`meeting_event_id` usage**: when present, the tool looks up the
+matching `bot_actions` row by `target_id=meeting_event_id AND
+target_kind='calendar_event'` to retrieve `result.calendar_id`,
+constructs the canonical Feishu event URL, and writes that into
+each created record's `created_by_meeting [URL]` Bitable column.
+If no matching `bot_actions` row is found (e.g., user pasted an
+external event ID), the column is left blank and the tool logs a
+warning — we deliberately don't fail the append, since the action
+items themselves are still useful.
+
 Writes one record per item to the `action_items` table in the bot's
-Bitable base. Three-phase pattern.
+Bitable base. Three-phase pattern with a **single atomic Phase 2
+sub-step**: `app_table_record.batch_create` either commits all
+records or none (Bitable's transactional guarantee on batch ops),
+so this tool does NOT need the multi-step intermediate-persist
+pattern from §3.3 / §3.8 — a single try/except around the batch
+call is sufficient. On success, persist the table_id + record_ids
+in one Phase 3 UPDATE.
 
 **Default-project resolution** (per item with no `project` provided):
 
@@ -840,7 +889,14 @@ implementation:
      reconciled_unknown signal.)
   6. **Phase 2.3.5 persist (on success)**: UPDATE with
      `target_id=<doc_token from poll>`, `target_kind="docx"`,
-     `result.url=<...>`. Now undo can find the doc.
+     `result.url=<...>`, and **keep `result.source_file_token`
+     intact** (do NOT clear it). The source `.md` stays in the bot's
+     文档柜 alongside the imported docx — for v1 we accept this
+     duplication ("v1 simplicity"; same trade-off mentioned in §3.8
+     intro). Undo on this row will delete the docx via target_id;
+     it deliberately does NOT also clean up the source `.md` because
+     a future "I want the markdown back" UX could read it. Now undo
+     can find the doc.
   7. **Phase 3 — Persist terminal status**: UPDATE `status='success'`.
 
   **Failure / uncertainty handling**:
@@ -955,11 +1011,27 @@ Dispatches on `action_type`:
   `schedule_meeting` audit row with `target_id=new_event_id` and
   `result.predecessor_action_id=<original schedule action_id>`; the
   cancel row stays `undone`.
+
+  **Logical_key collision check** (worth tracing through because
+  three rows interact): the new schedule audit row's logical_key is
+  computed from the snapshot's canonical_args, which match the
+  original schedule's logical_key. The original schedule row was
+  marked `undone` in §3.4 Phase 3, which cleared its
+  `logical_key_locked` per §6.2 lock-behavior table. So the new
+  schedule audit row INSERTs cleanly without a `LogicalKeyConflict`.
+  If for some reason the original row's lock wasn't cleared (edge
+  case: §3.4 Phase 3 crashed after marking cancel success but before
+  marking the original undone), the restore would surface as a
+  partial_success-style "please undo first" via the existing Phase
+  1b conflict handling — degrades gracefully, no spec gap.
 - `append_action_items` →
   `client.bitable.v1.app_table_record.batch_delete(...)` (flat SDK
   attribute path; see §3.3bis), passing `record_ids` from
-  `result.record_ids` along with the `app_token` and `table_id`
-  recorded in the original `result`.
+  `result.record_ids` along with the `table_id` from the row's
+  `target_id` and `app_token` from `bot_workspace.base_app_token`
+  (read fresh; not stored on the row to avoid duplicating workspace
+  state — `app_token` could legitimately change after a workspace
+  re-bootstrap, and the canonical source is §6.1 `bot_workspace`).
 - `create_meeting_doc` → **dispatch on `target_kind`** because the
   source-of-truth artifact depends on which Phase the row got stuck
   at (see §3.8 for the four possible terminal shapes):
@@ -1222,10 +1294,15 @@ from dataclasses import dataclass
 class RequestContext:
     """Mutable per-pooled-client request scope.
 
-    Mutated by app.py before every client.query() call, while holding
-    the pooled client's lock. Read by the tool closures via the same
-    object reference. No global state, no contextvars; the dataclass
-    instance lives as long as the _PooledClient that owns it.
+    Mutated by the runner inside its slot.lock acquisition, before
+    each client.query() call. app.py never touches this — it just
+    passes message_id / chat_id / sender_open_id / conversation_key
+    as kwargs to runner.answer / runner.answer_streaming, and the
+    runner writes them to slot.ctx.* (see iter-6 review for why
+    pool internals stay private to runner.py). Read by the tool
+    closures via the same object reference. No global state, no
+    contextvars; the dataclass instance lives as long as the
+    _PooledClient that owns it.
     """
     message_id: str = ""
     chat_id: str = ""
@@ -1609,11 +1686,15 @@ existing row and dispatches:
 
 `logical_key_locked: bool` is set to `true` at INSERT time and
 flipped to `false` by lazy GC after 60 s. The partial UNIQUE
-predicate is `WHERE logical_key_locked = true`. `status` retains
-its pure semantic meaning — `success` rows stay `success` forever,
-so every "find successful action" query (`last_for_me` (§3.4 / §3.9),
-`bot_known_events` (§3.5), `target_id` lookups (§3.4)) keeps working
-without needing to also accept some new status value.
+predicate is `WHERE logical_key_locked = true AND status IN
+('pending', 'success', 'reconciled_unknown')` — the
+`reconciled_unknown` arm is for partial_success orphans that must
+keep the lock until undo runs (see §6.2 lock-behavior table).
+`status` retains its pure semantic meaning — `success` rows stay
+`success` forever, so every "find successful action" query
+(`last_for_me` (§3.4 / §3.9), `bot_known_events` (§3.5),
+`target_id` lookups (§3.4)) keeps working without needing to also
+accept some new status value.
 
 An earlier draft used a `status='archived'` value to express
 "dedupe-period expired" but that conflated two orthogonal axes:
@@ -1764,7 +1845,7 @@ CREATE TABLE bot_actions (
                                                     -- (§5.2 / §5.3 case b).
     args            jsonb NOT NULL,                -- tool inputs (sanitized)
     target_id       text,                          -- Feishu side ID (event_id, record_id, doc_token)
-    target_kind     text,                          -- 'calendar_event' | 'bitable_record' | 'docx' | 'workspace_bootstrap'
+    target_kind     text,                          -- 'calendar_event' (§3.3/§3.4) | 'bitable_records' (§3.6, plural — one row per N records) | 'docx' (§3.8 success) | 'file' (§3.8 partial: source .md uploaded but import didn't start) | 'workspace_bootstrap' (§4) | NULL (freebusy conflict §3.3 Phase 2.1, or doc poll-timeout partial §3.8)
     result          jsonb,                         -- Feishu response keys we'll need later
     error           text,                          -- failure detail
     created_at      timestamptz NOT NULL DEFAULT now(),
@@ -1786,20 +1867,37 @@ CREATE INDEX bot_actions_chat_sender_recent_idx
   ON bot_actions (chat_id, sender_open_id, created_at DESC);
 
 -- Logical-key cross-process exclusion (§5.2): at most ONE row per
--- logical_key may currently hold the dedup lock AND be in an active
--- (pending or success) state. Two concurrent INSERTs race on this
+-- logical_key may currently hold the dedup lock AND be in an
+-- active-or-orphan state. Two concurrent INSERTs race on this
 -- UNIQUE; loser gets UniqueViolation. Lazy GC (§5.3 case b) flips
 -- logical_key_locked to false on success rows older than 60 s to
 -- free the key for legitimate repeat requests.
 --
--- The `status IN ('pending','success')` clause matters: it ensures
--- failed / undone / reconciled_unknown rows do NOT continue to hold
--- the dedup slot, even if their logical_key_locked column hasn't
--- been cleared yet. (Defense in depth: the status-changing helpers
--- below ALSO clear the lock, but the predicate makes that redundant
--- rather than load-bearing.)
+-- The `status IN ('pending','success','reconciled_unknown')` clause
+-- captures THREE distinct cases that should all block duplicates:
+--   * 'pending'             → another caller is mid-flight
+--   * 'success' (lock=true) → succeeded < 60 s ago, dedup window open
+--   * 'reconciled_unknown'
+--     (lock=true)           → partial_success orphan: a Feishu
+--                              artifact exists but the action couldn't
+--                              fully complete (§3.3 Phase 2.3, §3.8
+--                              poll timeout). Letting a duplicate
+--                              call slip through would create a
+--                              second artifact while the first sat
+--                              orphaned. The lock stays until undo
+--                              runs and clears it — see §6.2's
+--                              "Lock behavior on status transitions"
+--                              table.
 --
--- Crucially: a row's `status='success'` is preserved by the
+-- `failed` and `undone` rows do NOT continue to hold the dedup
+-- slot: status-changing helpers explicitly clear logical_key_locked
+-- for those (§6.2 lock-behavior table). They're excluded from the
+-- predicate via the bool, not via the status IN list — so a stale
+-- `failed` row with logical_key_locked=true (shouldn't happen, but
+-- defensive) still wouldn't be in the index because the predicate
+-- requires both clauses.
+--
+-- Critically: a row's `status='success'` is preserved by the
 -- expiry GC (only logical_key_locked flips), so all "find
 -- successful action" queries (last_for_me, bot_known_events,
 -- target_id lookups) keep working regardless of lock state.
@@ -2114,6 +2212,19 @@ agent commonly mishandles. For traceability:
 | 60 | Helper signatures didn't reflect v10's reality. `mark_bot_action_success` required `target_id`/`target_kind`, but freebusy-conflict-as-success rows have neither. `record_bot_action_target_pending` required `target_id`/`target_kind`, but doc Phase 2.1.5/2.2.5 only patch `result.source_file_token` / `result.import_ticket` | All three target params on these helpers are now optional. Result-only patches use `record_bot_action_target_pending(action_id, result_patch=...)` directly. Caught in iter-11 Codex review. |
 | 61 | Bitable Person fields (`owner` on `action_items`) need `user_id_type="open_id"` on every batch_create / search / list call; SDK defaults to `union_id` (different identity space) so without this the column would silently use IDs that don't match what `resolve_people` returns | §3.6 / §3.7 explicitly require `user_id_type="open_id"` on all bitable record calls; the SDK has the param on every relevant request model. Caught in iter-11 Codex review. |
 | 62 | iter-10 added `reconciled_unknown(partial_success)` to the partial UNIQUE index but `LogicalKeyConflict` catch arms in §5.1 still only branched on `success` vs `pending` — a real `partial_success` collision would return generic "in flight" instead of the correct "please undo first" guidance | Both catch arms (Phase 1b first-time-INSERT and the failed-retry path's `update_for_retry`) now have explicit `reconciled_unknown` branches returning the same "please undo first" message as Phase 0. Caught in iter-11 Codex review. |
+| 63 | `cancel_meeting(last:true)` excluded `reconciled_unknown(partial_success)` schedule rows. After iter-9 a partial_success has `target_id=event_id` and represents a real Feishu meeting; "取消刚才那个会" should resolve to it. v11 had the analogous fix in `last_for_me` (§3.9) but missed §3.4 | §3.4 `last:true` filter now reads `status IN ('success','reconciled_unknown') AND target_id IS NOT NULL`. Caught in self-review iter-12. |
+| 64 | §6.2 partial UNIQUE comment block was stale — said `status IN ('pending','success')` and that `reconciled_unknown` rows are excluded, but the actual SQL was `status IN ('pending','success','reconciled_unknown')` (iter-10 fix) and the lock-behavior table mandates partial_success **keeps** the lock | Comment block rewritten to match SQL: explicitly enumerates the three statuses and explains why each one belongs in the index. Caught in self-review iter-12. |
+| 65 | Several `user_id_type="open_id"` qualifiers missing on SDK calls outside the iter-11 fix scope: `today_iso` (`contact.v3.user.get`), `list_my_meetings` (`calendar_event.list`). Same identity-space gotcha as iter-11 #5 — SDK default is `union_id` and IDs would silently mismatch the open_id stored in `RequestContext` | §3.2 and §3.5 now show full SDK call signatures with `user_id_type("open_id")` explicit. Caught in self-review iter-12. |
+| 66 | §3.3 Phase 3 said "augment result with link and attendees" without pinning `attendees` shape. If implementer copies API response (which respects `user_id_type` of the call but could be future-changed), §3.5 `bot_known_events` JOIN against `attendees ⊇ {open_id}` could miss | §3.3 Phase 3 now explicitly says **copy from input `attendee_open_ids`**, not from API response, so `result.attendees: List[str]` is unambiguously open_ids. Caught in self-review iter-12. |
+| 67 | §3.5 `bot_known_events` JOIN filter was `status='success'`, excluded partial_success schedule rows. But those events DO exist on Feishu (Phase 2.2.5 created them); user asking "我下午有啥会" should see them | Filter now `status IN ('success','reconciled_unknown') AND target_id IS NOT NULL`. Caught in self-review iter-12. |
+| 68 | §5.0 `RequestContext` docstring said "Mutated by app.py" — out of date with iter-6's encapsulation fix where the runner mutates ctx inside its own slot.lock | Docstring rewritten to credit the runner. Caught in self-review iter-12. |
+| 69 | §5.2 explanatory paragraph quoted partial UNIQUE predicate as `WHERE logical_key_locked = true` (no status clause) — out of sync with §6.2 SQL post-iter-10 | Predicate quote in §5.2 now includes the full `AND status IN ('pending','success','reconciled_unknown')` clause. Caught in self-review iter-12. |
+| 70 | §6.2 `target_kind` column comment listed `'calendar_event'`/`'bitable_record'`/`'docx'`/`'workspace_bootstrap'` only. Iter-11 added `'bitable_records'` (plural, for append table-id row) and `'file'` (doc partial), and conflict no-ops legitimately have NULL — comment was stale | Comment rewritten as a structured catalog of every legal value with cross-references to the producing section. Caught in self-review iter-12. |
+| 71 | §3.6 `append_action_items` called itself "three-phase pattern" but `app_table_record.batch_create` is a single atomic Bitable op — implementer might wonder if intermediate-persist (§3.3 / §3.8 style) is needed and waste effort | §3.6 explicitly notes Phase 2 is single-step atomic; only Phase 3 (single UPDATE) is needed. Caught in self-review iter-12. |
+| 72 | §3.9 undo for `append_action_items` referenced `app_token and table_id` from "the original `result`" but §3.6 only stores `target_id=<table_id>` and `result.record_ids` — no `app_token` | §3.9 now reads `app_token` fresh from `bot_workspace.base_app_token` (canonical source; reading from row would duplicate workspace state and break after re-bootstrap). Caught in self-review iter-12. |
+| 73 | §3.8 Phase 2.3.5 didn't say what happens to `result.source_file_token` after success. Implementer could either delete the source `.md` (cleanup) or leave it (backup); spec was silent | §3.8 explicitly keeps `source_file_token` intact on success; v1 accepts the duplication for simplicity. Caught in self-review iter-12. |
+| 74 | §3.9 cancel-restore creates a new `schedule_meeting` audit row whose `logical_key` would collide with the original schedule's row IF the original's lock wasn't cleared. Spec didn't trace through whether undone-row lock-clear made the INSERT clean | §3.9 now traces: §3.4 Phase 3 marks original `undone` → §6.2 lock-behavior clears `logical_key_locked` → restore INSERT is clean. Edge case (§3.4 Phase 3 crashed mid-way) degrades to existing partial_success "please undo first" path. Caught in self-review iter-12. |
+| 75 | §3.6 listed `meeting_event_id?` as input but never said how it's used. §4 schema mentions a `created_by_meeting [URL]` column but no spec text bridged from input to column | §3.6 now describes the lookup: `bot_actions WHERE target_id=meeting_event_id AND target_kind='calendar_event'` to retrieve `calendar_id`, construct event URL, write to `created_by_meeting`. No-match → blank column + warning, don't fail the append. Caught in self-review iter-12. |
 
 ---
 
