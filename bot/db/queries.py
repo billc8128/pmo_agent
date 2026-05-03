@@ -366,6 +366,11 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _execute_data(request: Any) -> Any:
+    res = request.execute()
+    return res.data if res is not None else None
+
+
 def _has_artifact_handle(row: dict[str, Any]) -> bool:
     if row.get("target_id"):
         return True
@@ -406,13 +411,13 @@ def _lazy_gc_stuck_pending(row: dict[str, Any]) -> dict[str, Any]:
     if res and res.data:
         return res.data[0]
     return (
-        sb_admin()
-        .table("bot_actions")
-        .select("*")
-        .eq("id", row["id"])
-        .maybe_single()
-        .execute()
-        .data
+        _execute_data(
+            sb_admin()
+            .table("bot_actions")
+            .select("*")
+            .eq("id", row["id"])
+            .maybe_single()
+        )
         or row
     )
 
@@ -439,13 +444,13 @@ def _unlock_aged_success(row: dict[str, Any]) -> dict[str, Any] | None:
     if res and res.data:
         return None
     current = (
-        sb_admin()
-        .table("bot_actions")
-        .select("*")
-        .eq("id", row["id"])
-        .maybe_single()
-        .execute()
-        .data
+        _execute_data(
+            sb_admin()
+            .table("bot_actions")
+            .select("*")
+            .eq("id", row["id"])
+            .maybe_single()
+        )
     )
     if not current or not current.get("logical_key_locked"):
         return None
@@ -521,28 +526,28 @@ def release_bootstrap_lock(lock_id: str) -> None:
 
 def get_bot_action(message_id: str, action_type: str) -> dict[str, Any] | None:
     row = (
-        sb_admin()
-        .table("bot_actions")
-        .select("*")
-        .eq("message_id", message_id)
-        .eq("action_type", action_type)
-        .maybe_single()
-        .execute()
-        .data
+        _execute_data(
+            sb_admin()
+            .table("bot_actions")
+            .select("*")
+            .eq("message_id", message_id)
+            .eq("action_type", action_type)
+            .maybe_single()
+        )
     )
     return _lazy_gc_stuck_pending(row) if row else None
 
 
 def get_locked_by_logical_key(logical_key: str) -> dict[str, Any] | None:
     row = (
-        sb_admin()
-        .table("bot_actions")
-        .select("*")
-        .eq("logical_key", logical_key)
-        .eq("logical_key_locked", True)
-        .maybe_single()
-        .execute()
-        .data
+        _execute_data(
+            sb_admin()
+            .table("bot_actions")
+            .select("*")
+            .eq("logical_key", logical_key)
+            .eq("logical_key_locked", True)
+            .maybe_single()
+        )
     )
     if not row:
         return None
@@ -554,13 +559,13 @@ def get_locked_by_logical_key(logical_key: str) -> dict[str, Any] | None:
 
 def update_for_retry(action_id: str) -> dict[str, Any] | None:
     row = (
-        sb_admin()
-        .table("bot_actions")
-        .select("attempt_count")
-        .eq("id", action_id)
-        .maybe_single()
-        .execute()
-        .data
+        _execute_data(
+            sb_admin()
+            .table("bot_actions")
+            .select("attempt_count")
+            .eq("id", action_id)
+            .maybe_single()
+        )
         or {}
     )
     attempt_count = int(row.get("attempt_count") or 1) + 1
@@ -594,7 +599,7 @@ def record_bot_action_target_pending(
     result_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     current = (
-        sb_admin().table("bot_actions").select("result").eq("id", action_id).maybe_single().execute().data
+        _execute_data(sb_admin().table("bot_actions").select("result").eq("id", action_id).maybe_single())
         or {}
     )
     result = {**(current.get("result") or {}), **(result_patch or {})}
@@ -616,7 +621,7 @@ def record_bot_action_target_pending(
 
 def mark_bot_action_success(action_id: str, result_patch: dict[str, Any] | None = None) -> dict[str, Any] | None:
     current = (
-        sb_admin().table("bot_actions").select("result").eq("id", action_id).maybe_single().execute().data
+        _execute_data(sb_admin().table("bot_actions").select("result").eq("id", action_id).maybe_single())
         or {}
     )
     result = {**(current.get("result") or {}), **(result_patch or {})}
@@ -640,7 +645,7 @@ def mark_bot_action_failed(action_id: str, error: str) -> None:
 def mark_bot_action_reconciled_unknown(
     action_id: str, *, reconciliation_kind: str, error: str | None = None, keep_lock: bool = True
 ) -> None:
-    row = sb_admin().table("bot_actions").select("result").eq("id", action_id).maybe_single().execute().data or {}
+    row = _execute_data(sb_admin().table("bot_actions").select("result").eq("id", action_id).maybe_single()) or {}
     result = {**(row.get("result") or {}), "reconciliation_kind": reconciliation_kind}
     sb_admin().table("bot_actions").update(
         {
@@ -707,7 +712,7 @@ def get_bot_action_by_target(
         q = q.in_("action_type", action_type_in)
     if status_in:
         q = q.in_("status", status_in)
-    row = q.order("created_at", desc=True).limit(1).maybe_single().execute().data
+    row = _execute_data(q.order("created_at", desc=True).limit(1).maybe_single())
     return row
 
 
