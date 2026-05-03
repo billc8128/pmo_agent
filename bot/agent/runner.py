@@ -29,8 +29,12 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from agent import tools as agent_tools
-from agent.tools import build_pmo_mcp
+from agent.request_context import RequestContext
+from agent.tools_bitable import build_bitable_mcp
+from agent.tools_calendar import build_calendar_mcp
+from agent.tools_doc import build_doc_mcp
+from agent.tools_external import build_external_mcp
+from agent.tools_meta import build_meta_mcp
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -80,13 +84,11 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - **不要**在最终答案里把 `[asker]` 这行 echo 出来——那是给你看的元数据，不是给用户看的。
 
 你能调用的工具：
-- list_users          看全部已注册的用户
-- lookup_user         按 handle 查到 user_id（handle 可带或不带 @）
-- get_recent_turns    拉某个用户最近的 turn（按时间窗口、项目过滤）。
-                      返回每条 turn 的 user_message + agent_summary
-- get_project_overview 每个项目的累积叙事摘要（最高密度的"在做什么"信号）
-- get_activity_stats  按日 / 按项目聚合 turn 数（"有多忙"类问题）
-- today_iso          拿当前时间锚点（今天起、昨天、7天前、30天前 ISO）
+- Meta: today_iso, list_users, lookup_user, get_recent_turns, get_project_overview, get_activity_stats, generate_image, resolve_people, undo_last_action
+- Calendar: schedule_meeting, cancel_meeting, list_my_meetings
+- Bitable: append_action_items, query_action_items, create_bitable_table, append_to_my_table, query_my_table, describe_my_table
+- Doc: create_meeting_doc, create_doc, append_to_doc
+- External: read_doc, read_external_table, resolve_feishu_link
 
 # 选 tool 的策略（重要）
 
@@ -136,9 +138,18 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 风格建议：默认用 stylized illustration（插画/卡通/像素风/水彩等），**不要**用 photorealistic——避免假装是真人照片的伦理问题。
 
 你不能：
-- 写代码、改文件、跑命令——这是只读问答助手
 - 透露 user_id (UUID) / token 等数据库内部细节
 - 编造 turn 内容——只用工具返回的数据
+
+你现在可以在飞书做事，不只是回答问题。默认行为仍然是文字回复；只有用户意图明确指向订会、取消会议、记 action item、建表、写文档、追加到文档、读取飞书链接时才调用工具。
+
+硬规则：
+- 调用任何接受人员参数的写工具前必须先调 resolve_people；如果 ambiguous/unresolved，先反问。
+- 传给 schedule_meeting 的时间必须是 RFC3339 with timezone；先调 today_iso 拿时间锚点。
+- 不要修改不是你创建的飞书资源。只能取消/编辑 bot_actions 中属于当前用户/会话的事件、文档、表。
+- append_to_doc 仅作用于由 bot 自己创建的文档；不要尝试 append 到用户分享给你的链接。
+- 用户粘贴飞书 URL 时先调 resolve_feishu_link，再决定 read_doc / read_external_table。
+- 第一人称日历问题调用 list_my_meetings 时不传 target_open_id。
 """
 
 # Resolve the single placeholder via plain string replace (no
@@ -155,6 +166,7 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace(
 @dataclass
 class _PooledClient:
     client: ClaudeSDKClient
+    ctx: RequestContext = field(default_factory=RequestContext)
     last_used: float = field(default_factory=time.monotonic)
     busy: bool = False
     # Per-conversation FIFO so concurrent messages from the same
@@ -172,20 +184,42 @@ async def _get_client(conversation_key: str) -> _PooledClient:
     async with _pool_lock:
         slot = _pool.get(conversation_key)
         if slot is None:
+            ctx = RequestContext()
             options = ClaudeAgentOptions(
                 system_prompt=SYSTEM_PROMPT,
-                # Bot is read-only; the only tools are our supabase MCP.
-                # We disable Claude's built-in file/bash/web tools entirely.
                 allowed_tools=[
-                    "mcp__pmo__list_users",
-                    "mcp__pmo__lookup_user",
-                    "mcp__pmo__get_recent_turns",
-                    "mcp__pmo__get_project_overview",
-                    "mcp__pmo__get_activity_stats",
-                    "mcp__pmo__generate_image",
-                    "mcp__pmo__today_iso",
+                    "mcp__pmo_meta__list_users",
+                    "mcp__pmo_meta__lookup_user",
+                    "mcp__pmo_meta__get_recent_turns",
+                    "mcp__pmo_meta__get_project_overview",
+                    "mcp__pmo_meta__get_activity_stats",
+                    "mcp__pmo_meta__generate_image",
+                    "mcp__pmo_meta__today_iso",
+                    "mcp__pmo_meta__resolve_people",
+                    "mcp__pmo_meta__undo_last_action",
+                    "mcp__pmo_calendar__schedule_meeting",
+                    "mcp__pmo_calendar__cancel_meeting",
+                    "mcp__pmo_calendar__list_my_meetings",
+                    "mcp__pmo_bitable__append_action_items",
+                    "mcp__pmo_bitable__query_action_items",
+                    "mcp__pmo_bitable__create_bitable_table",
+                    "mcp__pmo_bitable__append_to_my_table",
+                    "mcp__pmo_bitable__query_my_table",
+                    "mcp__pmo_bitable__describe_my_table",
+                    "mcp__pmo_doc__create_meeting_doc",
+                    "mcp__pmo_doc__create_doc",
+                    "mcp__pmo_doc__append_to_doc",
+                    "mcp__pmo_external__read_doc",
+                    "mcp__pmo_external__read_external_table",
+                    "mcp__pmo_external__resolve_feishu_link",
                 ],
-                mcp_servers={"pmo": build_pmo_mcp()},
+                mcp_servers={
+                    "pmo_meta": build_meta_mcp(ctx),
+                    "pmo_calendar": build_calendar_mcp(ctx),
+                    "pmo_bitable": build_bitable_mcp(ctx),
+                    "pmo_doc": build_doc_mcp(ctx),
+                    "pmo_external": build_external_mcp(ctx),
+                },
                 # No write/exec tools — explicitly empty.
                 disallowed_tools=[
                     "Bash", "Write", "Edit", "NotebookEdit",
@@ -195,14 +229,21 @@ async def _get_client(conversation_key: str) -> _PooledClient:
             )
             client = ClaudeSDKClient(options=options)
             await client.connect()
-            slot = _PooledClient(client=client)
+            slot = _PooledClient(client=client, ctx=ctx)
             _pool[conversation_key] = slot
             logger.info("agent: created client for %s", conversation_key)
         slot.last_used = time.monotonic()
         return slot
 
 
-async def answer(conversation_key: str, question: str) -> str:
+async def answer(
+    conversation_key: str,
+    question: str,
+    *,
+    message_id: str = "",
+    chat_id: str = "",
+    sender_open_id: str = "",
+) -> str:
     """Run the agent and return only the final answer text.
 
     Kept for callers that don't care about progress; new code should use
@@ -210,7 +251,13 @@ async def answer(conversation_key: str, question: str) -> str:
     """
     answer_text = ""
     tool_count = 0
-    async for ev in answer_streaming(conversation_key, question):
+    async for ev in answer_streaming(
+        conversation_key,
+        question,
+        message_id=message_id,
+        chat_id=chat_id,
+        sender_open_id=sender_open_id,
+    ):
         if ev["kind"] == "tool":
             tool_count += 1
         elif ev["kind"] == "final":
@@ -218,7 +265,14 @@ async def answer(conversation_key: str, question: str) -> str:
     return answer_text or "(空回答 — 试试换个问法?)"
 
 
-async def answer_streaming(conversation_key: str, question: str):
+async def answer_streaming(
+    conversation_key: str,
+    question: str,
+    *,
+    message_id: str = "",
+    chat_id: str = "",
+    sender_open_id: str = "",
+):
     """Run the agent and yield progress events as they happen.
 
     Yields dicts of one of these shapes:
@@ -239,9 +293,10 @@ async def answer_streaming(conversation_key: str, question: str):
     # also queue behind other in-flight calls on the same slot.
     async with slot.lock:
         slot.busy = True
-        # Tell the image tool which conversation we're answering for
-        # (used for per-conversation rate limiting on image generation).
-        agent_tools.set_current_conversation(conversation_key)
+        slot.ctx.message_id = message_id
+        slot.ctx.chat_id = chat_id
+        slot.ctx.sender_open_id = sender_open_id
+        slot.ctx.conversation_key = conversation_key
         try:
             await slot.client.query(question)
             final_text_chunks: list[str] = []
@@ -252,11 +307,7 @@ async def answer_streaming(conversation_key: str, question: str):
                             final_text_chunks.append(block.text)
                         elif isinstance(block, ToolUseBlock):
                             name = block.name
-                            # Strip the "mcp__pmo__" prefix the SDK adds.
-                            if name.startswith("mcp__pmo__"):
-                                display = name[len("mcp__pmo__"):]
-                            else:
-                                display = name
+                            display = _strip_pmo_prefix(name)
                             args_hint = _format_args_hint(block.input or {})
                             logger.info(
                                 "agent: tool=%s input_keys=%s",
@@ -278,6 +329,22 @@ async def answer_streaming(conversation_key: str, question: str):
             yield {"kind": "error", "message": f"{type(e).__name__}: {e}"}
         finally:
             slot.busy = False
+
+
+_PMO_PREFIXES = (
+    "mcp__pmo_meta__",
+    "mcp__pmo_calendar__",
+    "mcp__pmo_bitable__",
+    "mcp__pmo_doc__",
+    "mcp__pmo_external__",
+)
+
+
+def _strip_pmo_prefix(tool_name: str) -> str:
+    for prefix in _PMO_PREFIXES:
+        if tool_name.startswith(prefix):
+            return tool_name[len(prefix):]
+    return tool_name
 
 
 def _format_args_hint(args: dict) -> str:

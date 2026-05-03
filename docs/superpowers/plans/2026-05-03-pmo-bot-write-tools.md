@@ -49,18 +49,18 @@
 | `bot/feishu/drive.py` | Drive v1 wrappers (file.upload_all/delete/create_folder, import_task.create/get) |
 | `bot/feishu/docx.py` | Docx v1 wrappers (document_block.list, document_block_children.create/batch_delete) |
 | `bot/feishu/contact.py` | Contact v3 wrappers (user.get, user.batch_get_id) + raw httpx wrapper for `/open-apis/search/v1/user` |
-| `bot/feishu/wiki.py` | Wiki v2 wrapper (space.node.get for `/wiki/<token>` redirect resolution) |
+| `bot/feishu/wiki.py` | Wiki v2 wrapper (`wiki.v2.space.get_node` for `/wiki/<token>` redirect resolution) |
 | `bot/feishu/links.py` | Pure-function URL parser used by `resolve_feishu_link`; calls `wiki.py` only for the wiki redirect path |
 
 #### Agent tool modules (one MCP server per file)
 
 | Path | Purpose |
 |---|---|
-| `bot/agent/tools_meta.py` | **Renamed from `tools.py`**. Hosts the 7 existing read tools (list_users, lookup_user, get_recent_turns, get_project_overview, get_activity_stats, today_iso extension, generate_image) + 3 new meta tools (resolve_people, undo_last_action, expanded today_iso). Exports `build_meta_mcp(ctx)`. |
-| `bot/agent/tools_calendar.py` | schedule_meeting + cancel_meeting + list_my_meetings. Exports `build_calendar_mcp(ctx)`. |
-| `bot/agent/tools_bitable.py` | append_action_items + query_action_items + create_bitable_table + append_to_my_table + query_my_table + describe_my_table. Exports `build_bitable_mcp(ctx)`. |
-| `bot/agent/tools_doc.py` | create_meeting_doc + create_doc + append_to_doc + private `_drive_import_markdown(ctx, action_id, title, markdown)` helper. Exports `build_doc_mcp(ctx)`. |
-| `bot/agent/tools_external.py` | read_doc + read_external_table + resolve_feishu_link. Exports `build_external_mcp(ctx)`. |
+| `bot/agent/tools_meta.py` | **Renamed from `tools.py`**. Hosts the 7 existing read tools (list_users, lookup_user, get_recent_turns, get_project_overview, get_activity_stats, today_iso extension, generate_image) + 3 new meta tools (resolve_people, undo_last_action, expanded today_iso). Exports `build_meta_mcp(ctx)` and `build_meta_tools(ctx)` for tests. |
+| `bot/agent/tools_calendar.py` | schedule_meeting + cancel_meeting + list_my_meetings. Exports `build_calendar_mcp(ctx)` and `build_calendar_tools(ctx)`. |
+| `bot/agent/tools_bitable.py` | append_action_items + query_action_items + create_bitable_table + append_to_my_table + query_my_table + describe_my_table. Exports `build_bitable_mcp(ctx)` and `build_bitable_tools(ctx)`. |
+| `bot/agent/tools_doc.py` | create_meeting_doc + create_doc + append_to_doc + private `_drive_import_markdown(ctx, action_id, title, markdown)` helper. Exports `build_doc_mcp(ctx)` and `build_doc_tools(ctx)`. |
+| `bot/agent/tools_external.py` | read_doc + read_external_table + resolve_feishu_link. Exports `build_external_mcp(ctx)` and `build_external_tools(ctx)`. |
 
 #### Tests (one file per tool module + helpers)
 
@@ -2663,7 +2663,7 @@ git commit -am "feat(feishu): drive v1 SDK wrappers (upload_all, import_task cre
 - Create: `bot/feishu/docx.py`
 - Test: `bot/tests/test_feishu_docx.py`
 
-- [ ] **Step 1: Write failing test for `list_blocks` and `append_blocks`**
+- [ ] **Step 1: Write failing tests for `list_blocks`, `append_blocks`, and index-range `delete_blocks`**
 
 ```python
 import pytest
@@ -2690,10 +2690,45 @@ async def test_list_blocks_returns_paginated_list(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.docx.v1.document_block.list = fake_list
-    monkeypatch.setattr(docx, "_client", lambda: fake_client)
+    monkeypatch.setattr(docx, "_lark_client", lambda: fake_client)
 
     blocks = await docx.list_blocks("doc_token_123")
     assert [b.block_id for b in blocks] == ["b1", "b2", "b3"]
+
+
+@pytest.mark.asyncio
+async def test_delete_blocks_maps_block_ids_to_current_child_indexes(monkeypatch):
+    fake_children = [
+        MagicMock(block_id="keep_a"),
+        MagicMock(block_id="del_1"),
+        MagicMock(block_id="del_2"),
+        MagicMock(block_id="keep_b"),
+        MagicMock(block_id="del_3"),
+    ]
+    fake_get_resp = MagicMock(success=lambda: True)
+    fake_get_resp.data.items = fake_children
+    fake_get_resp.data.has_more = False
+
+    delete_requests = []
+    fake_delete_resp = MagicMock(success=lambda: True)
+
+    fake_client = MagicMock()
+    fake_client.docx.v1.document_block_children.get = lambda req: fake_get_resp
+    fake_client.docx.v1.document_block_children.batch_delete = (
+        lambda req: delete_requests.append(req) or fake_delete_resp
+    )
+    monkeypatch.setattr(docx, "_lark_client", lambda: fake_client)
+
+    out = await docx.delete_blocks(
+        "doc_token_123", "root", ["del_1", "del_2", "already_missing", "del_3"]
+    )
+
+    assert out == {"deleted": 3, "missing": 1}
+    # Delete highest range first so lower indexes do not shift.
+    assert [(r.body.start_index, r.body.end_index) for r in delete_requests] == [
+        (4, 5),
+        (1, 3),
+    ]
 ```
 
 - [ ] **Step 2: Run test → expect import error / NotImplemented**
@@ -2710,16 +2745,22 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncio
 import lark_oapi as lark
 from lark_oapi.api.docx.v1 import (
     BatchDeleteDocumentBlockChildrenRequest,
     BatchDeleteDocumentBlockChildrenRequestBody,
     CreateDocumentBlockChildrenRequest,
     CreateDocumentBlockChildrenRequestBody,
+    GetDocumentBlockChildrenRequest,
     ListDocumentBlockRequest,
 )
 
-from .client import _client  # existing helper that returns lark_oapi.Client
+from feishu.client import feishu_client
+
+
+def _lark_client() -> lark.Client:
+    return feishu_client.client
 
 
 async def list_blocks(document_id: str) -> list[Any]:
@@ -2734,12 +2775,38 @@ async def list_blocks(document_id: str) -> list[Any]:
         )
         if page_token:
             req = req.page_token(page_token)
-        resp = _client().docx.v1.document_block.list(req.build())
+        resp = await asyncio.to_thread(_lark_client().docx.v1.document_block.list, req.build())
         if not resp.success():
             raise RuntimeError(f"docx.list_blocks failed: {resp.code} {resp.msg}")
         blocks.extend(resp.data.items or [])
         if not resp.data.has_more:
             return blocks
+        page_token = resp.data.page_token
+
+
+async def list_child_blocks(document_id: str, parent_block_id: str) -> list[Any]:
+    """Return direct children under parent_block_id, walking pagination."""
+    children: list[Any] = []
+    page_token: str | None = None
+    while True:
+        req = (
+            GetDocumentBlockChildrenRequest.builder()
+            .document_id(document_id)
+            .block_id(parent_block_id)
+            .page_size(500)
+        )
+        if page_token:
+            req = req.page_token(page_token)
+        resp = await asyncio.to_thread(
+            _lark_client().docx.v1.document_block_children.get, req.build()
+        )
+        if not resp.success():
+            raise RuntimeError(
+                f"docx.list_child_blocks failed: {resp.code} {resp.msg}"
+            )
+        children.extend(resp.data.items or [])
+        if not resp.data.has_more:
+            return children
         page_token = resp.data.page_token
 
 
@@ -2749,6 +2816,7 @@ async def append_blocks(
     children: list[Any],
     *,
     index: int = -1,
+    client_token: str | None = None,
 ) -> list[str]:
     """Append children blocks under parent_block_id; returns new block_ids."""
     body = (
@@ -2757,41 +2825,76 @@ async def append_blocks(
         .index(index)
         .build()
     )
-    req = (
+    req_builder = (
         CreateDocumentBlockChildrenRequest.builder()
         .document_id(document_id)
         .block_id(parent_block_id)
         .request_body(body)
-        .build()
     )
-    resp = _client().docx.v1.document_block_children.create(req)
+    if client_token:
+        req_builder = req_builder.client_token(client_token)
+    resp = await asyncio.to_thread(
+        _lark_client().docx.v1.document_block_children.create, req_builder.build()
+    )
     if not resp.success():
         raise RuntimeError(f"docx.append_blocks failed: {resp.code} {resp.msg}")
     return [c.block_id for c in (resp.data.children or [])]
 
 
+def _contiguous_ranges(indexes: list[int]) -> list[tuple[int, int]]:
+    """Return inclusive (start, end) ranges for sorted child indexes."""
+    if not indexes:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = prev = indexes[0]
+    for idx in indexes[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        ranges.append((start, prev))
+        start = prev = idx
+    ranges.append((start, prev))
+    return ranges
+
+
 async def delete_blocks(
     document_id: str, parent_block_id: str, block_ids: list[str]
-) -> None:
-    """Delete the specified children block_ids under parent_block_id."""
-    body = (
-        BatchDeleteDocumentBlockChildrenRequestBody.builder()
-        .block_ids(block_ids)
-        .build()
-    )
-    req = (
-        BatchDeleteDocumentBlockChildrenRequest.builder()
-        .document_id(document_id)
-        .block_id(parent_block_id)
-        .request_body(body)
-        .build()
-    )
-    resp = _client().docx.v1.document_block_children.batch_delete(req)
-    if not resp.success():
-        # 404 / NotFound is acceptable (already deleted) — caller may swallow.
-        raise RuntimeError(
-            f"docx.delete_blocks failed: code={resp.code} msg={resp.msg}"
+) -> dict[str, int]:
+    """Delete specified child block IDs by mapping them to current indexes.
+
+    lark-oapi's installed batch_delete body has only start_index/end_index,
+    not block_ids. Treat missing block IDs as already deleted.
+    """
+    current_children = await list_child_blocks(document_id, parent_block_id)
+    index_by_id = {c.block_id: i for i, c in enumerate(current_children)}
+    indexes = sorted(index_by_id[b] for b in block_ids if b in index_by_id)
+    missing = len(block_ids) - len(indexes)
+    if not indexes:
+        return {"deleted": 0, "missing": missing}
+
+    for start, end in reversed(_contiguous_ranges(indexes)):
+        body = (
+            BatchDeleteDocumentBlockChildrenRequestBody.builder()
+            .start_index(start)
+            .end_index(end + 1)  # SDK/API range is start-inclusive, end-exclusive.
+            .build()
         )
+        req = (
+            BatchDeleteDocumentBlockChildrenRequest.builder()
+            .document_id(document_id)
+            .block_id(parent_block_id)
+            .client_token(f"delete:{parent_block_id}:{start}:{end}")
+            .request_body(body)
+            .build()
+        )
+        resp = await asyncio.to_thread(
+            _lark_client().docx.v1.document_block_children.batch_delete, req
+        )
+        if not resp.success():
+            raise RuntimeError(
+                f"docx.delete_blocks failed: code={resp.code} msg={resp.msg}"
+            )
+    return {"deleted": len(indexes), "missing": missing}
 ```
 
 - [ ] **Step 4: Run tests → green**
@@ -2826,8 +2929,8 @@ async def test_resolve_node_returns_obj_metadata(monkeypatch):
     fake_resp = MagicMock(success=lambda: True)
     fake_resp.data.node = MagicMock(obj_token="docx_xxx", obj_type="docx")
     fake_client = MagicMock()
-    fake_client.wiki.v2.space_node.get = lambda req: fake_resp
-    monkeypatch.setattr(wiki, "_client", lambda: fake_client)
+    fake_client.wiki.v2.space.get_node = lambda req: fake_resp
+    monkeypatch.setattr(wiki, "_lark_client", lambda: fake_client)
 
     out = await wiki.resolve_node("wikcnXXXXXX")
     assert out == {"obj_token": "docx_xxx", "obj_type": "docx"}
@@ -2839,9 +2942,15 @@ async def test_resolve_node_returns_obj_metadata(monkeypatch):
 """Wiki v2 wrapper — resolve a /wiki/<token> URL to its underlying object."""
 from __future__ import annotations
 
+import asyncio
+import lark_oapi as lark
 from lark_oapi.api.wiki.v2 import GetNodeSpaceRequest
 
-from .client import _client
+from feishu.client import feishu_client
+
+
+def _lark_client() -> lark.Client:
+    return feishu_client.client
 
 
 async def resolve_node(token: str) -> dict[str, str]:
@@ -2850,7 +2959,7 @@ async def resolve_node(token: str) -> dict[str, str]:
     obj_type is one of 'docx', 'sheet', 'bitable', 'mindnote', 'file'.
     """
     req = GetNodeSpaceRequest.builder().token(token).build()
-    resp = _client().wiki.v2.space_node.get(req)
+    resp = await asyncio.to_thread(_lark_client().wiki.v2.space.get_node, req)
     if not resp.success():
         raise RuntimeError(f"wiki.resolve_node failed: {resp.code} {resp.msg}")
     node = resp.data.node
@@ -2861,7 +2970,7 @@ async def resolve_node(token: str) -> dict[str, str]:
 
 ```bash
 git add bot/feishu/wiki.py bot/tests/test_feishu_wiki.py
-git commit -m "feat(feishu): wiki.v2 space_node resolver for /wiki/<token>"
+git commit -m "feat(feishu): wiki.v2 space resolver for /wiki/<token>"
 ```
 
 ### Task 4.9: feishu/links.py URL parser (NEW for spec v21)
@@ -3152,7 +3261,7 @@ git commit -m "feat(bootstrap): bot_workspace bootstrap script with lock + idemp
 - [ ] **Step 1: Write failing test for closure capture**
 
 ```python
-"""Verify that build_pmo_mcp(ctx) tools see the latest ctx mutation."""
+"""Verify that build_meta_mcp(ctx) tools see the latest ctx mutation."""
 import pytest
 
 from agent.request_context import RequestContext
@@ -3230,9 +3339,11 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from agent.request_context import RequestContext
 
 
-def build_meta_mcp(ctx: RequestContext):
-    """Factory: returns the meta MCP server bound to ctx. Called once per
-    _PooledClient. See spec §5.0.
+def build_meta_tools(ctx: RequestContext):
+    """Return tool definitions bound to ctx.
+
+    Tests call this helper directly so they can invoke `tool_def.handler`
+    without depending on private internals of the SDK's MCP server object.
     """
 
     @tool("today_iso", "...", {})
@@ -3248,14 +3359,21 @@ def build_meta_mcp(ctx: RequestContext):
     # get_activity_stats, generate_image (uses ctx.conversation_key)
     # resolve_people (Task 7.2), undo_last_action (Task 9.1)
 
+    return [
+        today_iso, list_users, lookup_user, get_recent_turns,
+        get_project_overview, get_activity_stats, generate_image,
+        resolve_people, undo_last_action,
+    ]
+
+
+def build_meta_mcp(ctx: RequestContext):
+    """Factory: returns the meta MCP server bound to ctx. Called once per
+    _PooledClient. See spec §5.0.
+    """
     return create_sdk_mcp_server(
         name="pmo_meta",  # ← name change cascades to allowed_tools prefix
         version="0.1.0",
-        tools=[
-            today_iso, list_users, lookup_user, get_recent_turns,
-            get_project_overview, get_activity_stats, generate_image,
-            resolve_people, undo_last_action,
-        ],
+        tools=build_meta_tools(ctx),
     )
 ```
 
@@ -3281,10 +3399,19 @@ The full test suite WILL break here because `runner.py` still references the old
 
 ### Task 6.2: Skeleton four new MCP module files
 
-> Each file gets a no-tool `build_<domain>_mcp(ctx)` factory. Real tools
-> are added later (Task Groups 7–9 for the read/write tools, Task 9 for
-> undo). Skeletons exist now so runner.py can register all 5 MCP servers
-> in one go.
+> Each file gets a `build_<domain>_tools(ctx)` helper, a
+> `build_<domain>_mcp(ctx)` factory, and one internal `_not_ready` tool.
+> The placeholder is not user-facing and MUST NOT be added to
+> `allowed_tools`. Tests call `build_<domain>_tools(ctx)` directly so
+> they can invoke `tool_def.handler(...)` without relying on SDK server
+> internals.
+>
+> Why the placeholder exists: the installed `claude_agent_sdk` only
+> registers MCP `tools/list` / `tools/call` handlers when `tools` is
+> truthy. A truly empty `tools=[]` SDK MCP server returns `Method
+> 'tools/list' not found` during initialization. The placeholder keeps
+> the server protocol-valid until real tools are added in Task Groups
+> 7–9.
 
 **Files:**
 - Create: `bot/agent/tools_calendar.py`
@@ -3299,16 +3426,30 @@ The full test suite WILL break here because `runner.py` still references the old
 """pmo_calendar MCP server — schedule_meeting, cancel_meeting,
 list_my_meetings. Real bodies land in Task Group 8 (write tools).
 """
-from claude_agent_sdk import create_sdk_mcp_server
+from typing import Any
+
+from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from agent.request_context import RequestContext
+
+
+def build_calendar_tools(ctx: RequestContext):
+    @tool(
+        "_calendar_not_ready",
+        "Internal placeholder so the SDK MCP server has protocol handlers before real tools land.",
+        {},
+    )
+    async def _calendar_not_ready(args: dict) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "{\"error\":\"calendar tools not implemented yet\"}"}], "isError": True}
+
+    return [_calendar_not_ready]
 
 
 def build_calendar_mcp(ctx: RequestContext):
     return create_sdk_mcp_server(
         name="pmo_calendar",
         version="0.1.0",
-        tools=[],  # filled by Tasks 8.1, 8.2, 8.3
+        tools=build_calendar_tools(ctx),  # replaced by Tasks 8.1, 8.2, 8.3
     )
 ```
 
@@ -3318,14 +3459,28 @@ def build_calendar_mcp(ctx: RequestContext):
 create_bitable_table, append_to_my_table, query_my_table,
 describe_my_table. Real bodies land in Tasks 7.7/7.8 + 8.4 + 8.8/8.9.
 """
-from claude_agent_sdk import create_sdk_mcp_server
+from typing import Any
+
+from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from agent.request_context import RequestContext
 
 
+def build_bitable_tools(ctx: RequestContext):
+    @tool(
+        "_bitable_not_ready",
+        "Internal placeholder so the SDK MCP server has protocol handlers before real tools land.",
+        {},
+    )
+    async def _bitable_not_ready(args: dict) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "{\"error\":\"bitable tools not implemented yet\"}"}], "isError": True}
+
+    return [_bitable_not_ready]
+
+
 def build_bitable_mcp(ctx: RequestContext):
     return create_sdk_mcp_server(
-        name="pmo_bitable", version="0.1.0", tools=[],
+        name="pmo_bitable", version="0.1.0", tools=build_bitable_tools(ctx),
     )
 ```
 
@@ -3335,14 +3490,28 @@ def build_bitable_mcp(ctx: RequestContext):
 Shared private helper `_drive_import_markdown` is defined here too.
 Real bodies land in Tasks 8.5, 8.6, 8.7.
 """
-from claude_agent_sdk import create_sdk_mcp_server
+from typing import Any
+
+from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from agent.request_context import RequestContext
 
 
+def build_doc_tools(ctx: RequestContext):
+    @tool(
+        "_doc_not_ready",
+        "Internal placeholder so the SDK MCP server has protocol handlers before real tools land.",
+        {},
+    )
+    async def _doc_not_ready(args: dict) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "{\"error\":\"doc tools not implemented yet\"}"}], "isError": True}
+
+    return [_doc_not_ready]
+
+
 def build_doc_mcp(ctx: RequestContext):
     return create_sdk_mcp_server(
-        name="pmo_doc", version="0.1.0", tools=[],
+        name="pmo_doc", version="0.1.0", tools=build_doc_tools(ctx),
     )
 ```
 
@@ -3352,14 +3521,28 @@ def build_doc_mcp(ctx: RequestContext):
 resolve_feishu_link. Read-any tools (no workspace gate). Real bodies
 land in Tasks 7.4, 7.5, 7.6.
 """
-from claude_agent_sdk import create_sdk_mcp_server
+from typing import Any
+
+from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from agent.request_context import RequestContext
 
 
+def build_external_tools(ctx: RequestContext):
+    @tool(
+        "_external_not_ready",
+        "Internal placeholder so the SDK MCP server has protocol handlers before real tools land.",
+        {},
+    )
+    async def _external_not_ready(args: dict) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "{\"error\":\"external tools not implemented yet\"}"}], "isError": True}
+
+    return [_external_not_ready]
+
+
 def build_external_mcp(ctx: RequestContext):
     return create_sdk_mcp_server(
-        name="pmo_external", version="0.1.0", tools=[],
+        name="pmo_external", version="0.1.0", tools=build_external_tools(ctx),
     )
 ```
 
@@ -3411,7 +3594,7 @@ class _PooledClient:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 ```
 
-- [ ] **Step 3: Update _get_client — register 5 MCP servers, expand allowed_tools**
+- [ ] **Step 3: Update _get_client — register 5 MCP servers, keep allowed_tools read-only for now**
 
 ```python
 async def _get_client(conversation_key: str) -> _PooledClient:
@@ -3422,7 +3605,10 @@ async def _get_client(conversation_key: str) -> _PooledClient:
             options = ClaudeAgentOptions(
                 system_prompt=SYSTEM_PROMPT,
                 allowed_tools=[
-                    # Read tools (existing) + new meta tools
+                    # Existing read tools only. Task 10 expands this list
+                    # after the real domain tools exist. Do NOT whitelist
+                    # future tool names while their modules still only carry
+                    # `_not_ready` placeholders.
                     "mcp__pmo_meta__list_users",
                     "mcp__pmo_meta__lookup_user",
                     "mcp__pmo_meta__get_recent_turns",
@@ -3430,27 +3616,6 @@ async def _get_client(conversation_key: str) -> _PooledClient:
                     "mcp__pmo_meta__get_activity_stats",
                     "mcp__pmo_meta__today_iso",
                     "mcp__pmo_meta__generate_image",
-                    "mcp__pmo_meta__resolve_people",
-                    "mcp__pmo_meta__undo_last_action",
-                    # Calendar
-                    "mcp__pmo_calendar__schedule_meeting",
-                    "mcp__pmo_calendar__cancel_meeting",
-                    "mcp__pmo_calendar__list_my_meetings",
-                    # Bitable
-                    "mcp__pmo_bitable__append_action_items",
-                    "mcp__pmo_bitable__query_action_items",
-                    "mcp__pmo_bitable__create_bitable_table",
-                    "mcp__pmo_bitable__append_to_my_table",
-                    "mcp__pmo_bitable__query_my_table",
-                    "mcp__pmo_bitable__describe_my_table",
-                    # Doc
-                    "mcp__pmo_doc__create_meeting_doc",
-                    "mcp__pmo_doc__create_doc",
-                    "mcp__pmo_doc__append_to_doc",
-                    # External (read-any)
-                    "mcp__pmo_external__read_doc",
-                    "mcp__pmo_external__read_external_table",
-                    "mcp__pmo_external__resolve_feishu_link",
                 ],
                 mcp_servers={
                     "pmo_meta": build_meta_mcp(ctx),
@@ -3470,10 +3635,10 @@ async def _get_client(conversation_key: str) -> _PooledClient:
         return slot
 ```
 
-> **Order of `allowed_tools` matters for the system prompt's tool
-> inventory section** — the agent reads tools in declaration order.
-> Group them by domain (meta → calendar → bitable → doc → external).
-> See spec §11 step 6.
+> Task 10 performs the full v21 whitelist rewrite once Tasks 7–9 have
+> replaced the `_not_ready` placeholders with real tools. Until then,
+> keeping the whitelist read-only preserves existing behavior for the
+> Task 6.5 regression smoke.
 
 - [ ] **Step 4: Update answer_streaming signature + ctx mutation**
 
@@ -3581,11 +3746,11 @@ display_name = _strip_pmo_prefix(tool_name)
 cd bot && pytest tests/ -v
 ```
 
-Expected: all pass. The new MCP modules have no tools yet, but
-`build_<domain>_mcp(ctx)` returns valid empty servers; the runner
-registers them; `allowed_tools` references future tools that don't
-exist yet (Claude Agent SDK is permissive: unmatched tool names just
-never fire).
+Expected: all pass. The new MCP modules expose only internal
+`_*_not_ready` placeholder tools so the SDK MCP protocol has
+`tools/list` / `tools/call` handlers. Those placeholders are NOT in
+`allowed_tools`; the whitelist remains the existing read-only meta
+tools until Task 10 expands it after real tools exist.
 
 - [ ] **Step 2: Manual smoke — read-only flow still works**
 
@@ -3616,7 +3781,7 @@ git commit -m "refactor(agent): split tools.py into 5 domain MCP modules + Reque
 
 # Task Group 7: Read tools (8 tasks — v21 expanded)
 
-> **Spec ref:** §3.1 (resolve_people), §3.2 (today_iso extension), §3.7 (query_action_items), §3.11 (read_doc), §3.13 (query_my_table), §3.14 (describe_my_table), §3.16 (read_external_table), §3.17 (resolve_feishu_link).
+> **Spec ref:** §3.1 (resolve_people), §3.2 (today_iso extension), §3.7 (query_action_items), §3.11 (read_doc), §3.15 (query_my_table), §3.16 (describe_my_table), §3.17 (read_external_table), §3.18 (resolve_feishu_link).
 >
 > Read tools are simpler than write tools — no Phase 2.X.5, no idempotency,
 > no `bot_actions` rows. Read-any tools (`read_doc`, `read_external_table`,
@@ -3659,7 +3824,7 @@ git commit -m "refactor(agent): split tools.py into 5 domain MCP modules + Reque
 
 ### Task 7.4: resolve_feishu_link (NEW v21)
 
-> **Spec ref:** §3.17. Pure URL → metadata resolver. Wires `feishu/links.py`
+> **Spec ref:** §3.18. Pure URL → metadata resolver. Wires `feishu/links.py`
 > + `feishu/wiki.py` so the LLM can paste a Feishu URL and get back
 > `{kind, token, ...}` for use in subsequent tool calls.
 
@@ -3670,19 +3835,19 @@ git commit -m "refactor(agent): split tools.py into 5 domain MCP modules + Reque
 - [ ] **Step 1: Failing test for docx + base + wiki redirect**
 
 ```python
+import json
 import pytest
 from unittest.mock import AsyncMock
 
 from agent.request_context import RequestContext
-from agent.tools_external import build_external_mcp
+from agent.tools_external import build_external_tools
 
 
 @pytest.mark.asyncio
 async def test_resolve_docx_url(monkeypatch):
     ctx = RequestContext()
-    server = build_external_mcp(ctx)
-    tool_fn = next(t for t in server._tools if t.name == "resolve_feishu_link")
-    out = await tool_fn({"url": "https://example.feishu.cn/docx/dxAAAA"})
+    tool_def = next(t for t in build_external_tools(ctx) if t.name == "resolve_feishu_link")
+    out = await tool_def.handler({"url": "https://example.feishu.cn/docx/dxAAAA"})
     assert out["content"][0]["text"] == json.dumps(
         {"kind": "docx", "token": "dxAAAA"}, ensure_ascii=False
     )
@@ -3696,9 +3861,8 @@ async def test_resolve_wiki_redirects(monkeypatch):
         AsyncMock(return_value={"obj_token": "dxBBBB", "obj_type": "docx"}),
     )
     ctx = RequestContext()
-    server = build_external_mcp(ctx)
-    tool_fn = next(t for t in server._tools if t.name == "resolve_feishu_link")
-    out = await tool_fn({"url": "https://example.feishu.cn/wiki/wikC"})
+    tool_def = next(t for t in build_external_tools(ctx) if t.name == "resolve_feishu_link")
+    out = await tool_def.handler({"url": "https://example.feishu.cn/wiki/wikC"})
     payload = json.loads(out["content"][0]["text"])
     assert payload == {"kind": "docx", "token": "dxBBBB", "via_wiki": "wikC"}
 ```
@@ -3736,7 +3900,7 @@ async def resolve_feishu_link(args: dict) -> dict:
         return _err(str(e))
 ```
 
-- [ ] **Step 3: Register tool in `build_external_mcp`**, run tests → green; commit:
+- [ ] **Step 3: Return tool from `build_external_tools`**, run tests → green; commit:
 
 ```bash
 git add bot/agent/tools_external.py bot/tests/test_tools_external_resolve_feishu_link.py
@@ -3745,7 +3909,10 @@ git commit -m "feat(tools): resolve_feishu_link — parse Feishu URL → {kind, 
 
 ### Task 7.5: read_doc (NEW v21)
 
-> **Spec ref:** §3.11. Read-any tool: any docx the bot can `docs:document:readonly`-access (or that the user shared with it). Walks blocks, renders to markdown, truncates at 50 KB.
+> **Spec ref:** §3.11. Read-any tool: any docx the bot can
+> `docs:document:readonly`-access (or that the user shared with it).
+> Walks blocks, renders to markdown, truncates at `max_chars` (default
+> 20000 characters).
 
 **Files:**
 - Modify: `bot/agent/tools_external.py`
@@ -3768,9 +3935,8 @@ async def test_read_doc_renders_blocks(monkeypatch):
     monkeypatch.setattr(docx, "list_blocks", AsyncMock(return_value=fake_blocks))
 
     ctx = RequestContext()
-    server = build_external_mcp(ctx)
-    tool_fn = next(t for t in server._tools if t.name == "read_doc")
-    out = await tool_fn({"document_id": "doc_xxx"})
+    tool_def = next(t for t in build_external_tools(ctx) if t.name == "read_doc")
+    out = await tool_def.handler({"doc_link_or_token": "doc_xxx"})
     payload = json.loads(out["content"][0]["text"])
     assert "Hello world" in payload["markdown"]
     assert "## Section A" in payload["markdown"]
@@ -3785,9 +3951,8 @@ async def test_read_doc_403_returns_friendly_error(monkeypatch):
         AsyncMock(side_effect=RuntimeError("docx.list_blocks failed: 99991663 PermissionDenied")),
     )
     ctx = RequestContext()
-    server = build_external_mcp(ctx)
-    tool_fn = next(t for t in server._tools if t.name == "read_doc")
-    out = await tool_fn({"document_id": "doc_xxx"})
+    tool_def = next(t for t in build_external_tools(ctx) if t.name == "read_doc")
+    out = await tool_def.handler({"doc_link_or_token": "doc_xxx"})
     assert out["isError"] is True
     payload = json.loads(out["content"][0]["text"])
     assert "PermissionDenied" in payload["error"] or "403" in payload["error"]
@@ -3796,9 +3961,14 @@ async def test_read_doc_403_returns_friendly_error(monkeypatch):
 - [ ] **Step 2: Implement (with markdown renderer for text/heading/list/code/quote/table block types per spec §3.11)**
 
 Key behaviors:
-- Walk via `feishu.docx.list_blocks(document_id)`.
+- Normalize `doc_link_or_token`: if it looks like a Feishu URL, call
+  `resolve_feishu_link` first; otherwise treat it as a raw docx token.
+- Walk via `feishu.docx.list_blocks(doc_token)`.
 - Render each block to markdown using a `_render_block(block)` helper (see spec §3.11 mapping).
-- After rendering, truncate at 50 000 characters; set `truncated=True` and append `"…(truncated; ask for next section by block_id)"` so the LLM can decide to call again with `start_block_id`.
+- After rendering, truncate at `max_chars` (default 20000); set
+  `truncated=True` and append the spec's clear truncation marker. v21
+  does **not** expose `start_block_id`; if the user needs more, the
+  bot should ask for a narrower section or a smaller pasted excerpt.
 - Map Feishu's `99991663` (Permission denied) to a friendly error message that suggests the user share the doc.
 
 - [ ] **Step 3: Run tests → green; commit:**
@@ -3810,9 +3980,10 @@ git commit -m "feat(tools): read_doc — render arbitrary docx to markdown"
 
 ### Task 7.6: read_external_table (NEW v21)
 
-> **Spec ref:** §3.16. Read-any bitable. Rate-limited to 5 calls per hour
+> **Spec ref:** §3.17. Read-any bitable. Rate-limited to 5 calls per hour
 > per `conversation_key` (in-memory deque per slot, reset on bot restart).
-> Page size capped at 100; offset-paginated.
+> `page_size` defaults to 50 and is capped at 200. Pagination uses
+> Feishu `page_token` / `next_page_token`, not offset.
 
 **Files:**
 - Modify: `bot/agent/tools_external.py`
@@ -3822,7 +3993,11 @@ git commit -m "feat(tools): read_doc — render arbitrary docx to markdown"
 
 (Use `freezegun` to advance time across the rate-limit window.)
 
-- [ ] **Step 2: Implement** with module-level `_external_table_calls: dict[str, deque[float]]` keyed by `ctx.conversation_key`. Drop entries older than 3600s. Returns `{records, has_more, next_page_token}` shape.
+- [ ] **Step 2: Implement** with module-level `_external_table_calls:
+  `dict[str, deque[float]]` keyed by `ctx.conversation_key`. Drop
+  entries older than 3600s. Normalize `base_link_or_app_token` via
+  `resolve_feishu_link` for URL inputs, pass through `page_token`, cap
+  `page_size` at 200, and return `{records, has_more, next_page_token}`.
 
 - [ ] **Step 3: Run tests → green; commit:**
 
@@ -3833,7 +4008,7 @@ git commit -m "feat(tools): read_external_table with 5/hour rate limit"
 
 ### Task 7.7: describe_my_table (NEW v21)
 
-> **Spec ref:** §3.14. Returns the schema (field name + field_type) of one
+> **Spec ref:** §3.16. Returns the schema (field name + field_type) of one
 > of the bot's own bitable tables. Workspace gate: refuse any
 > `app_token != ws.base_app_token`. Refuse `table_id == ws.action_items_table_id`
 > (LLM should use `query_action_items` for that).
@@ -3850,8 +4025,9 @@ git commit -m "feat(tools): read_external_table with 5/hour rate limit"
 
 ### Task 7.8: query_my_table (NEW v21)
 
-> **Spec ref:** §3.13. Same workspace gate as 7.7. Filter/sort syntax mirrors
-> `query_action_items`. Page size capped at 100. Returns `{records, has_more}`.
+> **Spec ref:** §3.15. Same workspace gate as 7.7. Filter/sort syntax mirrors
+> `query_action_items`. `page_size` defaults to 50 and is capped at 200.
+> Returns `{records, has_more, next_page_token}`.
 
 **Files:**
 - Modify: `bot/agent/tools_bitable.py`
@@ -3875,7 +4051,9 @@ git commit -m "feat(tools): read_external_table with 5/hour rate limit"
 > the same workspace gate + Phase -1 / 0 / 1 / 2.X / 2.X.5 / 3 pattern;
 > append_to_doc additionally enforces an authorship gate (the doc must
 > have been created by the bot, identified by a `bot_actions` row with
-> `action_type IN ('create_doc','create_meeting_doc','append_to_doc')`).
+> `target_kind='docx'` and
+> `action_type IN ('create_doc','create_meeting_doc')`; prior append
+> rows do not grant authorship).
 >
 > **File mapping** (where each tool body lives — important since the spec
 > v21 split MCP modules):
@@ -3893,7 +4071,7 @@ git commit -m "feat(tools): read_external_table with 5/hour rate limit"
 #### Task 8.1a: schedule_meeting Phase -1 + 0 (validation + Phase 0 dedup)
 
 **Files:**
-- Modify: `bot/agent/tools_calendar.py` (add `schedule_meeting` inner function inside `build_calendar_mcp(ctx)`)
+- Modify: `bot/agent/tools_calendar.py` (add `schedule_meeting` inner function inside `build_calendar_tools(ctx)`)
 - Test: `bot/tests/test_tools_calendar_schedule_meeting.py`
 
 - [ ] **Step 1: Write the first three failing tests**
@@ -3907,8 +4085,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent import tools as agent_tools
 from agent.request_context import RequestContext
+from agent.tools_calendar import build_calendar_tools
 
 
 @pytest.fixture
@@ -3922,14 +4100,13 @@ def ctx():
 @pytest.fixture
 def schedule_meeting(ctx, monkeypatch):
     """Build the MCP server fresh per test, return the schedule_meeting handler."""
-    server = agent_tools.build_pmo_mcp(ctx)
-    # The MCP server stores tools by name; pull out schedule_meeting
-    return next(t for t in server.tools if t.name == "schedule_meeting")
+    tool_def = next(t for t in build_calendar_tools(ctx) if t.name == "schedule_meeting")
+    return tool_def.handler
 
 
 @pytest.mark.asyncio
 async def test_phase_minus_1_rejects_missing_required_args(schedule_meeting):
-    result = await schedule_meeting.handler({"title": "X"})  # no start_time, no attendees
+    result = await schedule_meeting({"title": "X"})  # no start_time, no attendees
     assert result["isError"] is True
     body = result["content"][0]["text"]
     assert "start_time" in body or "attendee_open_ids" in body
@@ -3937,7 +4114,7 @@ async def test_phase_minus_1_rejects_missing_required_args(schedule_meeting):
 
 @pytest.mark.asyncio
 async def test_phase_minus_1_rejects_non_rfc3339_start_time(schedule_meeting):
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "tomorrow 3pm",
         "attendee_open_ids": ["ou_a"],
     })
@@ -3957,7 +4134,7 @@ async def test_phase_minus_1_allows_empty_attendees_when_asker_auto_included(
             "result": {"event_id": "evt_self", "link": "https://..."},
         },
     )
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "Focus block",
         "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": [],
@@ -3978,7 +4155,7 @@ async def test_phase_0_returns_dedup_when_logical_key_locked(
             "result": {"event_id": "evt_prior", "link": "https://..."},
         },
     )
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X",
         "start_time": "2026-05-08T15:00:00+08:00",
         "duration_minutes": 30,
@@ -3995,7 +4172,7 @@ async def test_phase_0_returns_dedup_when_logical_key_locked(
 cd bot && pytest tests/test_tools_schedule_meeting.py -v
 ```
 
-- [ ] **Step 3: Implement the skeleton in `tools.py` inside `build_pmo_mcp(ctx)`**
+- [ ] **Step 3: Implement the skeleton in `tools_calendar.py` inside `build_calendar_tools(ctx)`**
 
 ```python
 @tool(
@@ -4100,7 +4277,7 @@ async def test_phase_1a_success_returns_cached_no_feishu_call(schedule_meeting, 
         "result": {"event_id": "evt_existing", "link": "https://..."},
     })
     # No Feishu mocks → if any are called, AttributeError
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
     })
@@ -4114,7 +4291,7 @@ async def test_phase_1a_pending_returns_in_flight(schedule_meeting, monkeypatch)
     monkeypatch.setattr("db.queries.get_bot_action", lambda mid, at: {
         "status": "pending", "result": {},
     })
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
     })
@@ -4130,7 +4307,7 @@ async def test_phase_1a_reconciled_unknown_partial_returns_undo_prompt(schedule_
         "target_id": "evt_orphan",
         "result": {"reconciliation_kind": "partial_success"},
     })
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
     })
@@ -4153,7 +4330,7 @@ async def test_phase_1a_failed_calls_update_for_retry_then_continues(schedule_me
     monkeypatch.setattr("db.queries.update_for_retry", fake_retry)
     monkeypatch.setattr("db.queries.get_bot_workspace", lambda: None)  # Phase 2.0 fails
 
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
     })
@@ -4167,7 +4344,7 @@ async def test_phase_1a_undone_rejects_fresh_request(schedule_meeting, monkeypat
     monkeypatch.setattr("db.queries.get_bot_action", lambda mid, at: {
         "status": "undone", "result": {},
     })
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
     })
@@ -4274,7 +4451,7 @@ async def test_phase_1_happy_inserts_pending_and_continues(schedule_meeting, mon
     monkeypatch.setattr(
         "db.queries.get_bot_workspace", lambda: None,  # → Phase 2.0 fails
     )
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X",
         "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
@@ -4296,7 +4473,7 @@ async def test_phase_1_message_conflict_returns_cached_success(
         })
     monkeypatch.setattr("db.queries.insert_bot_action_pending", fake_insert)
 
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
     })
@@ -4317,7 +4494,7 @@ async def test_phase_1_logical_conflict_returns_dedup_or_in_flight(
         })
     monkeypatch.setattr("db.queries.insert_bot_action_pending", fake_insert)
 
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],
     })
@@ -4399,7 +4576,7 @@ async def test_phase_2_0_unions_asker_into_attendees(
         "db.queries.mark_bot_action_success", lambda *a, **kw: {"id": "u-1"},
     )
 
-    result = await schedule_meeting.handler({
+    result = await schedule_meeting({
         "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
         "attendee_open_ids": ["ou_a"],  # NOT including the asker
     })
@@ -4648,9 +4825,10 @@ async def test_create_doc_happy_path(monkeypatch, fake_ctx):
 > **Spec ref:** §3.12. Append a markdown snippet as new blocks at the end of
 > a doc the bot owns. **Authorship gate**: refuse unless the document is
 > referenced as `target_id` in some `bot_actions WHERE action_type IN
-> ('create_doc','create_meeting_doc','append_to_doc') AND status IN
-> ('success','reconciled_unknown')`. Save the new `block_ids` in
-> `result.block_ids` so undo can `docx.delete_blocks(parent, block_ids)`.
+> ('create_doc','create_meeting_doc') AND target_kind='docx' AND status IN
+> ('success','reconciled_unknown')`. Save the new block IDs in
+> `result.appended_block_ids` plus `result.parent_block_id` so undo can
+> call `docx.delete_blocks(document_id, parent_block_id, block_ids)`.
 
 **Files:**
 - Modify: `bot/agent/tools_doc.py`
@@ -4661,14 +4839,19 @@ async def test_create_doc_happy_path(monkeypatch, fake_ctx):
 - [ ] **Step 2: Implement**:
   - Phase -1: workspace + authorship gate via new `queries.is_doc_authored_by_bot(doc_token)` helper (one SELECT against `bot_actions`).
   - Phase 0/1: standard skeleton.
-  - Phase 2: render markdown to docx blocks, call `feishu.docx.append_blocks(document_id=doc_token, parent_block_id=<root>, children=blocks)`; capture returned `block_ids`.
-  - Phase 2.5: `record_bot_action_target_pending(target_kind='docx_block_append', target_id=doc_token, result={"block_ids": [...], "parent_block_id": <root>})`.
+  - Phase 2: render markdown to docx blocks, prepend the
+    `<!-- bot_action_id=<row.id> -->` marker block, list current root
+    children for reconciliation context, then call
+    `feishu.docx.append_blocks(document_id=doc_token,
+    parent_block_id=<root>, children=blocks, client_token=row.id)`;
+    capture returned `block_ids`.
+  - Phase 2.5: `record_bot_action_target_pending(target_kind='docx_block_append', target_id=doc_token, result={"appended_block_ids": [...], "parent_block_id": <root>, "append_marker_block_id": <first marker block id>})`.
   - Phase 3: `mark_bot_action_success`.
 - [ ] **Step 3: Commit:** `feat(tools): append_to_doc with authorship gate + block-id capture`
 
 ### Task 8.8: create_bitable_table (NEW v21 — schema-defined table inside bot's base)
 
-> **Spec ref:** §3.15. Create a new table inside `ws.base_app_token`. Workspace
+> **Spec ref:** §3.13. Create a new table inside `ws.base_app_token`. Workspace
 > gate: refuse any other `app_token`. Validates field type names against the
 > Feishu enum (text / number / single_select / multi_select / date / user / etc.).
 
@@ -4686,7 +4869,7 @@ async def test_create_doc_happy_path(monkeypatch, fake_ctx):
 
 ### Task 8.9: append_to_my_table (NEW v21 — write rows to a bot-owned table)
 
-> **Spec ref:** §3.18. Same workspace gate. Refuses
+> **Spec ref:** §3.14. Same workspace gate. Refuses
 > `table_id == ws.action_items_table_id` and redirects the LLM to
 > `append_action_items` (which has the project-disambiguation Phase -1 flow).
 
@@ -4724,8 +4907,8 @@ async def test_create_doc_happy_path(monkeypatch, fake_ctx):
 ```python
 import pytest
 from unittest.mock import MagicMock
-from agent import tools as agent_tools
 from agent.request_context import RequestContext
+from agent.tools_meta import build_meta_tools
 from db import queries
 
 
@@ -4738,8 +4921,8 @@ def ctx():
 
 @pytest.fixture
 def undo(ctx):
-    server = agent_tools.build_pmo_mcp(ctx)
-    return next(t for t in server.tools if t.name == "undo_last_action")
+    tool_def = next(t for t in build_meta_tools(ctx) if t.name == "undo_last_action")
+    return tool_def.handler
 
 
 @pytest.mark.asyncio
@@ -4748,7 +4931,7 @@ async def test_last_is_in_flight_returns_friendly_message(undo, monkeypatch):
         "db.queries.last_bot_action_for_sender_in_chat",
         lambda **kw: queries.LastIsInFlight,
     )
-    result = await undo.handler({"last_for_me": True})
+    result = await undo({"last_for_me": True})
     body = result["content"][0]["text"]
     assert "still" in body.lower() or "进行中" in body
 
@@ -4759,7 +4942,7 @@ async def test_last_was_unreachable_returns_explicit_refusal(undo, monkeypatch):
         "db.queries.last_bot_action_for_sender_in_chat",
         lambda **kw: queries.LastWasUnreachable,
     )
-    result = await undo.handler({"last_for_me": True})
+    result = await undo({"last_for_me": True})
     body = result["content"][0]["text"]
     # Spec §3.9: must NOT silently fall through to older row
     assert "无法自动撤销" in body or "请人工" in body
@@ -4770,7 +4953,7 @@ async def test_no_target_returns_no_op(undo, monkeypatch):
     monkeypatch.setattr(
         "db.queries.last_bot_action_for_sender_in_chat", lambda **kw: None,
     )
-    result = await undo.handler({"last_for_me": True})
+    result = await undo({"last_for_me": True})
     assert "no recent action" in result["content"][0]["text"].lower() \
         or "没找到" in result["content"][0]["text"]
 
@@ -4784,7 +4967,7 @@ async def test_target_id_kind_resolves_source_row_in_current_chat(undo, monkeypa
             "status": "success", "target_id": "evt_x", "target_kind": "calendar_event",
         },
     )
-    result = await undo.handler({"target_id": "evt_x", "target_kind": "calendar_event"})
+    result = await undo({"target_id": "evt_x", "target_kind": "calendar_event"})
     assert "undo dispatch for schedule_meeting" in result["content"][0]["text"]
 ```
 
@@ -4882,7 +5065,7 @@ async def test_undo_schedule_deletes_event_and_marks_undone(undo, monkeypatch):
         lambda action_id: captured.setdefault("undone", action_id),
     )
 
-    result = await undo.handler({"last_for_me": True})
+    result = await undo({"last_for_me": True})
     assert captured["delete"] == ("cal_bot", "evt_x")
     assert captured["undone"] == "u-1"
 
@@ -4910,7 +5093,7 @@ async def test_undo_schedule_404_treated_as_success(undo, monkeypatch):
         "db.queries.retire_source_action",
         lambda action_id: captured.setdefault("undone", action_id),
     )
-    result = await undo.handler({"last_for_me": True})
+    result = await undo({"last_for_me": True})
     assert captured["undone"] == "u-1"  # marked undone despite 404
     assert "isError" not in result or result.get("isError") is not True
 ```
@@ -5008,39 +5191,41 @@ This is the most complex undo path. Reference spec §3.9 cancel_meeting branch v
 
 - [ ] **Failing tests** — one test per action_type, asserting target_kind dispatch and 404-as-success:
   - `action_type='create_doc', target_kind='docx'` → `drive.delete_file(token=target_id, type='docx')` + `.md` cleanup; both 404-tolerant.
-  - `action_type='append_to_doc', target_kind='docx_block_append'` → `docx.delete_blocks(document_id=target_id, parent_block_id=result.parent_block_id, block_ids=result.block_ids)`; missing-block 404 → success. **Does NOT delete the doc itself** — only the blocks this action appended.
+  - `action_type='append_to_doc', target_kind='docx_block_append'` → `docx.delete_blocks(document_id=target_id, parent_block_id=result.parent_block_id, block_ids=result.appended_block_ids)`; missing stored block IDs → success/already deleted. **Does NOT delete the doc itself** — only the blocks this action appended.
   - `action_type='create_bitable_table', target_kind='bitable_table'` → `bitable.delete_table(app_token=ws.base_app_token, table_id=target_id)`; 404 OK.
   - `action_type='append_to_my_table', target_kind='bitable_records'` → `bitable.batch_delete_records(app_token=ws.base_app_token, table_id=target_id, record_ids=result.record_ids)`; per-record 404 tolerated and reported as `{partial: true, deleted: N, missing: M}`.
 
-- [ ] **Implementation**: extend the dispatcher in `tools_meta.undo_last_action` (Task 9.1a's match-statement) with these four new arms. Each arm transitions the source row `success → undone` via `retire_source_action(row.id)` and writes a new audit row of `action_type=f'undo_{source_action_type}'`.
+- [ ] **Implementation**: extend the dispatcher in `tools_meta.undo_last_action` (Task 9.1a's match-statement) with these four new arms. Each arm transitions the source row `success → undone` via `retire_source_action(row.id)` and writes a trace-only audit row with `action_type='undo_last_action'`, `target_id=<original action_id>`, `target_kind='bot_action_undo'`, and `result.source_action_type=<source action_type>`. Do NOT create `undo_create_doc` / `undo_append_to_doc` action types — those would pass the undoable predicate and reintroduce undo-of-undo.
 
 - [ ] **Commit**: `feat(tools): undo dispatch for create_doc / append_to_doc / create_bitable_table / append_to_my_table`
 
 ---
 
-# Task Group 10: Wire into agent runner (1 task — v21 simplified)
+# Task Group 10: Wire into agent runner (1 task)
 
-> **v21 change**: the original 10.1 ("expand allowed_tools") is now done
-> as part of Task 6.3 (since 6.3 had to register all 5 MCP servers
-> together for the runner to start at all). What's left is the
-> SYSTEM_PROMPT update.
+> Task 6.3 registers all 5 MCP servers but intentionally keeps
+> `allowed_tools` limited to the existing read-only meta tools. This
+> task performs the full v21 whitelist rewrite only after Tasks 7–9
+> have replaced the `_not_ready` placeholders with real tools.
 
-### Task 10.1: Replace SYSTEM_PROMPT tool inventory + read-only sentence
+### Task 10.1: Expand allowed_tools + replace SYSTEM_PROMPT tool inventory
 
 **Files:**
-- Modify: `bot/agent/runner.py` (`SYSTEM_PROMPT` constant)
+- Modify: `bot/agent/runner.py` (`allowed_tools` + `SYSTEM_PROMPT` constant)
 
 Per spec §9 + §10 row 122 (v21 expansion):
 
-1. Replace the tool inventory list (around `runner.py:84`) to include all
+1. Replace the `allowed_tools` list (Task 6.3 left it read-only) with
+   the full domain-grouped v21 list from spec §11 step 6.
+2. Replace the tool inventory list (around `runner.py:84`) to include all
    18 tools, grouped by domain:
    - **Meta**: today_iso, list_users, lookup_user, get_recent_turns, get_project_overview, get_activity_stats, generate_image, resolve_people, undo_last_action
    - **Calendar**: schedule_meeting, cancel_meeting, list_my_meetings
    - **Bitable**: append_action_items, query_action_items, create_bitable_table, append_to_my_table, query_my_table, describe_my_table
    - **Doc**: create_meeting_doc, create_doc, append_to_doc
    - **External (read-any)**: read_doc, read_external_table, resolve_feishu_link
-2. Remove the "这是只读问答助手" / "你不能：写代码、改文件、跑命令" lines.
-3. Append the v21 directive block (extends §9 with the new tools):
+3. Remove the "这是只读问答助手" / "你不能：写代码、改文件、跑命令" lines.
+4. Append the v21 directive block (extends §9 with the new tools):
    ```
    你现在可以在飞书做事，不只是回答问题。
 
@@ -5123,15 +5308,15 @@ Each scenario is a checkbox item — verify in Feishu UI + DB:
 #### v21 additions (spec §11 step 9 v21)
 
 - [ ] **v21 / §3.10 create_doc**: ask the bot to "起草一份关于 X 的笔记，保存到文档柜". Confirm a Docx is created in the bot's docs folder and a `bot_actions` row exists with `action_type='create_doc', target_kind='docx'`. The doc title and body match what the LLM produced.
-- [ ] **v21 / §3.12 append_to_doc authorship gate**: ask the bot to "在我刚才那篇笔记后面追加一段进度". Confirm new blocks appear at the end of the same doc; `bot_actions` row has `target_kind='docx_block_append'` and `result.block_ids` is non-empty. Then paste a Feishu doc URL the bot did NOT create and ask for an append — confirm refusal with an authorship-gate message.
+- [ ] **v21 / §3.12 append_to_doc authorship gate**: ask the bot to "在我刚才那篇笔记后面追加一段进度". Confirm new blocks appear at the end of the same doc; `bot_actions` row has `target_kind='docx_block_append'`, `result.appended_block_ids` is non-empty, and `result.parent_block_id` is set. Then paste a Feishu doc URL the bot did NOT create and ask for an append — confirm refusal with an authorship-gate message.
 - [ ] **v21 / §3.12 undo append_to_doc deletes only the new blocks**: undo the append above; confirm the appended blocks vanish but the original doc body is intact, and the source `create_doc` row remains `success` (NOT `undone`).
-- [ ] **v21 / §3.15 create_bitable_table**: ask the bot to "建一张多维表，叫『风险登记』，字段：标题/责任人/状态". Confirm new table appears in the bot's base; `bot_actions` row has `target_kind='bitable_table'`.
-- [ ] **v21 / §3.18 append_to_my_table redirects action_items**: ask the bot to write a row into the `action_items` table directly via `append_to_my_table` — confirm tool refuses and the LLM (per system prompt) falls back to `append_action_items`.
-- [ ] **v21 / §3.13 query_my_table workspace gate**: ask the bot to query a table in some external base (paste an unrelated `app_token` via the args). Confirm refusal with workspace-gate message.
+- [ ] **v21 / §3.13 create_bitable_table**: ask the bot to "建一张多维表，叫『风险登记』，字段：标题/责任人/状态". Confirm new table appears in the bot's base; `bot_actions` row has `target_kind='bitable_table'`.
+- [ ] **v21 / §3.14 append_to_my_table redirects action_items**: ask the bot to write a row into the `action_items` table directly via `append_to_my_table` — confirm tool refuses and the LLM (per system prompt) falls back to `append_action_items`.
+- [ ] **v21 / §3.15 query_my_table workspace gate**: ask the bot to query a table in some external base (paste an unrelated `app_token` via the args). Confirm refusal with workspace-gate message.
 - [ ] **v21 / §3.11 read_doc happy path**: share a docx with the bot, ask "把这篇文档总结成 3 点" → confirm the bot calls `read_doc` and returns a summary based on actual content (markdown rendering preserves headings + lists).
-- [ ] **v21 / §3.11 read_doc 50KB truncation**: paste a very long doc (>50 KB rendered) → confirm `truncated=true` in tool result and the bot's reply mentions it asked for the next chunk by `start_block_id` (or summarizes only the visible portion).
-- [ ] **v21 / §3.16 read_external_table rate limit**: in one chat, ask the bot 6 times in quick succession to read different external bitables → confirm the 6th call returns the rate-limit error and the bot apologizes + suggests text description.
-- [ ] **v21 / §3.17 resolve_feishu_link wiki redirect**: paste a `/wiki/<token>` URL whose underlying object is a docx → confirm the bot internally calls `resolve_feishu_link` (visible in tool trace), gets back `{kind: 'docx', token: '...', via_wiki: '...'}`, then proceeds to `read_doc`.
+- [ ] **v21 / §3.11 read_doc 20000-character truncation**: paste a very long doc (>20000 rendered chars) → confirm `truncated=true` in tool result and the bot's reply mentions it only saw the returned prefix / asks for a narrower section if needed.
+- [ ] **v21 / §3.17 read_external_table rate limit**: in one chat, ask the bot 6 times in quick succession to read different external bitables → confirm the 6th call returns the rate-limit error and the bot apologizes + suggests text description.
+- [ ] **v21 / §3.18 resolve_feishu_link wiki redirect**: paste a `/wiki/<token>` URL whose underlying object is a docx → confirm the bot internally calls `resolve_feishu_link` (visible in tool trace), gets back `{kind: 'docx', token: '...', via_wiki: '...'}`, then proceeds to `read_doc`.
 
 - [ ] **Step 3: Document failures in `docs/specs/2026-05-02-pmo-bot-write-tools-design.md` §10 omissions table for follow-up**
 

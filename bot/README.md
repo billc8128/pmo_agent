@@ -16,7 +16,9 @@ AI-coding activity recorded in pmo_agent.
   via the Anthropic-compatible protocol
 - **Memory**: a `ClaudeSDKClient` per `(chat_id, sender_id)`,
   garbage-collected after 30 min idle
-- **Data**: read-only Supabase via anon key + RLS
+- **Data**: Supabase anon key for public read tools, plus server-only
+  service-role key for Feishu identity lookup, `bot_workspace`, and
+  `bot_actions` write-tool state
 
 ## Tools the agent can call
 
@@ -34,13 +36,29 @@ the Supabase client.
 
 ```bash
 cp .env.example .env
-# fill in real credentials
+# fill in real credentials, including server-only SUPABASE_SERVICE_ROLE_KEY
 pip install -r requirements.txt
 uvicorn app:app --reload --port 8080
 ```
 
 Then expose locally for Feishu to reach (e.g. `ngrok http 8080`) and
 paste the URL into the Feishu app's event subscription.
+
+## Feishu Permission Scopes
+
+Before running `python -m scripts.bootstrap_bot_workspace`, enable the
+bot app's tenant-token permissions in Feishu Open Platform. The write
+tools need calendar, Bitable, Docx/Drive, and contact scopes. At a
+minimum, bootstrap currently requires:
+
+- `calendar:calendar` or `calendar:calendar:create`
+
+The full PMO write-tool surface also uses calendar event/freebusy,
+Bitable app/table/record, Drive file/folder/import, Docx block, Wiki
+resolve, and contact directory APIs. If a bootstrap or smoke-test call
+returns Feishu `99991672 Access denied`, open the authorization URL in
+the error message, grant the listed scope, publish/enable the app
+permission, and rerun the failed command.
 
 ## Deploy
 

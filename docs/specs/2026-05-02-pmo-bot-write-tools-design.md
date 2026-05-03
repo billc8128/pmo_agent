@@ -8,8 +8,10 @@
   assistant that can also act on Feishu.
 
 This spec is the source of truth for the "包工头" bot's first set of
-**write-side** capabilities. Read-only tools (`list_users`,
-`get_recent_turns`, etc.) defined in `bot/agent/tools.py` are unaffected.
+**write-side** capabilities. Existing read-only tools (`list_users`,
+`get_recent_turns`, etc.) move from `bot/agent/tools.py` to
+`bot/agent/tools_meta.py` during the v21 MCP split, but their behavior
+is otherwise unchanged.
 
 ---
 
@@ -127,8 +129,8 @@ user when the restore happens. It is still strictly better than
    └──────────┬────────────┘
               │
    ┌──────────┴────────────┐
-   │ bot/agent/tools.py    │   8 new tools, write tools use three-phase pattern
-   └──────────┬────────────┘
+   │ bot/agent/tools_*.py  │   5 domain MCP servers; write tools use
+   └──────────┬────────────┘   the three-phase pattern
               │
    ┌──────────┴────────────┐
    │ bot/db/queries.py     │   bot_actions + bot_workspace queries
@@ -183,10 +185,11 @@ runtime gating.
   tools enforce this at the tool-body level: refuse if `app_token` /
   `parent_folder` doesn't match. `append_to_doc` additionally requires
   the target `doc_token` to appear in `bot_actions WHERE
-  target_kind='docx' AND status='success'` AND
-  `(action_type='create_doc' OR action_type='create_meeting_doc' OR
-  action_type='append_to_doc')` — i.e. bot must be the author of the
-  document, not just somebody with edit permission.
+  target_kind='docx' AND status IN ('success','reconciled_unknown')`
+  AND `action_type IN ('create_doc','create_meeting_doc')` — i.e. bot
+  must be the author of the document, not just somebody with edit
+  permission. Prior `append_to_doc` rows never grant authorship; an
+  append can only derive authority from the original bot-created doc.
 - **`bot's own + user primary`**: `list_my_meetings` reads two
   result sets (§3.5) — `bot_known_events` from `bot_actions`,
   `user_calendar_events` from the asker's primary calendar. The
@@ -1707,10 +1710,13 @@ with that `source_action_id`.
 
 For `append_to_doc` undo, the dispatch reads
 `result.appended_block_ids` and calls
-`docx.v1.document_block_children.batch_delete` to remove exactly
-those blocks (spec rationale in §3.12). 404 on individual block IDs
-is treated the same as for batch_delete: missing means already-gone,
-fine, finalize when none remain.
+`feishu.docx.delete_blocks(document_id=target_id,
+parent_block_id=result.parent_block_id,
+block_ids=result.appended_block_ids)` to remove exactly those blocks
+(spec rationale in §3.12). The wrapper re-lists current children and
+deletes by `start_index` / `end_index` ranges because the installed
+lark-oapi SDK has no `block_ids(...)` delete builder. Missing stored
+block IDs mean already-gone; finalize when none remain.
 
 ---
 
@@ -1774,12 +1780,11 @@ doc_token they otherwise know), return Markdown content.
 **Implementation**:
 1. If input contains `/docx/` or `/wiki/`, extract token via
    `resolve_feishu_link` (handle wiki → docx redirect; spec §3.18).
-2. Call `docx.v1.document.raw_content(document_id=doc_token)` —
-   the SDK exposes a `raw_content` method that returns plain text;
-   we want **the structured block tree** to render to markdown
-   faithfully, so use `docx.v1.document_block.list(...)` instead and
+2. Call `docx.v1.document_block.list(document_id=doc_token)` and
    convert blocks to markdown ourselves (paragraph → text, heading →
-   `# / ## / ###`, bullet list → `-`, code block → fenced).
+   `# / ## / ###`, bullet list → `-`, code block → fenced). Do not
+   use `document.raw_content`: it returns plain text and loses the
+   structure we need for useful summaries.
 3. Truncate to `max_chars`.
 4. Return `{markdown, doc_token, title, char_count, truncated: bool}`.
 
@@ -1815,8 +1820,9 @@ target doc was created by the bot:
 auth_row = queries.get_bot_action_by_target(
     target_id=doc_token, target_kind='docx',
     action_type_in=['create_doc', 'create_meeting_doc'],
+    status_in=['success', 'reconciled_unknown'],
 )
-if auth_row is None or auth_row['status'] != 'success':
+if auth_row is None:
     return _err(
         "我只能改我自己创建的文档。这个文档不是我建的，"
         "请直接在飞书里编辑，或者让我新建一个相关的文档"
@@ -1835,15 +1841,26 @@ distinguish "edit because shared" from "edit because authored").
 - Phase 2.1: parse `markdown_body` into Docx blocks (use the same
   block-converter as Path B fallback would have — heading → heading,
   paragraph → text, code → code block, etc.)
-- Phase 2.2: `docx.v1.document_block_children.create(...)` to append
-  blocks at the document end. The response includes the newly-created
+- Phase 2.2: before appending, list the target parent block's
+  current children (`document_block_children.get`) so undo can later
+  reason about indexes. Then call
+  `docx.v1.document_block_children.create(...)` at the document end
+  with `client_token=<bot_actions.id>` (`row.id`) so a retry across
+  the Phase 2 ↔ 2.2.5 crash window does not create a second copy of
+  the same appended blocks. The response includes the newly-created
   `block_ids`.
 - Phase 2.2.5: `record_bot_action_target_pending` with
   `target_id=<doc_token>`, `target_kind='docx_block_append'`,
-  `result.appended_block_ids=[...]`. **Critical for undo**: without
-  the block_ids, undo can't remove the appended content cleanly
-  (deleting the whole doc would lose unrelated content the user
-  added).
+  `result.appended_block_ids=[...]`, `result.parent_block_id=<root>`,
+  and `result.append_marker_block_id=<the first block carrying the
+  bot_action_id marker>`. **Critical for undo**: the installed
+  lark-oapi `BatchDeleteDocumentBlockChildrenRequestBody` deletes by
+  child index range (`start_index`, `end_index`), not by block_id.
+  Therefore undo must re-list current children, map the stored
+  `appended_block_ids` / marker block to their current indexes, and
+  delete those current index ranges. Without the block_ids + parent,
+  undo can't remove the appended content cleanly (deleting the whole
+  doc would lose unrelated content the user added).
 - Phase 3: success.
 
 **Failure handling**:
@@ -1867,12 +1884,19 @@ if the response was lost — undo can list the doc's blocks, find any
 with our marker, and delete those. The trade-off (visible HTML
 comment in the rendered doc) is small.
 
-**Undo**: §3.9 `append_to_doc` arm — calls
-`docx.v1.document_block_children.batch_delete(document_id=doc_token,
-block_ids=result.appended_block_ids)`. 404 on individual block IDs
-treated as already-deleted (idempotent). After all blocks gone, mark
-source row `undone`. The doc itself is NOT deleted (it had pre-existing
-content; the user only undid the append).
+**Undo**: §3.9 `append_to_doc` arm — call the wrapper
+`docx.delete_blocks(document_id=doc_token,
+parent_block_id=result.parent_block_id,
+block_ids=result.appended_block_ids)`. The wrapper MUST NOT call a
+non-existent SDK `.block_ids(...)` builder. It re-lists the parent's
+current children, maps each stored block_id to its current child index,
+groups contiguous indexes into ranges, and calls
+`document_block_children.batch_delete` with `start_index` / `end_index`
+for each range, highest range first so earlier indexes don't shift.
+Missing block IDs are treated as already-deleted; non-contiguous
+surviving IDs are deleted as multiple ranges. After all surviving
+blocks are gone, mark source row `undone`. The doc itself is NOT
+deleted (it had pre-existing content; the user only undid the append).
 
 ### 3.13 `create_bitable_table`
 
@@ -2029,8 +2053,9 @@ wiki resolution):
 1. Parse URL host + path. Recognized patterns:
    - `*/docx/<doc_token>[?...]` → `{kind: 'docx', doc_token}`
    - `*/wiki/<wiki_token>[?...]` → call
-     `wiki.v2.space.node.get(token=wiki_token)` → resolve to
-     underlying `{kind: 'docx' | 'sheet' | 'bitable', token, ...}`.
+     `wiki.v2.space.get_node(GetNodeSpaceRequest.builder().token(wiki_token).build())`
+     → resolve to underlying
+     `{kind: 'docx' | 'sheet' | 'bitable', token, ...}`.
    - `*/base/<app_token>[?table=<table_id>][&view=<view_id>]` →
      `{kind: 'bitable', app_token, table_id?, view_id?}`
    - `*/sheets/<sheet_token>` → `{kind: 'sheet', sheet_token}` (not
@@ -2225,9 +2250,11 @@ pooled-client architecture makes the staleness case dominant.
 
 #### The actual mechanism: a mutable struct owned by `_PooledClient`
 
-Each pooled client gets one `RequestContext` instance. `build_pmo_mcp`
-becomes a factory that takes the context and returns an MCP server
-whose tool implementations close over it. The runner mutates the
+Each pooled client gets one `RequestContext` instance. Each per-domain
+factory (`build_meta_mcp`, `build_calendar_mcp`, `build_bitable_mcp`,
+`build_doc_mcp`, `build_external_mcp`) takes that same context and
+returns an MCP server whose tool implementations close over it. The
+runner mutates the
 context's fields **inside its existing `slot.lock` acquisition**
 before calling `client.query()`, so no other request can interleave.
 
@@ -2267,7 +2294,7 @@ it does today. This preserves the pooling protocol as private and
 also covers the fallback `answer()` path at `app.py:158` automatically.
 
 ```python
-# bot/agent/tools.py
+# bot/agent/request_context.py
 from dataclasses import dataclass
 
 @dataclass
@@ -2290,8 +2317,9 @@ class RequestContext:
     conversation_key: str = ""
 
 
-def build_pmo_mcp(ctx: RequestContext):
-    """Factory: returns an MCP server whose tools see `ctx` by closure.
+# bot/agent/tools_calendar.py
+def build_calendar_mcp(ctx: RequestContext):
+    """Factory: returns an MCP server whose calendar tools see `ctx` by closure.
 
     Called once per _PooledClient, at client construction time, and
     passed in via ClaudeAgentOptions(mcp_servers=...).
@@ -2300,17 +2328,17 @@ def build_pmo_mcp(ctx: RequestContext):
     @tool("schedule_meeting", "...", {...})
     async def schedule_meeting(args: dict) -> dict:
         # Closure captures `ctx` itself, not its current value — so
-        # every invocation sees whatever app.py last wrote.
+        # every invocation sees whatever runner.py last wrote.
         message_id = ctx.message_id
         chat_id = ctx.chat_id
         sender_open_id = ctx.sender_open_id
         ...
 
-    # ... other tools ...
+    # ... cancel_meeting, list_my_meetings ...
 
     return create_sdk_mcp_server(
-        name="pmo", version="0.1.0",
-        tools=[schedule_meeting, ..., resolve_people, append_action_items, ...],
+        name="pmo_calendar", version="0.1.0",
+        tools=[schedule_meeting, cancel_meeting, list_my_meetings],
     )
 ```
 
@@ -2325,7 +2353,14 @@ class _PooledClient:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 async def _get_client(conversation_key: str) -> _PooledClient:
-    # ...creates ctx + ClaudeSDKClient with mcp_servers={"pmo": build_pmo_mcp(ctx)}...
+    # ...creates ctx + ClaudeSDKClient with all 5 domain MCP servers...
+    # mcp_servers={
+    #   "pmo_meta": build_meta_mcp(ctx),
+    #   "pmo_calendar": build_calendar_mcp(ctx),
+    #   "pmo_bitable": build_bitable_mcp(ctx),
+    #   "pmo_doc": build_doc_mcp(ctx),
+    #   "pmo_external": build_external_mcp(ctx),
+    # }
     ...
 
 async def answer_streaming(
@@ -2375,17 +2410,18 @@ The existing call site at `tools.py:29-31` (`_current_conversation_key_var`
 + `set_current_conversation`) is removed and replaced. `agent/imaging.py`
 itself does **not** change — it already takes `conversation_key` as a
 kwarg. The change is at the caller side: the `generate_image` tool body
-inside `build_pmo_mcp(ctx)` now passes `ctx.conversation_key` to that
+inside `build_meta_mcp(ctx)` now passes `ctx.conversation_key` to that
 existing kwarg instead of reading the old module global.
 
 ### 5.1 Tool body skeleton
 
-The skeleton runs inside the `build_pmo_mcp(ctx)` factory's closure (§5.0),
-so `ctx` is captured by reference — no parameter passing, no global state.
+The skeleton runs inside the appropriate per-domain `build_*_mcp(ctx)`
+factory's closure (§5.0), so `ctx` is captured by reference — no
+parameter passing, no global state.
 
 ```python
 async def schedule_meeting(args: dict) -> dict[str, Any]:
-    # ctx is captured by closure from build_pmo_mcp(ctx); see §5.0.
+    # ctx is captured by closure from build_calendar_mcp(ctx); see §5.0.
     message_id = ctx.message_id
     chat_id = ctx.chat_id
     sender_open_id = ctx.sender_open_id
@@ -3247,7 +3283,7 @@ agent commonly mishandles. For traceability:
 | 10 | Meeting rooms / VC links | Out of scope (§1.3) |
 | 11 | Cross-language fuzzy matching | Out of scope; agent re-asks (§3.1) |
 | 12 | Doc attachments / images | Out of scope; markdown-only Docx body (§3.8) |
-| 13 | Per-task isolation of `message_id`/`chat_id` for concurrent runs | Per-`_PooledClient` `RequestContext` dataclass captured by closure in `build_pmo_mcp(ctx)` (§5.0). `contextvars.ContextVar` was tried in v3 and rejected: claude-agent-sdk dispatches tool calls from a long-lived reader task via `start_soon`, breaking ContextVar inheritance. |
+| 13 | Per-task isolation of `message_id`/`chat_id` for concurrent runs | Per-`_PooledClient` `RequestContext` dataclass captured by closure in each per-domain `build_*_mcp(ctx)` factory (§5.0). `contextvars.ContextVar` was tried in v3 and rejected: claude-agent-sdk dispatches tool calls from a long-lived reader task via `start_soon`, breaking ContextVar inheritance. |
 | 14 | Stuck `pending` rows after process crash | Lazy GC marks them `reconciled_unknown`, surfaced to user, never silently retried (§5.3) |
 | 15 | Concurrent re-bootstrap creating duplicate workspace resources | Lock row + audit row are now **separate** in `bot_actions` (§4); lock released by **DELETE** so subsequent rebuilds can reacquire. (v3-era "release by UPDATE-to-success" was a real bug — the row would persist forever and block all future bootstraps.) |
 | 16 | "Last meeting in conversation" undefined without conversation scope | `chat_id` column on `bot_actions` + `(chat_id, sender_open_id, created_at DESC)` index (§6.2) |
@@ -3260,7 +3296,7 @@ agent commonly mishandles. For traceability:
 | 23 | No pre-execution confirmation gate for write actions | Accepted explicitly (§1.4); `undo_last_action` is elevated to safety-critical with v1 acceptance criteria |
 | 24 | `send_dm` (DM-as-bot) was raised by Codex review as missing | Marked out-of-scope in §1.3 with stated reason; deferred until draft-then-confirm UX is designed |
 | 25 | User retypes the same instruction → bot fires duplicate side effect (UNIQUE on `message_id` does NOT cover this) | `logical_key` column on `bot_actions` + 60-second look-back in tool body Phase 0 (§5.1, §5.2, §6.2). Re-issuance more than 60s apart still fires twice — explicitly accepted in §5.2. |
-| 26 | `contextvars.ContextVar` does not survive claude-agent-sdk's tool-call dispatch path | Per-`_PooledClient` `RequestContext` dataclass + closure-based `build_pmo_mcp(ctx)` factory (§5.0). Verified by inspecting `claude_agent_sdk/_internal/query.py:196` `start_soon` semantics. |
+| 26 | `contextvars.ContextVar` does not survive claude-agent-sdk's tool-call dispatch path | Per-`_PooledClient` `RequestContext` dataclass + closure-based per-domain `build_*_mcp(ctx)` factories (§5.0). Verified by inspecting `claude_agent_sdk/_internal/query.py:196` `start_soon` semantics. |
 | 27 | Bootstrap lock row left in `success` state forever, blocking all future rebuilds (v3 bug) | Release the lock by `DELETE`, audit by separate row (§4). Caught in iter-4 review. |
 | 28 | `append_action_items` ambiguous-project flow wrote orphan rows in v3 | Refactored to halt-and-ask: returns `needs_project` without writing (§3.6). Caught in iter-4 review. |
 | 29 | `cancel_meeting` had no compensating undo path, breaking the §1.4 trust model | Added `pre_cancel_event_snapshot` capture before delete (§3.4); undo dispatcher restores via `calendar_event.create` (§3.9). Caveats documented. Caught in iter-5 Codex review. |
@@ -3356,7 +3392,7 @@ agent commonly mishandles. For traceability:
 | 119 | The original §3 / §7 had all 9 tools in a single `bot/agent/tools.py` file (~1500 lines projected). After v21's expansion to 18 tools, single-file maintenance becomes painful and changes to one domain risk regressions in another | Split into 5 MCP server modules per domain, mirroring `feishu-cc`'s pattern: `tools_meta.py` / `tools_calendar.py` / `tools_bitable.py` / `tools_doc.py` / `tools_external.py`. Each exports `build_<domain>_mcp(ctx)`; `runner.py` registers all 5 via `mcp_servers={...}` dict. The LLM sees a flat `allowed_tools` list of ~25 entries (no progressive disclosure in v1 — see "future work" §12). |
 | 120 | The split MCP servers introduce 5 new tool-name prefixes (`mcp__pmo_meta__*`, `mcp__pmo_calendar__*`, etc.). The existing 7 read tools change from `mcp__pmo__*` to `mcp__pmo_meta__*`. Anything string-matching the old prefix breaks silently | §7 explicitly flags `bot/app.py` card-rendering code (around line 255 strips `mcp__pmo__`) and `runner.py:179` allowed_tools list as needing updates. Smoke test in §11 step 9 verifies the progress card still shows clean tool names after the prefix change. |
 | 121 | `read_doc` / `read_external_table` could be abused by the LLM to exhaustively read large external resources, blowing token budget | `read_doc` truncates to `max_chars=20000` with a clear truncation marker; `read_external_table` caps at `page_size=50` (hard ceiling 200) AND has a per-conversation rate limit of 5 calls/hour. Rate limit lives in tool body via in-memory dict keyed on `ctx.conversation_key`. |
-| 122 | `append_to_doc` could let an attacker trick the bot into modifying any doc shared with the bot for read access — Feishu permissions don't distinguish "edit because shared" from "edit because authored" | `append_to_doc` has an authorship gate (Phase -1) that queries `bot_actions WHERE target_id=doc_token AND target_kind='docx' AND status='success' AND action_type IN ('create_doc','create_meeting_doc','append_to_doc')`. Refuse if no row. Each appended block carries a `<!-- bot_action_id=<uuid> -->` HTML comment marker so undo can find/remove blocks even if the response was lost mid-flight. |
+| 122 | `append_to_doc` could let an attacker trick the bot into modifying any doc shared with the bot for read access — Feishu permissions don't distinguish "edit because shared" from "edit because authored" | `append_to_doc` has an authorship gate (Phase -1) that queries `bot_actions WHERE target_id=doc_token AND target_kind='docx' AND status IN ('success','reconciled_unknown') AND action_type IN ('create_doc','create_meeting_doc')`. Refuse if no row. Prior `append_to_doc` rows do not grant authorship. Each appended block carries a `<!-- bot_action_id=<uuid> -->` HTML comment marker so undo can find/remove blocks even if the response was lost mid-flight; Phase 2 calls `document_block_children.create` with `client_token=<bot_actions.id>` so retried appends dedupe server-side. |
 | 123 | `create_bitable_table` undo deletes the table — and any rows the user/bot added since creation. Without a warning, the user might lose data they didn't know was tied to the table | §3.13 undo includes `restore_caveats: ["the table contained N rows that were also deleted"]` in the response. Smoke test §11 step 9 verifies the agent surfaces this caveat to the user. |
 | 124 | `append_to_my_table` overlaps with `append_action_items` — both write to bot's own Bitable. The agent might call `append_to_my_table` against the `action_items` table and bypass schema validation | §3.14 Phase -1 explicitly refuses `table_id IN (action_items_table_id, meetings_table_id)` and redirects the agent to the schema-validating `append_action_items`. Tool description directive reinforces this. |
 | 125 | The spec didn't say where `today_iso` (existing tool) lives after the v21 split. Without explicit re-homing, an implementer might leave it in the renamed `tools.py` file and miss the `tools_meta.py` move | §3 module mapping table explicitly lists `today_iso` (and the other 6 existing read tools) under `tools_meta.py`. §7 ownership table notes "the old `tools.py` is renamed to `tools_meta.py`". |
@@ -3579,7 +3615,7 @@ internals.
      email/phone path), and a raw httpx wrapper for
      `/open-apis/search/v1/user` (lark-oapi has no
      `contact.v3.user.search`).
-   - `bot/feishu/wiki.py` — wiki v2 wrapper: `space.node.get` for
+   - `bot/feishu/wiki.py` — wiki v2 wrapper: `wiki.v2.space.get_node` for
      `resolve_feishu_link` to dereference `/wiki/<token>` URLs into
      underlying docx/sheet/bitable tokens.
    - `bot/feishu/links.py` — pure-function URL parser used by

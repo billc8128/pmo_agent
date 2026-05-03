@@ -24,6 +24,11 @@ web/.next/
 web/out/
 web/.vercel/
 
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # Editors / OS
 .DS_Store
 .idea/

@@ -156,7 +156,13 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         logger.warning("could not send card; falling back to plain text reply")
         try:
             answer = await asyncio.wait_for(
-                agent_runner.answer(conversation_key, framed_question),
+                agent_runner.answer(
+                    conversation_key,
+                    framed_question,
+                    message_id=ev.message_id,
+                    chat_id=ev.chat_id,
+                    sender_open_id=ev.sender_open_id,
+                ),
                 timeout=settings.agent_max_duration_seconds,
             )
         except Exception as e:
@@ -181,7 +187,13 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         )
 
     try:
-        async for event in agent_runner.answer_streaming(conversation_key, framed_question):
+        async for event in agent_runner.answer_streaming(
+            conversation_key,
+            framed_question,
+            message_id=ev.message_id,
+            chat_id=ev.chat_id,
+            sender_open_id=ev.sender_open_id,
+        ):
             if event["kind"] == "tool":
                 # Mark previous tool as done — the LLM has moved on.
                 if steps and not steps[-1].get("done"):

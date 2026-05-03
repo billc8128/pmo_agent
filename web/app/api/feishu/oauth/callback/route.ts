@@ -88,6 +88,7 @@ export async function GET(request: NextRequest) {
   let openId: string;
   let name: string | null = null;
   let email: string | null = null;
+  let mobile: string | null = null;
   try {
     const userResp = await fetch(USERINFO_URL, {
       headers: { Authorization: `Bearer ${userAccessToken}` },
@@ -103,6 +104,7 @@ export async function GET(request: NextRequest) {
     openId = userJson.data?.open_id;
     name   = userJson.data?.name ?? null;
     email  = userJson.data?.email ?? userJson.data?.enterprise_email ?? null;
+    mobile = userJson.data?.mobile ?? userJson.data?.phone ?? null;
     if (!openId) {
       return backToMe(origin, { feishu: 'error', reason: 'no_open_id' });
     }
@@ -124,6 +126,7 @@ export async function GET(request: NextRequest) {
         user_id: user.id,
         feishu_name: name,
         feishu_email: email,
+        feishu_mobile: mobile,
       },
       { onConflict: 'feishu_open_id' },
     );
