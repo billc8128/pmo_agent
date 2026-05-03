@@ -434,7 +434,7 @@ Expected: both INSERTs succeed (the partial UNIQUE includes only `pending|succes
 
 ---
 
-# Task Group 3: db/queries.py — bot_actions helpers (10 tasks)
+# Task Group 3: db/queries.py — bot_actions helpers (11 tasks)
 
 > **Spec ref:** §6.2 SQL helpers, §11 step 2.
 
@@ -996,6 +996,10 @@ from datetime import datetime, timezone, timedelta
 _STUCK_PENDING_THRESHOLD = timedelta(minutes=5)
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _has_artifact_handle(row: dict[str, Any]) -> bool:
     if row.get("target_id"):
         return True
@@ -1032,6 +1036,7 @@ def _lazy_gc_stuck_pending(row: dict[str, Any]) -> dict[str, Any]:
             "error": "reconciled: pending too long",
             "result": new_result,
             "logical_key_locked": has_handle,
+            "updated_at": _utc_now_iso(),
         }).eq("id", row["id"]).eq("status", "pending").execute()
     )
     if update.data:
@@ -1210,6 +1215,19 @@ def test_mark_success_returns_none_when_terminal(fake_admin):
     fake_admin.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = []
     row = queries.mark_bot_action_success("u1", target_id="evt_x", target_kind="calendar_event")
     assert row is None
+
+
+def test_status_transition_updates_timestamp(fake_admin):
+    captured = {}
+    def fake_update(payload):
+        captured.update(payload)
+        return fake_admin.table.return_value.update.return_value
+    fake_admin.table.return_value.update.side_effect = fake_update
+    fake_admin.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [{
+        "id": "u1", "status": "failed",
+    }]
+    queries.mark_bot_action_failed("u1", error="api error")
+    assert "updated_at" in captured
 ```
 
 - [ ] **Step 2: Run, expect failure**
@@ -1227,7 +1245,10 @@ def mark_bot_action_success(
     delayed retry can't overwrite a terminal row. Returns the updated
     row, or None if the row is already terminal (caller must re-read).
     """
-    payload: dict[str, Any] = {"status": "success"}
+    payload: dict[str, Any] = {
+        "status": "success",
+        "updated_at": _utc_now_iso(),
+    }
     if target_id is not None:
         payload["target_id"] = target_id
     if target_kind is not None:
@@ -1252,6 +1273,7 @@ def mark_bot_action_failed(action_id: str, error: str) -> dict[str, Any] | None:
     res = (
         sb_admin().table("bot_actions").update({
             "status": "failed", "error": error, "logical_key_locked": False,
+            "updated_at": _utc_now_iso(),
         }).eq("id", action_id).eq("status", "pending").execute()
     )
     return res.data[0] if res.data else None
@@ -1271,6 +1293,7 @@ def mark_bot_action_undone(action_id: str) -> dict[str, Any] | None:
     res = (
         sb_admin().table("bot_actions").update({
             "status": "undone", "logical_key_locked": False,
+            "updated_at": _utc_now_iso(),
         }).eq("id", action_id).eq("status", "pending").execute()
     )
     return res.data[0] if res.data else None
@@ -1303,6 +1326,7 @@ def retire_source_action(action_id: str) -> dict[str, Any] | None:
     res = (
         sb_admin().table("bot_actions").update({
             "status": "undone", "logical_key_locked": False,
+            "updated_at": _utc_now_iso(),
         }).eq("id", action_id).in_("status", ["success", "reconciled_unknown"]).execute()
     )
     if res.data:
@@ -1344,6 +1368,100 @@ def test_retire_source_action_idempotent_on_already_undone(fake_admin):
 
 ```bash
 git commit -am "feat(db): mark_bot_action_success/failed/undone with transition guards + retire_source_action for undo dispatch"
+```
+
+### Task 3.6a: record_bot_action_target_pending
+
+**Files:**
+- Modify: `bot/db/queries.py`
+- Test: `bot/tests/test_queries_bot_actions.py`
+
+This helper is required by every write tool sub-step that creates or
+discovers a Feishu artifact before Phase 3. Do not inline ad-hoc UPDATEs
+inside tool bodies; otherwise crash recovery and undo metadata will drift
+between schedule/cancel/doc/action-item flows.
+
+- [ ] **Step 1: Write failing tests**
+
+```python
+def test_record_bot_action_target_pending_persists_artifact_without_terminalizing(fake_admin):
+    fake_admin.table.return_value.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = {
+        "id": "u1", "result": {"calendar_id": "cal_bot"},
+    }
+    fake_admin.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [{
+        "id": "u1", "status": "pending", "target_id": "evt_x",
+        "target_kind": "calendar_event",
+        "result": {"calendar_id": "cal_bot", "link": "https://..."},
+    }]
+    row = queries.record_bot_action_target_pending(
+        "u1", target_id="evt_x", target_kind="calendar_event",
+        result_patch={"link": "https://..."},
+    )
+    assert row["status"] == "pending"
+    assert row["target_id"] == "evt_x"
+    assert row["result"]["calendar_id"] == "cal_bot"
+
+
+def test_record_bot_action_target_pending_requires_pending(fake_admin):
+    fake_admin.table.return_value.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = {
+        "id": "u1", "result": {},
+    }
+    fake_admin.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = []
+    row = queries.record_bot_action_target_pending("u1", result_patch={"import_ticket": "t1"})
+    assert row is None
+```
+
+- [ ] **Step 2: Run, expect failure**
+
+- [ ] **Step 3: Implement**
+
+```python
+def record_bot_action_target_pending(
+    action_id: str, *,
+    target_id: str | None = None,
+    target_kind: str | None = None,
+    result_patch: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Persist artifact handles during Phase 2.x while keeping the row pending.
+
+    Used immediately after artifact-producing calls:
+    - schedule Phase 2.2.5: calendar event_id
+    - cancel Phase 2a.5: pre-cancel snapshot + original event_id
+    - append_action_items Phase 2.1.5: created Bitable row ids
+    - create_meeting_doc Phase 2.1.5/2.2.5/2.3.5: import ticket,
+      source_file_token, docx file_token
+
+    Returns the updated row, or None if the source row is no longer
+    pending and the caller must re-read/dispatch by current state.
+    """
+    if target_id is None and target_kind is None and not result_patch:
+        raise ValueError("record_bot_action_target_pending requires target or result_patch")
+
+    existing = (
+        sb_admin().table("bot_actions").select("result")
+        .eq("id", action_id).maybe_single().execute().data
+    ) or {}
+    payload: dict[str, Any] = {"updated_at": _utc_now_iso()}
+    if target_id is not None:
+        payload["target_id"] = target_id
+    if target_kind is not None:
+        payload["target_kind"] = target_kind
+    if result_patch:
+        payload["result"] = {**(existing.get("result") or {}), **result_patch}
+
+    res = (
+        sb_admin().table("bot_actions").update(payload)
+        .eq("id", action_id).eq("status", "pending").execute()
+    )
+    return res.data[0] if res.data else None
+```
+
+- [ ] **Step 4: Run, expect pass**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -am "feat(db): record pending artifact targets for write-tool recovery"
 ```
 
 ### Task 3.7: mark_bot_action_reconciled_unknown + invariant
@@ -1440,6 +1558,7 @@ def mark_bot_action_reconciled_unknown(
         "error": error,
         "result": post_result,
         "logical_key_locked": (kind == "partial_success"),
+        "updated_at": _utc_now_iso(),
     }
     if target_id is not None:
         payload["target_id"] = target_id
@@ -1471,6 +1590,11 @@ git commit -am "feat(db): mark_bot_action_reconciled_unknown with partial_succes
 
 ```python
 def test_update_for_retry_transitions_failed_to_pending(fake_admin):
+    captured = {}
+    def fake_update(payload):
+        captured.update(payload)
+        return fake_admin.table.return_value.update.return_value
+    fake_admin.table.return_value.update.side_effect = fake_update
     fake_admin.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [{
         "id": "u1", "status": "pending", "attempt_count": 2,
         "logical_key_locked": True,
@@ -1478,6 +1602,7 @@ def test_update_for_retry_transitions_failed_to_pending(fake_admin):
     row = queries.update_for_retry("u1", new_args={"x": 1}, logical_key="lk1")
     assert row["status"] == "pending"
     assert row["attempt_count"] == 2
+    assert "updated_at" in captured
 
 
 def test_update_for_retry_returns_none_when_not_failed(fake_admin):
@@ -1535,6 +1660,7 @@ def update_for_retry(
                 "args": new_args,
                 "error": None,
                 "logical_key_locked": True,
+                "updated_at": _utc_now_iso(),
             }).eq("id", action_id).eq("status", "failed").execute()
         )
         return res.data[0] if res.data else None
@@ -2126,7 +2252,7 @@ This wraps:
 - `calendar.v4.calendar_event_attendee.create`
 - `calendar.v4.freebusy.batch`
 
-- [ ] **Step 1: Write failing test for create_event with idempotency_key**
+- [ ] **Step 1: Write failing tests for create_calendar + create_event with idempotency_key**
 
 ```python
 """Test calendar SDK wrappers — assert builder paths and required args."""
@@ -2138,6 +2264,28 @@ from unittest.mock import MagicMock
 import pytest
 
 from feishu import calendar
+
+
+@pytest.mark.asyncio
+async def test_create_calendar_uses_calendar_request_body(monkeypatch):
+    captured = {}
+    fake_resource = MagicMock()
+    def fake_create(request):
+        captured["request"] = request
+        resp = MagicMock()
+        resp.success.return_value = True
+        resp.data.calendar.calendar_id = "cal_bot"
+        return resp
+    fake_resource.create = fake_create
+    fake_lark = MagicMock()
+    fake_lark.calendar.v4.calendar = fake_resource
+    monkeypatch.setattr("feishu.calendar._lark_client", lambda: fake_lark)
+
+    calendar_id = await calendar.create_calendar(summary="PMO Bot")
+    assert calendar_id == "cal_bot"
+    req = captured["request"]
+    assert req.request_body.__class__.__name__ == "Calendar"
+    assert req.request_body.summary == "PMO Bot"
 
 
 @pytest.mark.asyncio
@@ -2168,6 +2316,7 @@ async def test_create_event_passes_idempotency_key_and_calendar_id(monkeypatch):
     req = captured["request"]
     assert req.calendar_id == "cal_bot"
     assert req.idempotency_key == "schedule_meeting:uuid-1"
+    assert req.request_body.start_time.timezone
 ```
 
 - [ ] **Step 2: Run, expect failure**
@@ -2199,6 +2348,7 @@ from lark_oapi.api.calendar.v4.model import (
     PrimarysCalendarRequestBody,
     BatchFreebusyRequest,
     BatchFreebusyRequestBody,
+    Calendar,
     CalendarEvent,
 )
 
@@ -2210,9 +2360,7 @@ def _lark_client() -> lark.Client:
 
 async def create_calendar(*, summary: str) -> str:
     """Bootstrap: create the bot's primary calendar. Returns calendar_id."""
-    body = CalendarEvent.builder().summary(summary).build()  # CalendarBody is similar
-    # Actually CreateCalendarRequest takes a Calendar object; check installed model
-    # signature — spec §4 says simply calendar.create with summary.
+    body = Calendar.builder().summary(summary).build()
     req = CreateCalendarRequest.builder().request_body(body).build()
     resp = await asyncio.to_thread(_lark_client().calendar.v4.calendar.create, req)
     if not resp.success():
@@ -2309,9 +2457,7 @@ async def create_event(
 
 def _time_info(rfc3339: str, time_zone: str | None) -> Any:
     """Build a TimeInfo from an RFC3339 string. Implementer should
-    inspect lark_oapi.api.calendar.v4.model.TimeInfo for exact field
-    layout — `timestamp` (epoch seconds) + `time_zone` is the most
-    common shape.
+    use the installed SDK field name `timezone` (not `time_zone`).
     """
     from datetime import datetime
     from lark_oapi.api.calendar.v4.model import TimeInfo
@@ -2319,7 +2465,7 @@ def _time_info(rfc3339: str, time_zone: str | None) -> Any:
     return (
         TimeInfo.builder()
         .timestamp(str(int(dt.timestamp())))
-        .time_zone(time_zone or str(dt.tzinfo))
+        .timezone(time_zone or str(dt.tzinfo))
         .build()
     )
 
@@ -2924,6 +3070,7 @@ git commit -m "refactor(agent): RequestContext closure replaces module global; r
 """Tests for schedule_meeting tool. Mocks DB helpers + Feishu calendar wrappers."""
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -2964,6 +3111,26 @@ async def test_phase_minus_1_rejects_non_rfc3339_start_time(schedule_meeting):
     })
     assert result["isError"] is True
     assert "RFC3339" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_phase_minus_1_allows_empty_attendees_when_asker_auto_included(
+    schedule_meeting, monkeypatch,
+):
+    """Self-only meetings/focus blocks are valid because include_asker defaults True."""
+    monkeypatch.setattr(
+        "db.queries.get_locked_by_logical_key",
+        lambda _key: {
+            "status": "success",
+            "result": {"event_id": "evt_self", "link": "https://..."},
+        },
+    )
+    result = await schedule_meeting.handler({
+        "title": "Focus block",
+        "start_time": "2026-05-08T15:00:00+08:00",
+        "attendee_open_ids": [],
+    })
+    assert result.get("isError") is not True
 
 
 @pytest.mark.asyncio
@@ -3028,8 +3195,11 @@ async def schedule_meeting(args: dict) -> dict:
             return _err("start_time must include timezone (RFC3339)")
     except ValueError:
         return _err(f"start_time is not RFC3339: {args['start_time']!r}")
-    if not args.get("attendee_open_ids"):
-        return _err("attendee_open_ids must be non-empty (resolve via resolve_people)")
+    if not args.get("attendee_open_ids") and args.get("include_asker") is False:
+        return _err(
+            "attendee_open_ids must be non-empty when include_asker=False "
+            "(resolve via resolve_people)"
+        )
 
     canonical = canonicalize_args(args, action_type="schedule_meeting")
     logical_key = compute_logical_key(
@@ -3478,9 +3648,10 @@ async def test_phase_2_1_conflict_marks_success_outcome(
 
 - [ ] Failing test asserts:
   - `idempotency_key="schedule_meeting:<action_id>"` is passed to `calendar.create_event`
-  - `record_target_pending` (or equivalent) is called with `target_id=event_id` BEFORE Phase 2.3
+  - `queries.record_bot_action_target_pending` is called with `target_id=event_id`,
+    `target_kind="calendar_event"`, and `result_patch.calendar_id` BEFORE Phase 2.3
 
-- [ ] Implementation per spec §3.3 Phase 2.2 + 2.2.5.
+- [ ] Implementation per spec §3.3 Phase 2.2 + 2.2.5 and Task 3.6a.
 
 - [ ] Commit.
 
@@ -3510,7 +3681,8 @@ async def test_phase_2_1_conflict_marks_success_outcome(
 > - Phase 0: `get_locked_by_logical_key` (logical-key dedup)
 > - **Phase 1a: `get_bot_action(message_id, action_type)` lookup with all 5 status branches** (success/pending/reconciled_unknown/undone/failed→update_for_retry)
 > - Phase 1b: `insert_bot_action_pending` (only when 1a returned None)
-> - Phase 2.x: tool-specific Feishu calls, with intermediate `target_id`/`target_kind` persistence after each artifact-producing sub-step
+> - Phase 2.x: tool-specific Feishu calls, with intermediate `target_id`/`target_kind`
+>   persistence via `queries.record_bot_action_target_pending` after each artifact-producing sub-step
 > - Phase 3: `mark_bot_action_success` and (where applicable) `retire_source_action(source_row_id)` for related rows
 >
 > Tasks 8.2–8.5 list the **Phase 2.x specifics** below; Phase -1 / 0 / 1a / 1b / 3 are the same skeleton from 8.1a–c, and are NOT repeated. When in doubt, copy 8.1a's tool body and adjust Phase 2.x.
@@ -3618,7 +3790,7 @@ Failure handling per spec §3.8: pre-upload fail → `failed`; ambiguous (cleanu
 - Modify: `bot/agent/tools.py`
 - Test: `bot/tests/test_tools_undo_last_action.py`
 
-- [ ] **Step 1: Failing tests for the three sentinel paths**
+- [ ] **Step 1: Failing tests for sentinel paths + explicit selectors**
 
 ```python
 import pytest
@@ -3672,6 +3844,19 @@ async def test_no_target_returns_no_op(undo, monkeypatch):
     result = await undo.handler({"last_for_me": True})
     assert "no recent action" in result["content"][0]["text"].lower() \
         or "没找到" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_target_id_kind_resolves_source_row_in_current_chat(undo, monkeypatch):
+    monkeypatch.setattr(
+        "db.queries.get_bot_action_by_target",
+        lambda **kw: {
+            "id": "u1", "chat_id": "oc_1", "action_type": "schedule_meeting",
+            "status": "success", "target_id": "evt_x", "target_kind": "calendar_event",
+        },
+    )
+    result = await undo.handler({"target_id": "evt_x", "target_kind": "calendar_event"})
+    assert "undo dispatch for schedule_meeting" in result["content"][0]["text"]
 ```
 
 - [ ] **Step 3: Implement the shell**
@@ -3709,6 +3894,16 @@ async def undo_last_action(args: dict) -> dict:
         # chat_id scope check
         if source_row["chat_id"] != ctx.chat_id:
             return _err("不能在另一个群里撤销其他群发起的操作")
+    elif args.get("target_id") and args.get("target_kind"):
+        source_row = queries.get_bot_action_by_target(
+            chat_id=ctx.chat_id,
+            target_id=args["target_id"],
+            target_kind=args["target_kind"],
+        )
+        if not source_row:
+            return _err("target_id/target_kind 找不到当前群可撤销的操作")
+    elif args.get("target_id") or args.get("target_kind"):
+        return _err("undo_last_action requires both target_id and target_kind")
     else:
         return _err("undo_last_action requires {last_for_me} or {action_id} or {target_id+target_kind}")
 
@@ -3720,7 +3915,11 @@ async def undo_last_action(args: dict) -> dict:
     return _err(f"undo dispatch for {source_row['action_type']} not yet implemented")
 ```
 
-Add `get_bot_action_by_id(uuid)` to `db/queries.py` if not yet present (one-liner SELECT by primary key).
+Add DB selectors to `db/queries.py`:
+- `get_bot_action_by_id(uuid)` — one-liner SELECT by primary key.
+- `get_bot_action_by_target(chat_id, target_id, target_kind)` — SELECT the newest row
+  scoped to the current `chat_id`, with `status IN ('success','reconciled_unknown')`,
+  `action_type != 'undo_last_action'`, and exact `target_id`/`target_kind`.
 
 - [ ] **Step 5: Commit**
 
@@ -3954,8 +4153,8 @@ Each scenario is a checkbox item — verify in Feishu UI + DB:
 - [ ] **§1.4 acceptance: undo across LRU eviction**: schedule a meeting, wait long enough that the original `message_id` falls out of `feishu/events.py:_seen_events` LRU (~5 min), then say "撤销刚才那个" — confirm undo still resolves via `chat_id+sender_open_id` scoping (NOT message_id) and successfully deletes the event.
 - [ ] **Spec §11 step 9 cross-process logical-key dedup**: from a shell, fire two concurrent `curl` POSTs to `/feishu/webhook` carrying the **same chat_id, sender_open_id, and tool args** but **different `message_id`s** (simulate webhook retries from two upstream replicas). Confirm:
   - Exactly ONE meeting is created on Feishu (not two).
-  - Both `bot_actions` rows exist; the loser has the partial-UNIQUE conflict outcome (either "deduplicated_from_logical_key=True" or "in flight" depending on timing).
-  - The loser's row has the same `logical_key` as the winner.
+  - Exactly ONE `bot_actions` row exists for the locked `logical_key`; the loser request hit the DB partial-UNIQUE before INSERT and therefore has no loser row.
+  - The loser response/log shows the logical-key conflict outcome (either `deduplicated_from_logical_key=True` if the winner had committed by replay time, or an "in flight" refusal if the winner was still pending).
   - This proves the DB partial UNIQUE — `bot_actions_logical_locked_uniq` — is the load-bearing cross-process exclusion (spec §5.2 + §6.2).
   - Sample shell snippet:
     ```bash
@@ -3965,12 +4164,15 @@ Each scenario is a checkbox item — verify in Feishu UI + DB:
     curl -s -X POST localhost:8000/feishu/webhook -d "$P2" &
     wait
     psql "$SUPABASE_DB_URL" -c \
-      "SELECT id, message_id, status, result->>'deduplicated_from_logical_key' AS dedup
+      "SELECT id, message_id, status, logical_key,
+              result->>'deduplicated_from_logical_key' AS dedup
        FROM bot_actions
        WHERE message_id IN ('MSG_A','MSG_B')
        ORDER BY created_at;"
     ```
-  - Expected: one row `success`, one row with `dedup='true'` (or `status='success'` plus error noting "in flight" if the timing was tighter than commit-visible).
+  - Expected: one row only, `status='success'`, with the shared `logical_key`.
+    Validate the second request's HTTP body or app logs for the replay/refusal outcome;
+    do not expect a second `bot_actions` row.
 - [ ] **§3.9 + iter-20 row 114: 404-as-success undo replay**: schedule a meeting, manually delete the event in the Feishu UI (simulating "delete succeeded but DB UPDATE crashed mid-flight"), then ask the bot to undo — confirm the bot treats `EventNotFound` as the desired end state, marks the source row `undone`, and writes a normal undo audit row (not a failure).
 - [ ] **iter-21 doc cleanup non-404 retryability**: schedule a doc that produces a docx + source `.md` in 文档柜. Manually revoke `drive:drive` scope on the bot in Feishu admin (or simulate with auth-error injection). Ask the bot to undo — confirm undo treats the cleanup failure as retryable, leaves the source row's status unchanged, and on a re-undo (after restoring scope) completes successfully.
 
