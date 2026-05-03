@@ -9,6 +9,9 @@
 
 import type { Turn } from './types';
 
+export const TIMELINE_TIME_ZONE = 'Asia/Shanghai';
+const TIMELINE_UTC_OFFSET = '+08:00';
+
 // projectRootForTurn returns the canonical project key. New daemon
 // versions write project_root directly; old rows fall back to the
 // legacy "first 4 path components" heuristic.
@@ -60,9 +63,7 @@ export function dateRangeStartISO(range: DateRange): string | null {
   const day = 24 * 60 * 60 * 1000;
   switch (range) {
     case 'today': {
-      const d = new Date();
-      d.setHours(0, 0, 0, 0);
-      return d.toISOString();
+      return `${timelineDayKey(new Date())}T00:00:00${TIMELINE_UTC_OFFSET}`;
     }
     case '7d':
       return new Date(now - 7 * day).toISOString();
@@ -92,10 +93,9 @@ export function parseDateRange(raw: unknown): DateRange {
 //     ProjectBlock "..." {...}
 //   }
 //
-// Day key is the ISO date in the viewer's local timezone (UI only;
-// not stored). The day list is sorted newest-first; project blocks
-// within a day are sorted by their newest turn within that day, also
-// newest-first.
+// Day key is the ISO date in the app timeline timezone (UI only; not
+// stored). The day list is sorted newest-first; project blocks within a
+// day are sorted by their newest turn within that day, also newest-first.
 
 export type ProjectBlock = {
   root: string;          // absolute path
@@ -115,7 +115,7 @@ export function groupByDayAndProject(turns: Turn[]): DayGroup[] {
 
   for (const t of turns) {
     const d = new Date(t.user_message_at);
-    const dayKey = localDayKey(d);
+    const dayKey = timelineDayKey(d);
     let projMap = dayMap.get(dayKey);
     if (!projMap) {
       projMap = new Map();
@@ -149,28 +149,32 @@ export function groupByDayAndProject(turns: Turn[]): DayGroup[] {
   return days;
 }
 
-// localDayKey returns YYYY-MM-DD in the browser/server local timezone.
-// In Vercel serverless we run UTC; the date headers therefore reflect
-// UTC. That's fine for a public timeline — far simpler than juggling
-// per-viewer timezones, and the deltas are usually obvious from the
-// turn timestamps inside.
-function localDayKey(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+function timelineDayKey(d: Date): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMELINE_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(d);
+  const values = Object.fromEntries(
+    parts
+      .filter((p) => p.type === 'year' || p.type === 'month' || p.type === 'day')
+      .map((p) => [p.type, p.value]),
+  );
+  return `${values.year}-${values.month}-${values.day}`;
 }
 
 function humanDayLabel(dayKey: string): string {
-  const today = localDayKey(new Date());
-  const yesterday = localDayKey(new Date(Date.now() - 86_400_000));
+  const today = timelineDayKey(new Date());
+  const yesterday = timelineDayKey(new Date(Date.now() - 86_400_000));
   if (dayKey === today) return 'Today';
   if (dayKey === yesterday) return 'Yesterday';
   // Display style: "Apr 30" if same year, otherwise "Apr 30, 2025".
   const [y, m, d] = dayKey.split('-').map(Number);
   const date = new Date(Date.UTC(y, m - 1, d));
-  const sameYear = y === new Date().getFullYear();
+  const sameYear = y === Number(today.slice(0, 4));
   return date.toLocaleDateString('en-US', {
+    timeZone: 'UTC',
     month: 'short',
     day: 'numeric',
     ...(sameYear ? {} : { year: 'numeric' }),
@@ -227,7 +231,7 @@ export function groupByProjectAndDay(turns: Turn[]): ProjectGroupTree[] {
     }
     if (t.user_message_at > p.latestAt) p.latestAt = t.user_message_at;
 
-    const dayKey = localDayKey(new Date(t.user_message_at));
+    const dayKey = timelineDayKey(new Date(t.user_message_at));
     let day = p.days.get(dayKey);
     if (!day) {
       day = { dayKey, dayLabel: humanDayLabel(dayKey), turns: [] };

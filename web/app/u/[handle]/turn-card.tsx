@@ -16,15 +16,20 @@
 
 import { useState } from 'react';
 import type { Turn } from '@/lib/types';
-import { projectRootForTurn } from '@/lib/grouping';
+import { TIMELINE_TIME_ZONE, projectRootForTurn } from '@/lib/grouping';
 import { ResponseMarkdown } from './response-markdown';
 
 export function TurnCard({ turn }: { turn: Turn }) {
   const [expanded, setExpanded] = useState(false);
 
   const t = new Date(turn.user_message_at);
-  const time = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const time = t.toLocaleTimeString([], {
+    timeZone: TIMELINE_TIME_ZONE,
+    hour: '2-digit',
+    minute: '2-digit',
+  });
   const date = t.toLocaleDateString([], {
+    timeZone: TIMELINE_TIME_ZONE,
     year: 'numeric',
     month: 'short',
     day: 'numeric',

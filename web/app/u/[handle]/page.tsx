@@ -29,7 +29,7 @@ import { ProjectChips } from '../../_components/project-chips';
 
 export const dynamic = 'force-dynamic';
 
-const PAGE_SIZE = 200;
+const PAGE_SIZE = 1000;
 
 export default async function ProfilePage(props: PageProps<'/u/[handle]'>) {
   const { handle } = await props.params;

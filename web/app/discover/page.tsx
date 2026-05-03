@@ -27,7 +27,7 @@ import { ProjectChips } from '../_components/project-chips';
 
 export const dynamic = 'force-dynamic';
 
-const PAGE_SIZE = 200;
+const PAGE_SIZE = 1000;
 
 export default async function DiscoverPage(props: PageProps<'/discover'>) {
   const sp = await props.searchParams;
