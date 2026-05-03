@@ -148,23 +148,91 @@ write tools; existing event handling, dedup, and cards are unchanged.
 
 ## 3. Tool catalog
 
-8 new tools (5 write, 3 read) + 1 modification to an existing tool.
+**16 new tools (8 write, 8 read) + 1 modification to an existing
+tool**, organized by domain into 5 MCP server modules. The split
+mirrors `feishu-cc`'s pattern (one `build_*_mcp(ctx)` factory per
+domain) so each file stays focused and testable in isolation. The
+LLM still sees a flat `allowed_tools` list — the split is for code
+organization and future progressive-disclosure upgrades, not for
+runtime gating.
 
-| # | Tool | Domain | Read or Write |
-| --- | --- | --- | --- |
-| 1 | `resolve_people` | Contact | Read |
-| 2 | `today_iso` (modified) | Time | Read |
-| 3 | `schedule_meeting` | Calendar | **Write** |
-| 4 | `cancel_meeting` | Calendar | **Write** |
-| 5 | `list_my_meetings` | Calendar | Read |
-| 6 | `append_action_items` | Bitable | **Write** |
-| 7 | `query_action_items` | Bitable | Read |
-| 8 | `create_meeting_doc` | Docx | **Write** |
-| 9 | `undo_last_action` | Audit | **Write** (compensating) |
+| # | Tool | MCP module | Read or Write | Scope |
+| --- | --- | --- | --- | --- |
+| 1 | `resolve_people` | meta | Read | Org directory |
+| 2 | `today_iso` (modified) | meta | Read | — |
+| 3 | `undo_last_action` | meta | **Write** (compensating) | bot's own |
+| 4 | `schedule_meeting` | calendar | **Write** | bot's own |
+| 5 | `cancel_meeting` | calendar | **Write** | bot's own |
+| 6 | `list_my_meetings` | calendar | Read | bot's own + user primary |
+| 7 | `append_action_items` | bitable | **Write** | bot's own |
+| 8 | `query_action_items` | bitable | Read | bot's own |
+| 9 | `create_bitable_table` | bitable | **Write** | bot's own |
+| 10 | `append_to_my_table` | bitable | **Write** | bot's own |
+| 11 | `query_my_table` | bitable | Read | bot's own |
+| 12 | `describe_my_table` | bitable | Read | bot's own |
+| 13 | `create_meeting_doc` | doc | **Write** | bot's own |
+| 14 | `create_doc` | doc | **Write** | bot's own |
+| 15 | `append_to_doc` | doc | **Write** | bot's own (verified-author) |
+| 16 | `read_doc` | external | Read | any user-pasted link |
+| 17 | `read_external_table` | external | Read | any user-pasted link |
+| 18 | `resolve_feishu_link` | external | Read | parses URL → IDs |
 
-System prompt receives a paragraph telling the model: default to plain
-text; call write tools only when the user's intent is unambiguous; for
-person references, always go through `resolve_people` first.
+**Scope contract** (load-bearing for §1.4 trust model):
+- **`bot's own`**: target is a resource INSIDE `bot_workspace.base_app_token`
+  (Bitable) or `bot_workspace.docs_folder_token` (Drive). All write
+  tools enforce this at the tool-body level: refuse if `app_token` /
+  `parent_folder` doesn't match. `append_to_doc` additionally requires
+  the target `doc_token` to appear in `bot_actions WHERE
+  target_kind='docx' AND status='success'` AND
+  `(action_type='create_doc' OR action_type='create_meeting_doc' OR
+  action_type='append_to_doc')` — i.e. bot must be the author of the
+  document, not just somebody with edit permission.
+- **`bot's own + user primary`**: `list_my_meetings` reads two
+  result sets (§3.5) — `bot_known_events` from `bot_actions`,
+  `user_calendar_events` from the asker's primary calendar. The
+  asker's calendar is read with `user_id_type='open_id'`; visibility
+  is whatever Feishu returns (the bot can see events it's invited to
+  + events on calendars shared with the bot app).
+- **`any user-pasted link`**: read-only, no write side effect, no
+  undo. The user pasting a link is the consent signal.
+
+**Module → MCP server mapping**:
+
+| MCP server name | File | Tools |
+|---|---|---|
+| `pmo_meta` | `bot/agent/tools_meta.py` | 1, 2, 3 + the 7 existing read tools |
+| `pmo_calendar` | `bot/agent/tools_calendar.py` | 4, 5, 6 |
+| `pmo_bitable` | `bot/agent/tools_bitable.py` | 7, 8, 9, 10, 11, 12 |
+| `pmo_doc` | `bot/agent/tools_doc.py` | 13, 14, 15 |
+| `pmo_external` | `bot/agent/tools_external.py` | 16, 17, 18 |
+
+`bot/agent/runner.py` registers all 5 MCP servers in
+`mcp_servers={...}` and the full flat `allowed_tools` whitelist (~25
+entries including the 7 existing read tools that were already
+exposed). See §7 for the per-file ownership table.
+
+**Why split MCP servers but keep flat `allowed_tools`** (post-iter-31
+architecture decision, see §10 row 118):
+- Code organization: changes to calendar tools don't touch
+  bitable/doc files; tests can mock a whole MCP server fixture.
+- LLM attention: 18 tools is still well within Opus 4.7's "easy"
+  range. Progressive disclosure (loading only some servers) is
+  unnecessary complexity for v1; the dict-based `mcp_servers`
+  registration in `_get_client` is a one-line gate that future
+  versions can flip if real-world LLM behavior demands it.
+- Migration safety: existing 7 read tools (`list_users`,
+  `lookup_user`, `get_recent_turns`, `get_project_overview`,
+  `get_activity_stats`, `today_iso`, `generate_image`) move from the
+  current single `pmo` MCP server to `pmo_meta` — their `mcp__pmo__*`
+  prefixes change to `mcp__pmo_meta__*`. Only `runner.py:179`'s
+  `allowed_tools` list and possibly card-rendering code that splits
+  on `mcp__pmo__` need updating. See §7 ownership table.
+
+System prompt receives a paragraph telling the model: default to
+plain text; call write tools only when the user's intent is
+unambiguous; for person references, always go through
+`resolve_people` first; **bot only writes to its own workspace**;
+**read tools accept any user-pasted link** (consent via paste).
 
 ### 3.1 `resolve_people`
 
@@ -1637,6 +1705,349 @@ those, treats already-missing ones as fine, and marks the source
 row `undone` only when the table no longer contains any record
 with that `source_action_id`.
 
+For `append_to_doc` undo, the dispatch reads
+`result.appended_block_ids` and calls
+`docx.v1.document_block_children.batch_delete` to remove exactly
+those blocks (spec rationale in §3.12). 404 on individual block IDs
+is treated the same as for batch_delete: missing means already-gone,
+fine, finalize when none remain.
+
+---
+
+### 3.10 `create_doc`
+
+**Purpose**: Create a generic Feishu docx in the bot's `文档柜` folder
+(NOT a meeting-notes doc — that's still `create_meeting_doc`). Use
+when the user says things like "把这些写成一个文档" / "整理一份给我"
+that aren't tied to a specific meeting.
+
+**Inputs**:
+- `title: str` — document title (max 100 chars)
+- `markdown_body: str` — Markdown source the agent produced
+- `tags?: list[str]` — optional metadata for future filtering (stored
+  in `result.tags`; not surfaced as a Bitable column in v1)
+
+**Phases** (same skeleton as `create_meeting_doc`, see §3.8 / §5.1):
+- Phase -1: validation (title length, markdown non-empty)
+- Phase 0 / 1a / 1b: standard skeleton
+- Phase 2: same 3-step Path A flow as §3.8 — `file.upload_all`
+  (markdown.md) → `import_task.create` → poll `import_task.get`
+- Each step persists artifact handles via
+  `record_bot_action_target_pending` per the same pattern.
+- Phase 3: persist `target_id=<doc_token>`, `target_kind='docx'`,
+  `result.url`.
+
+**Difference from `create_meeting_doc`**:
+- No `meeting_event_id?` input — `create_doc` is meeting-agnostic.
+- No `meetings` Bitable row written — `create_meeting_doc` optionally
+  links into the `meetings` table; `create_doc` doesn't.
+- Both use the same Phase 2 implementation (Path A 3-step). To avoid
+  duplication, factor a private `_drive_import_markdown(ctx, action_id,
+  title, markdown_body)` helper in `tools_doc.py` that both tools call.
+
+**Undo**: §3.9 `create_doc` arm — same as `create_meeting_doc` undo
+dispatch, branched by `target_kind` (`docx` / `file` / `NULL +
+import_ticket` / `NULL + source_file_token`). The action_type
+distinguishes the two for audit-trail purposes; undo treats them
+identically.
+
+**Out of scope for v1**: write to user-owned folders. The asker's
+docx must always be created under
+`bot_workspace.docs_folder_token`. To "share" the doc, the agent
+returns the URL in chat; the user can re-share from the Feishu UI.
+
+### 3.11 `read_doc`
+
+**Purpose**: Read any docx the user pastes a link to (or whose
+doc_token they otherwise know), return Markdown content.
+
+**Inputs**:
+- `doc_link_or_token: str` — either a full Feishu URL or a raw
+  doc_token. The tool body normalizes via `resolve_feishu_link` (§3.18)
+  if it looks like a URL.
+- `max_chars?: int = 20000` — soft cap on returned markdown to
+  protect token budget. Truncate with a clear `[... 文档已截断，剩余
+  X 字符]` marker if over.
+
+**No 3-phase pattern** — read-only, no `bot_actions` row.
+
+**Implementation**:
+1. If input contains `/docx/` or `/wiki/`, extract token via
+   `resolve_feishu_link` (handle wiki → docx redirect; spec §3.18).
+2. Call `docx.v1.document.raw_content(document_id=doc_token)` —
+   the SDK exposes a `raw_content` method that returns plain text;
+   we want **the structured block tree** to render to markdown
+   faithfully, so use `docx.v1.document_block.list(...)` instead and
+   convert blocks to markdown ourselves (paragraph → text, heading →
+   `# / ## / ###`, bullet list → `-`, code block → fenced).
+3. Truncate to `max_chars`.
+4. Return `{markdown, doc_token, title, char_count, truncated: bool}`.
+
+**Permission failure handling**: if Feishu returns 403/permission
+denied (the doc isn't shared with the bot or the user's OAuth scope
+doesn't cover it), return a clear error: `"我没有权限读这个文档。
+请把它分享给 @包工头 (bot 的 open_id)，或者把内容复制粘贴给我"`. NOT a
+retryable failure — the user has to take action.
+
+**System-prompt directive**: when the user says "看一下 X 文档" /
+"读这个" / pastes a `feishu.cn/docx/...` URL, call this. Do NOT
+re-paste the body verbatim into chat — summarize. Truncation
+markers should be surfaced to the user ("文档很长，我只看了前面
+20000 字符").
+
+### 3.12 `append_to_doc`
+
+**Purpose**: Append Markdown content to an **existing bot-authored
+docx**. Used in flows like "把这次会议的 action items 也加到上次的
+项目文档里" (provided the project doc was created by the bot).
+
+**Inputs**:
+- `doc_link_or_token: str` — same normalization as `read_doc`
+- `markdown_body: str` — content to append. Rendered as new blocks
+  at the end of the document.
+- `heading?: str` — optional separator heading inserted before the
+  appended content (e.g., `## 2026-05-08 会议 action items`)
+
+**Authorship gate** (Phase -1): before any Feishu call, verify the
+target doc was created by the bot:
+
+```python
+auth_row = queries.get_bot_action_by_target(
+    target_id=doc_token, target_kind='docx',
+    action_type_in=['create_doc', 'create_meeting_doc'],
+)
+if auth_row is None or auth_row['status'] != 'success':
+    return _err(
+        "我只能改我自己创建的文档。这个文档不是我建的，"
+        "请直接在飞书里编辑，或者让我新建一个相关的文档"
+    )
+```
+
+This is the §1.4 trust-model enforcement: bot writes only to its own
+artifacts. Without this check, an attacker could trick the bot into
+modifying any doc the bot has edit permission on (e.g., a doc shared
+with `@包工头` for read-only viewing — Feishu permissions don't
+distinguish "edit because shared" from "edit because authored").
+
+**Phases**:
+- Phase -1: validation + authorship gate
+- Phase 0 / 1a / 1b: standard skeleton
+- Phase 2.1: parse `markdown_body` into Docx blocks (use the same
+  block-converter as Path B fallback would have — heading → heading,
+  paragraph → text, code → code block, etc.)
+- Phase 2.2: `docx.v1.document_block_children.create(...)` to append
+  blocks at the document end. The response includes the newly-created
+  `block_ids`.
+- Phase 2.2.5: `record_bot_action_target_pending` with
+  `target_id=<doc_token>`, `target_kind='docx_block_append'`,
+  `result.appended_block_ids=[...]`. **Critical for undo**: without
+  the block_ids, undo can't remove the appended content cleanly
+  (deleting the whole doc would lose unrelated content the user
+  added).
+- Phase 3: success.
+
+**Failure handling**:
+- Authorship gate fail → refusal (no bot_actions row, no Feishu
+  call).
+- Phase 2.1 markdown parse error → `failed`, no Feishu call.
+- Phase 2.2 returns partial block_ids (some succeed, some fail) →
+  spec rule per Feishu API: `block_children.create` is atomic —
+  either all blocks land or none. Treat failure as `failed` after a
+  retryable transport-error guard (network timeout → query the doc's
+  block list with our `source_action_id` marker pattern below).
+- Multi-call failure (Feishu accepted some appends, dropped others
+  before response) → `reconciled_unknown(partial_success)` with
+  `target_id=doc_token`, `target_kind='docx_block_append'`,
+  `result.appended_block_ids=[...what we know]`.
+
+**Per-block `source_action_id` marker**: the first block of each
+append is a hidden Markdown HTML comment:
+`<!-- bot_action_id=<uuid> -->`. This makes undo recovery work even
+if the response was lost — undo can list the doc's blocks, find any
+with our marker, and delete those. The trade-off (visible HTML
+comment in the rendered doc) is small.
+
+**Undo**: §3.9 `append_to_doc` arm — calls
+`docx.v1.document_block_children.batch_delete(document_id=doc_token,
+block_ids=result.appended_block_ids)`. 404 on individual block IDs
+treated as already-deleted (idempotent). After all blocks gone, mark
+source row `undone`. The doc itself is NOT deleted (it had pre-existing
+content; the user only undid the append).
+
+### 3.13 `create_bitable_table`
+
+**Purpose**: Create a new table inside the bot's `包工头的工作台`
+Bitable base. Used when the user says "帮我建一张项目跟踪表" /
+"开个新表记问题列表".
+
+**Inputs**:
+- `name: str` — table name (max 100 chars)
+- `fields: list[dict]` — schema declaration. Each field is
+  `{name: str, type: str, options?: dict}`. Type is one of:
+  `text`, `number`, `single_select` (requires
+  `options.choices: List[str]`), `multi_select` (same),
+  `date_time`, `checkbox`, `person` (Bitable Person field;
+  options.user_id_type defaults to "open_id"), `url`,
+  `phone`, `email`. Mapping to Feishu's numeric type codes happens
+  inside `tools_bitable.py:_field_type_to_code`.
+- `description?: str` — table description.
+
+**Workspace gate** (Phase -1): the table is always created inside
+`bot_workspace.base_app_token`. Caller cannot specify a different
+`app_token` (no input field for it). This is the §1.4 enforcement
+in the input shape itself.
+
+**Phases**:
+- Phase -1: validation (name length, fields non-empty, all field
+  types known)
+- Phase 0 / 1a / 1b: standard skeleton
+- Phase 2.1: `bitable.v1.app_table.create(app_token=ws.base_app_token,
+  ...)` with `client_token=<bot_actions.id>` for idempotency.
+  Returns `table_id`.
+- Phase 2.1.5: `record_bot_action_target_pending` with
+  `target_id=<table_id>`, `target_kind='bitable_table'`.
+- Phase 3: success.
+
+**Undo**: §3.9 `create_bitable_table` arm — calls
+`bitable.v1.app_table.batch_delete(app_token=ws.base_app_token,
+table_ids=[target_id])`. 404 → idempotent. After delete, mark source
+`undone`. Note this **deletes any rows the user/bot added to the
+table since creation** — surface a `restore_caveats: ["the table
+contained N rows that were also deleted"]` in the undo response.
+
+### 3.14 `append_to_my_table`
+
+**Purpose**: Append rows to **any table** in the bot's own Bitable
+base — not just the special `action_items` table. This is the
+"PMO writes to the project tracker she just created" use case.
+
+**Inputs**:
+- `table_id: str` — must be a table inside `bot_workspace.base_app_token`
+  (verified at the tool body — see workspace gate below).
+- `records: list[dict]` — list of row dicts with field-name keys
+  matching the table's schema.
+- `client_token?: str` — defaults to `<bot_actions.id>` for
+  idempotency (per Codex iter-22 row 113).
+
+**Workspace gate** (Phase -1):
+1. Refuse if `table_id` is `bot_workspace.action_items_table_id` —
+   redirect to `append_action_items` for the schema-validating path
+   (avoids two tools doing the same job with different validation).
+2. Refuse if `table_id` is `bot_workspace.meetings_table_id` for the
+   same reason.
+3. Verify the table exists in the bot's base via
+   `bitable.v1.app_table.get(app_token=ws.base_app_token,
+   table_id=table_id)` — 404 → refuse "table does not exist in my
+   workspace".
+
+**Schema-aware validation** (Phase -1, after the workspace gate):
+- The agent SHOULD have called `describe_my_table` (§3.16) first.
+  Tool description directive: "If you're unsure about field names
+  or types, call describe_my_table on this table_id before
+  append_to_my_table."
+- The tool body still validates: refuse if any record has unknown
+  field names. (Don't validate types — Feishu rejects on its side
+  with clear errors.)
+
+**Phases 0-3**: same as `append_action_items` — three-phase pattern,
+single atomic `batch_create`, ambiguous-failure handling per Codex
+iter-23.
+
+**Undo**: §3.9 `append_to_my_table` arm — same as
+`append_action_items`: query by hidden `source_action_id` field on
+each record, batch_delete with per-record 404-idempotency.
+
+### 3.15 `query_my_table`
+
+**Purpose**: Read rows from any table in the bot's base. Read-only,
+no `bot_actions` row.
+
+**Inputs**:
+- `table_id: str` — workspace gate: must belong to
+  `bot_workspace.base_app_token`. Same gate as §3.14.
+- `filter?: str` — Bitable filter expression
+  (`field=value AND field2 contains "..."`). Optional.
+- `sort?: list[dict]` — `[{field: str, desc: bool}]`. Optional.
+- `page_size?: int = 50` — capped at 200.
+
+**Implementation**: `bitable.v1.app_table_record.search(app_token,
+table_id, ..., user_id_type="open_id")`.
+
+### 3.16 `describe_my_table`
+
+**Purpose**: Return the schema of a table in the bot's base — field
+names, types, options for select fields. Used by the LLM before
+`append_to_my_table` to know what fields exist.
+
+**Inputs**:
+- `table_id: str` — workspace gate as above.
+
+**Implementation**:
+- `bitable.v1.app_table_field.list(app_token, table_id)` →
+  field list with `field_name`, `type` (Feishu's numeric code),
+  `property` (options for select fields).
+- Convert numeric type codes back to friendly names (`text`,
+  `single_select`, etc.) reusing the same mapping as §3.13.
+- Return `{table_id, table_name, fields: [{name, type, options?}]}`.
+
+### 3.17 `read_external_table`
+
+**Purpose**: Read rows from any Bitable table the user pastes a
+link to. The user pasting the link is the consent signal — the bot
+doesn't write, just reads.
+
+**Inputs**:
+- `link_or_app_table_token: str` — either a full Feishu URL like
+  `https://example.feishu.cn/base/<app_token>?table=<table_id>&...`
+  or a raw `<app_token>:<table_id>` pair. Normalized via
+  `resolve_feishu_link` (§3.18).
+- `filter?: str` — same as `query_my_table`
+- `page_size?: int = 50` — capped at 200, hard ceiling for token
+  protection.
+
+**No `bot_actions` row** — read-only.
+
+**Permission failure handling**: 403 → clear error "我没有权限读这张
+表。请把这张多维表格分享给 @包工头". NOT retryable.
+
+**Rate limit**: cap at 5 calls per conversation per hour to prevent
+LLM from exhaustively reading large bases. Track via a simple
+in-memory dict keyed by `ctx.conversation_key` with sliding 1-hour
+window. 6th call in the window → return cached "已达频次上限" error.
+
+### 3.18 `resolve_feishu_link`
+
+**Purpose**: Parse a Feishu URL into `{kind, token, table_id?,
+record_id?}` for downstream tool calls. Used by `read_doc`,
+`read_external_table`, `append_to_doc` to accept user-friendly URLs.
+
+**Inputs**:
+- `url: str` — any Feishu URL.
+
+**Implementation** (pure-function, no Feishu API calls except for
+wiki resolution):
+1. Parse URL host + path. Recognized patterns:
+   - `*/docx/<doc_token>[?...]` → `{kind: 'docx', doc_token}`
+   - `*/wiki/<wiki_token>[?...]` → call
+     `wiki.v2.space.node.get(token=wiki_token)` → resolve to
+     underlying `{kind: 'docx' | 'sheet' | 'bitable', token, ...}`.
+   - `*/base/<app_token>[?table=<table_id>][&view=<view_id>]` →
+     `{kind: 'bitable', app_token, table_id?, view_id?}`
+   - `*/sheets/<sheet_token>` → `{kind: 'sheet', sheet_token}` (not
+     used by any v1 tool; included for forward-compat)
+   - Otherwise → `{kind: 'unknown', url}`.
+2. Return as a JSON dict for the agent to consume.
+
+**Why a tool, not a helper**: the LLM needs to inspect the result
+and decide which downstream tool to call (read_doc vs
+read_external_table). Keeping the parser in MCP-tool form makes the
+agent's reasoning explicit in the trace — easier to debug "why did
+it call read_external_table on a docx URL".
+
+**System-prompt directive**: when the user pastes a `feishu.cn` URL
+without context, call resolve_feishu_link first; then dispatch by
+kind.
+
 ---
 
 ## 4. Bot workspace bootstrap
@@ -2717,23 +3128,24 @@ these places:
 | Concern | Lives in | Existing or new |
 | --- | --- | --- |
 | Feishu webhook handling | `bot/feishu/events.py`, `bot/app.py` | unchanged |
-| Per-run context (`message_id`, `chat_id`, `sender_open_id`, `conversation_key`) via `RequestContext` dataclass owned by each `_PooledClient`, captured by closure in `build_pmo_mcp(ctx)` (see §5.0) | `bot/agent/tools.py` (`RequestContext` definition + factory), `bot/agent/runner.py` (one ctx per `_PooledClient`; `answer` / `answer_streaming` accept `message_id` / `chat_id` / `sender_open_id` and set `slot.ctx.*` inside the existing `slot.lock`), `bot/app.py` (calls `answer_streaming(...)` with the four params; **never** touches `_get_client` / `slot.ctx` / `slot.lock` directly) | new dataclass, factory pattern in `build_pmo_mcp`, runner public surface gains 3 kwargs, existing `set_current_conversation` removed entirely |
-| Tool schema + LLM-visible behavior | `bot/agent/tools.py` | new tools, three-phase pattern in each |
-| **Agent SDK `allowed_tools` whitelist** (`bot/agent/runner.py:179`) | `bot/agent/runner.py` | **must add** `mcp__pmo__resolve_people`, `mcp__pmo__schedule_meeting`, `mcp__pmo__cancel_meeting`, `mcp__pmo__list_my_meetings`, `mcp__pmo__append_action_items`, `mcp__pmo__query_action_items`, `mcp__pmo__create_meeting_doc`, `mcp__pmo__undo_last_action` to the existing list. Without this, the SDK filters the new tools out and the LLM never sees them. **Discovered during review iteration 3** — a previous draft incorrectly claimed runner.py was unchanged. |
+| Per-run context (`message_id`, `chat_id`, `sender_open_id`, `conversation_key`) via `RequestContext` dataclass owned by each `_PooledClient`, captured by closure in every `build_*_mcp(ctx)` factory (see §5.0) | `bot/agent/request_context.py` (definition), `bot/agent/runner.py` (one ctx per `_PooledClient`; passes the SAME ctx into all 5 `build_*_mcp(ctx)` calls; `answer` / `answer_streaming` accept `message_id` / `chat_id` / `sender_open_id` and set `slot.ctx.*` inside the existing `slot.lock`), `bot/app.py` (calls `answer_streaming(...)` with the four params; **never** touches `_get_client` / `slot.ctx` / `slot.lock` directly) | new dataclass file; existing `set_current_conversation` removed entirely |
+| Per-domain MCP servers (post-iter-31, see §3) | `bot/agent/tools_meta.py` (resolve_people, today_iso, undo_last_action + 7 existing read tools), `bot/agent/tools_calendar.py` (schedule/cancel/list_my_meetings), `bot/agent/tools_bitable.py` (action_items + my_table family), `bot/agent/tools_doc.py` (create_doc / append_to_doc / create_meeting_doc), `bot/agent/tools_external.py` (read_doc / read_external_table / resolve_feishu_link) | new (5 files); each module exports `build_<domain>_mcp(ctx)` that returns an MCP server. The old `bot/agent/tools.py` is renamed to `tools_meta.py` and rewritten to include only the meta tools + the 7 existing read tools (which keep their existing implementation, only the wrapping factory changes). |
+| **Agent SDK `allowed_tools` whitelist** (`bot/agent/runner.py:179`) | `bot/agent/runner.py` | **complete rewrite** of the list to enumerate all ~25 entries with new `mcp__pmo_meta__*`, `mcp__pmo_calendar__*`, `mcp__pmo_bitable__*`, `mcp__pmo_doc__*`, `mcp__pmo_external__*` prefixes. The existing 7 read tools' prefixes change from `mcp__pmo__*` to `mcp__pmo_meta__*` — this also means anything that string-matched the old prefix (e.g., `bot/app.py:255` strips `mcp__pmo__`) needs updating. |
 | Agent SDK system prompt | `bot/agent/runner.py` (`SYSTEM_PROMPT` constant) | replace tool inventory + read-only sentence per §9, then weave in §9 directives |
-| Feishu API wrappers (calendar, bitable, docx, contact) | `bot/feishu/client.py` | new methods |
+| Card-rendering tool-name display (`bot/app.py` around line 255 strips `mcp__pmo__` prefix for the progress card) | `bot/app.py` | needs a regex update to strip any of `mcp__pmo_(meta|calendar|bitable|doc|external)__` — otherwise the user sees ugly raw tool names in the progress card |
+| Feishu API wrappers (calendar, bitable, docx, drive, contact) | `bot/feishu/calendar.py`, `bot/feishu/bitable.py`, `bot/feishu/drive.py`, `bot/feishu/contact.py`, `bot/feishu/auth.py` | new (5 files); thin async wrappers around lark-oapi. `bot/feishu/client.py` keeps its existing `FeishuClient` class for the IM helpers (reactions, replies, cards) — only `fetch_self_info` is refactored to call `feishu/auth.py:get_tenant_access_token()` instead of inline POSTing |
 | `bot_actions` / `bot_workspace` SQL | `bot/db/queries.py` | new functions, all via `sb_admin()` |
 | Workspace bootstrap script | `bot/scripts/bootstrap_bot_workspace.py` | new file (and the `bot/scripts/` directory itself, created in step 4 of §11) |
 | Schema | `backend/supabase/migrations/0010_*.sql`, `0011_*.sql` | new |
 
 Things explicitly NOT changed: `bot/feishu/cards.py`, `bot/db/client.py`,
-the existing read tools.
+the existing read tools' implementations (only their containing
+factory file moves from `tools.py` to `tools_meta.py`).
 
 No imaging.py signature change is needed: `imaging.generate_and_upload`
-already takes `conversation_key` as a kwarg. The actual change is in
-the `generate_image` tool body inside `build_pmo_mcp(ctx)`, which now
-passes `ctx.conversation_key` to that existing kwarg instead of
-reading the removed module global.
+already takes `conversation_key` as a kwarg. The `generate_image` tool
+body inside `build_meta_mcp(ctx)` passes `ctx.conversation_key` to that
+existing kwarg instead of reading the removed module global.
 
 ---
 
@@ -2940,6 +3352,14 @@ agent commonly mishandles. For traceability:
 | 115 | §6.2 SQL helpers `mark_bot_action_failed`, `mark_bot_action_undone`, `mark_bot_action_reconciled_unknown` updated by `id` only. A delayed worker or miswired callsite could overwrite a terminal row (`success` / `undone` / prior recovery state) | All three helpers now use `WHERE id=$id AND status='pending'` AND `RETURNING *`. The 0-row case (terminal already) is handled by §11 helper contract: re-read by id and dispatch on the actual current status. Caught in iter-29 Codex review (cherry-picked). |
 | 116 | `bot_actions_pending_idx` was on `(status, created_at)`. The §5.3 stuck-pending GC actually queries by row age = `now() - updated_at` (since `update_for_retry` resets the GC clock by bumping `updated_at`). Index/predicate mismatch → seq scan on hot GC path | Index changed to `(status, updated_at) WHERE status='pending'`. Bootstrap lock recovery still uses `created_at` because it has no retry/heartbeat. Caught in iter-29 Codex review (cherry-picked). |
 | 117 | §9 / §11 said to "append" §9 directives to the system prompt, but the existing `SYSTEM_PROMPT` lists the read-only tool inventory and explicitly says "this is a read-only assistant". Appending without removing those leaves contradictory instructions | §9 now directs implementer to REPLACE the tool inventory + remove the read-only sentence first, then weave in the directive block. §7 / §11 step 8 updated accordingly. Caught in iter-30 Codex review (cherry-picked). |
+| 118 | v1 spec (8 tools) was scoped to "bot writes its own workspace only" — but real PMO use cases include "把这些 todo 加到 alex 的项目跟踪表" (write to others) and "看一下产品需求文档 v3 帮我总结" (read others). The narrow scope made the bot feel like a meeting secretary, not a PMO | v21 expands to 18 tools across 5 domains. Read tools (3) accept any user-pasted Feishu link; write tools (8 net new) are workspace-gated to `bot_workspace.base_app_token` / `docs_folder_token`. `append_to_doc` adds an authorship gate: the target docx must be a row in `bot_actions WHERE target_kind='docx' AND status='success' AND action_type IN ('create_doc','create_meeting_doc')`. Trust model from §1.4 unchanged — bot writes only to its own artifacts. Caught during architecture review after the user asked "为什么是 create_meeting_doc 而不是任意 doc?". |
+| 119 | The original §3 / §7 had all 9 tools in a single `bot/agent/tools.py` file (~1500 lines projected). After v21's expansion to 18 tools, single-file maintenance becomes painful and changes to one domain risk regressions in another | Split into 5 MCP server modules per domain, mirroring `feishu-cc`'s pattern: `tools_meta.py` / `tools_calendar.py` / `tools_bitable.py` / `tools_doc.py` / `tools_external.py`. Each exports `build_<domain>_mcp(ctx)`; `runner.py` registers all 5 via `mcp_servers={...}` dict. The LLM sees a flat `allowed_tools` list of ~25 entries (no progressive disclosure in v1 — see "future work" §12). |
+| 120 | The split MCP servers introduce 5 new tool-name prefixes (`mcp__pmo_meta__*`, `mcp__pmo_calendar__*`, etc.). The existing 7 read tools change from `mcp__pmo__*` to `mcp__pmo_meta__*`. Anything string-matching the old prefix breaks silently | §7 explicitly flags `bot/app.py` card-rendering code (around line 255 strips `mcp__pmo__`) and `runner.py:179` allowed_tools list as needing updates. Smoke test in §11 step 9 verifies the progress card still shows clean tool names after the prefix change. |
+| 121 | `read_doc` / `read_external_table` could be abused by the LLM to exhaustively read large external resources, blowing token budget | `read_doc` truncates to `max_chars=20000` with a clear truncation marker; `read_external_table` caps at `page_size=50` (hard ceiling 200) AND has a per-conversation rate limit of 5 calls/hour. Rate limit lives in tool body via in-memory dict keyed on `ctx.conversation_key`. |
+| 122 | `append_to_doc` could let an attacker trick the bot into modifying any doc shared with the bot for read access — Feishu permissions don't distinguish "edit because shared" from "edit because authored" | `append_to_doc` has an authorship gate (Phase -1) that queries `bot_actions WHERE target_id=doc_token AND target_kind='docx' AND status='success' AND action_type IN ('create_doc','create_meeting_doc','append_to_doc')`. Refuse if no row. Each appended block carries a `<!-- bot_action_id=<uuid> -->` HTML comment marker so undo can find/remove blocks even if the response was lost mid-flight. |
+| 123 | `create_bitable_table` undo deletes the table — and any rows the user/bot added since creation. Without a warning, the user might lose data they didn't know was tied to the table | §3.13 undo includes `restore_caveats: ["the table contained N rows that were also deleted"]` in the response. Smoke test §11 step 9 verifies the agent surfaces this caveat to the user. |
+| 124 | `append_to_my_table` overlaps with `append_action_items` — both write to bot's own Bitable. The agent might call `append_to_my_table` against the `action_items` table and bypass schema validation | §3.14 Phase -1 explicitly refuses `table_id IN (action_items_table_id, meetings_table_id)` and redirects the agent to the schema-validating `append_action_items`. Tool description directive reinforces this. |
+| 125 | The spec didn't say where `today_iso` (existing tool) lives after the v21 split. Without explicit re-homing, an implementer might leave it in the renamed `tools.py` file and miss the `tools_meta.py` move | §3 module mapping table explicitly lists `today_iso` (and the other 6 existing read tools) under `tools_meta.py`. §7 ownership table notes "the old `tools.py` is renamed to `tools_meta.py`". |
 
 ---
 
@@ -3124,52 +3544,189 @@ internals.
 
    Also add `bot_workspace` helpers: `get_bot_workspace()`,
    `update_bot_workspace(...)`.
-3. **`feishu/client.py`** — wrap calendar/bitable/docx/contact endpoints.
+3. **Feishu SDK wrappers — split into 5 files** (post-iter-31):
+   - `bot/feishu/auth.py` — extract `get_tenant_access_token()` from
+     the inline POST currently in `feishu/client.py:67`. Required by
+     `contact.py` (`search_users` raw httpx call).
+   - `bot/feishu/calendar.py` — calendar v4 wrappers: `create_calendar`
+     (bootstrap), `primarys`, `freebusy_batch`, `create_event` (with
+     `idempotency_key`), `get_event` (with `need_attendee=True,
+     user_id_type='open_id'`), `delete_event`, `invite_attendees`,
+     `list_events`. EventNotFound exception for §3.9 404-as-success.
+   - `bot/feishu/bitable.py` — bitable v1 wrappers: `app.create`,
+     `app.get`, `app_table.create`, `app_table.batch_delete` (for
+     undo of `create_bitable_table`), `app_table.get`,
+     `app_table_field.list` (for `describe_my_table`),
+     `app_table_record.batch_create` (with `client_token`),
+     `app_table_record.batch_delete`, `app_table_record.search`.
+     Every call passes `user_id_type='open_id'`. Plus a
+     `bootstrap_base()` convenience for §4 that creates the base +
+     two seed tables atomically.
+   - `bot/feishu/drive.py` — drive v1 wrappers: `file.upload_all`,
+     `file.delete` (with `type` param), `file.create_folder`,
+     `import_task.create`, `import_task.get`. FileNotFound exception
+     for §3.9 404-as-success.
+   - `bot/feishu/docx.py` — docx v1 wrappers: `document.create`
+     (Path B fallback — DEFERRED to v2 per spec row 117),
+     `document_block.list` (for `read_doc` markdown rendering),
+     `document_block_children.create` (for `append_to_doc`),
+     `document_block_children.batch_delete` (for `append_to_doc`
+     undo). Note v1 ships read + append paths; document.create is
+     reachable only via Path A in `tools_doc.py:_drive_import_markdown`,
+     which lives in drive.py. Path B fallback is deferred.
+   - `bot/feishu/contact.py` — contact v3 wrappers: `user.get` (for
+     today_iso timezone), `user.batch_get_id` (for resolve_people
+     email/phone path), and a raw httpx wrapper for
+     `/open-apis/search/v1/user` (lark-oapi has no
+     `contact.v3.user.search`).
+   - `bot/feishu/wiki.py` — wiki v2 wrapper: `space.node.get` for
+     `resolve_feishu_link` to dereference `/wiki/<token>` URLs into
+     underlying docx/sheet/bitable tokens.
+   - `bot/feishu/links.py` — pure-function URL parser used by
+     `resolve_feishu_link`; no Feishu API calls. Calls `wiki.py`
+     only for the `/wiki/` redirect case.
+
+   `bot/feishu/client.py` is mostly unchanged — only `fetch_self_info`
+   refactored to call `auth.py:get_tenant_access_token()`. The
+   existing IM helpers (`add_reaction`, `reply_text`, `reply_post`,
+   `reply_card`, `patch_card`, etc.) stay where they are.
 4. **Create `bot/scripts/` directory + `bootstrap_bot_workspace.py`** —
    run once against dev env, verify the calendar/base/folder appear
    correctly. Re-runnable: detects existing workspace row and exits.
-5. **Per-pooled-client `RequestContext` refactor** — touches three
-   files; ship and bake **before** any new write tools land:
-   - `bot/agent/tools.py`: define `RequestContext` dataclass; convert
-     `build_pmo_mcp` from a no-arg helper to a factory
-     `build_pmo_mcp(ctx)` whose tool implementations close over
-     `ctx`. Remove the old `_current_conversation_key_var` global
-     and `set_current_conversation`.
-   - `bot/agent/runner.py`: each `_PooledClient` gets a fresh
-     `RequestContext` at construction and passes it into
-     `build_pmo_mcp(ctx)`. The public `answer` and `answer_streaming`
-     functions gain `message_id`, `chat_id`, `sender_open_id`
-     keyword parameters. Inside `answer_streaming`, after
-     `async with slot.lock:` (the existing line at `runner.py:240`),
-     assign all four request fields to `slot.ctx` BEFORE calling
-     `slot.client.query(...)`. The `agent_tools.set_current_conversation`
-     line at `runner.py:244` is removed in the same diff.
-   - `bot/app.py`: update both call sites of `agent_runner.answer*` —
-     the streaming path at `app.py:184` and the fallback `answer`
-     path at `app.py:158-160` — to pass the three new keyword
-     arguments. **Do not** import `_get_client`, `_PooledClient`,
-     `slot.lock`, or `slot.ctx` from runner. The pool stays a private
-     implementation detail of `runner.py`.
-   - `bot/agent/imaging.py` does not change. The
-     `generate_image` tool body inside `build_pmo_mcp(ctx)` already
-     has `ctx` in scope; it passes `ctx.conversation_key` to
-     `imaging.generate_and_upload`'s existing `conversation_key`
-     kwarg.
+5. **Per-pooled-client `RequestContext` refactor + MCP server split**
+   (post-iter-31, ship as ONE atomic commit because the rename
+   touches both runner.py and tools.py):
 
-   This is a **pure refactor** — no new tool, no new behavior. Existing
-   read tools should continue working unchanged. Verify with the
-   existing test set (or a manual round-trip in dev) before moving on.
+   a. **Define RequestContext** in a NEW file `bot/agent/request_context.py`
+      (separate from `tools_meta.py` so it has zero import cycles).
+      Removes the old `_current_conversation_key_var` global from
+      `bot/agent/tools.py`.
 
-6. **`bot/agent/runner.py` — `allowed_tools` whitelist**: add the 8
-   new `mcp__pmo__*` entries to the existing `allowed_tools` list at
-   `runner.py:179`. **This step blocks step 9** (smoke test): without
-   it the LLM never sees the new tools.
-7. **`agent/tools.py`** — add the 8 new tools (`resolve_people`,
-   `schedule_meeting`, `cancel_meeting`, `list_my_meetings`,
-   `append_action_items`, `query_action_items`, `create_meeting_doc`,
-   `undo_last_action`) plus the `today_iso` extension as inner
-   functions inside `build_pmo_mcp(ctx)`; each follows the §5.1
-   skeleton and reads context from `ctx`.
+   b. **Rename `bot/agent/tools.py` → `bot/agent/tools_meta.py`** and
+      convert `build_pmo_mcp()` → `build_meta_mcp(ctx)`. Keep the 7
+      existing read tools' implementations unchanged; only the
+      wrapping factory signature + the closure-capture pattern
+      changes. Add `resolve_people`, `today_iso` (extended), and
+      `undo_last_action` here.
+
+   c. **Create the four new MCP modules** (each exports `build_<x>_mcp(ctx)`):
+      - `bot/agent/tools_calendar.py`
+      - `bot/agent/tools_bitable.py`
+      - `bot/agent/tools_doc.py`
+      - `bot/agent/tools_external.py`
+
+   d. **`bot/agent/runner.py`** changes:
+      - Each `_PooledClient` gets a fresh `RequestContext` at
+        construction.
+      - The same `ctx` passes into ALL FIVE factories:
+        ```python
+        mcp_servers = {
+            "pmo_meta": build_meta_mcp(ctx),
+            "pmo_calendar": build_calendar_mcp(ctx),
+            "pmo_bitable": build_bitable_mcp(ctx),
+            "pmo_doc": build_doc_mcp(ctx),
+            "pmo_external": build_external_mcp(ctx),
+        }
+        ```
+      - The public `answer` and `answer_streaming` functions gain
+        `message_id`, `chat_id`, `sender_open_id` keyword
+        parameters.
+      - Inside `answer_streaming`, after `async with slot.lock:`
+        (existing line at `runner.py:240`), assign all four request
+        fields to `slot.ctx` BEFORE calling `slot.client.query(...)`.
+      - The `agent_tools.set_current_conversation` line at
+        `runner.py:244` is removed in the same diff.
+
+   e. **`bot/app.py`** changes:
+      - Both call sites of `agent_runner.answer*` — the streaming path
+        at `app.py:184` and the fallback `answer` path at
+        `app.py:158-160` — pass the three new keyword arguments.
+        **Do not** import `_get_client` / `slot.*` from runner.
+      - The progress-card tool-name display (around `app.py:255`,
+        `name[len("mcp__pmo__"):]`) needs updating to strip the
+        new prefixes:
+        ```python
+        for prefix in ("mcp__pmo_meta__", "mcp__pmo_calendar__",
+                       "mcp__pmo_bitable__", "mcp__pmo_doc__",
+                       "mcp__pmo_external__"):
+            if name.startswith(prefix):
+                display = name[len(prefix):]
+                break
+        else:
+            display = name
+        ```
+        Without this the user sees ugly raw tool names in the
+        progress card.
+
+   f. **`bot/agent/imaging.py`** does NOT change. The
+      `generate_image` tool body inside `build_meta_mcp(ctx)` already
+      has `ctx` in scope; it passes `ctx.conversation_key` to
+      `imaging.generate_and_upload`'s existing `conversation_key`
+      kwarg.
+
+   This step is **load-bearing**: ship before any new write tool
+   lands. Existing read tools must continue working unchanged
+   (regression check: send a question to the bot in Feishu and
+   verify it answers as before).
+
+6. **`bot/agent/runner.py` — `allowed_tools` whitelist (full rewrite)**:
+   replace the entire list at `runner.py:179` with the
+   ~25 entries:
+   ```python
+   allowed_tools=[
+       # meta
+       "mcp__pmo_meta__list_users",
+       "mcp__pmo_meta__lookup_user",
+       "mcp__pmo_meta__get_recent_turns",
+       "mcp__pmo_meta__get_project_overview",
+       "mcp__pmo_meta__get_activity_stats",
+       "mcp__pmo_meta__generate_image",
+       "mcp__pmo_meta__today_iso",
+       "mcp__pmo_meta__resolve_people",
+       "mcp__pmo_meta__undo_last_action",
+       # calendar
+       "mcp__pmo_calendar__schedule_meeting",
+       "mcp__pmo_calendar__cancel_meeting",
+       "mcp__pmo_calendar__list_my_meetings",
+       # bitable
+       "mcp__pmo_bitable__append_action_items",
+       "mcp__pmo_bitable__query_action_items",
+       "mcp__pmo_bitable__create_bitable_table",
+       "mcp__pmo_bitable__append_to_my_table",
+       "mcp__pmo_bitable__query_my_table",
+       "mcp__pmo_bitable__describe_my_table",
+       # doc
+       "mcp__pmo_doc__create_doc",
+       "mcp__pmo_doc__append_to_doc",
+       "mcp__pmo_doc__create_meeting_doc",
+       # external
+       "mcp__pmo_external__read_doc",
+       "mcp__pmo_external__read_external_table",
+       "mcp__pmo_external__resolve_feishu_link",
+   ]
+   ```
+   **This step blocks the smoke test**: without it the LLM never
+   sees the new tools.
+
+7. **Tools implementation** — for each MCP module, add the tools
+   inside the corresponding `build_<x>_mcp(ctx)` factory. Order:
+   - `tools_meta.py`: `resolve_people` (§3.1), `today_iso` extension
+     (§3.2), `undo_last_action` (§3.9). Existing 7 read tools stay
+     unchanged.
+   - `tools_calendar.py`: `schedule_meeting` (§3.3), `cancel_meeting`
+     (§3.4), `list_my_meetings` (§3.5). Each follows the §5.1
+     skeleton.
+   - `tools_bitable.py`: `append_action_items` (§3.6),
+     `query_action_items` (§3.7), `create_bitable_table` (§3.13),
+     `append_to_my_table` (§3.14), `query_my_table` (§3.15),
+     `describe_my_table` (§3.16).
+   - `tools_doc.py`: `create_meeting_doc` (§3.8), `create_doc` (§3.10),
+     `append_to_doc` (§3.12). Factor a private
+     `_drive_import_markdown(ctx, action_id, title, markdown)` helper
+     used by both `create_meeting_doc` and `create_doc` for the
+     3-step Path A flow.
+   - `tools_external.py`: `read_doc` (§3.11), `read_external_table`
+     (§3.17), `resolve_feishu_link` (§3.18).
 8. **System prompt** — REPLACE the existing tool inventory and the "this is a read-only assistant" sentence in `bot/agent/runner.py`'s `SYSTEM_PROMPT`, then weave in §9 directives
    (`SYSTEM_PROMPT` constant).
 9. **End-to-end smoke test** in a private Feishu group, mandatory
@@ -3223,10 +3780,60 @@ internals.
       original request). Run two such requests concurrently and
       confirm only **one** new base is created (the lock row in
       `bot_actions` mediates).
+    - **NEW (v21) — `create_doc` + `append_to_doc` flow**: ask
+      "帮我建一份「项目 X 起步会议纪要」". Bot calls `create_doc`,
+      returns URL. Then ask "再加一段：决议 — alex 负责调研 Y";
+      bot calls `append_to_doc` against the just-created doc, returns
+      success. Open the doc, verify both sections exist + the AI-origin
+      banner is at the top + each appended block has the
+      `<!-- bot_action_id=... -->` HTML comment marker. Then say
+      "撤销刚才的追加" — bot calls `undo_last_action`, only the
+      appended blocks are removed; the original creation is intact.
+    - **NEW (v21) — `append_to_doc` authorship gate**: in a doc the
+      bot did NOT create (a user-shared doc), ask "把这段加到那个
+      文档里" (paste link). Bot must refuse with "我只能改我自己创建
+      的文档", no Feishu side effect, no `bot_actions` row.
+    - **NEW (v21) — `create_bitable_table` + `append_to_my_table`
+      flow**: ask "帮我建一张项目跟踪表，字段是：项目名、负责人、状态
+      (未开始/进行中/已完成)、截止日期". Bot calls
+      `create_bitable_table`, returns the new table_id. Then ask
+      "把项目 X 加进去，alex 负责，进行中，5 月 15 日截止". Bot calls
+      `describe_my_table` first, then `append_to_my_table`. Open the
+      table in Feishu, verify the row exists with correct field values
+      (especially the Person field showing alex's avatar — this proves
+      `user_id_type='open_id'` is correctly set).
+    - **NEW (v21) — `read_external_table` rate limit**: paste a
+      Bitable URL the bot has read access to, ask the bot to read it.
+      Repeat 5 times in a row → all succeed. 6th time within the same
+      hour → bot returns "已达频次上限" without making the Feishu API
+      call (verify in Feishu admin / logs that no API call was made).
+    - **NEW (v21) — `read_doc` truncation**: paste a long docx URL
+      (>20,000 chars). Bot reads it, returns a summary, surfaces "文档
+      很长，我只看了前面 20000 字符" to the user.
+    - **NEW (v21) — `resolve_feishu_link` wiki redirect**: paste a
+      `/wiki/<token>` URL. Bot first calls `resolve_feishu_link`,
+      gets back `{kind: 'docx', doc_token: ...}` (the wiki redirect
+      target), then calls `read_doc` against the resolved token. Verify
+      the agent's tool-call trace shows both calls in order.
+    - **NEW (v21) — workspace gate on `append_to_my_table`**: try
+      passing the `action_items` table_id to `append_to_my_table` —
+      bot refuses with redirect-to-`append_action_items` message
+      (no Feishu call, no `bot_actions` row).
+    - **NEW (v21) — `create_bitable_table` undo with row data loss
+      caveat**: build a table, add 2 rows manually in the Bitable UI
+      (NOT via the bot), then ask the bot to undo the table creation.
+      Verify the bot deletes the table AND surfaces "the table
+      contained N rows that were also deleted" caveat to the user.
+    - **NEW (v21) — tool-name display after MCP split**: trigger any
+      tool call (e.g. `schedule_meeting`); verify the progress card
+      shows "schedule_meeting" not "mcp__pmo_calendar__schedule_meeting".
+      This validates the `app.py:255` regex update.
 
 Each step touches at most one or two files. Step 5 is the largest
-single touch (4 files), and is intentionally separated from new-
-behavior steps so a regression there is easier to bisect.
+single touch (~9 files: 5 new MCP modules + runner.py + app.py +
+request_context.py + tools.py rename), and is intentionally
+separated from new-behavior steps so a regression there is easier
+to bisect.
 
 ---
 
