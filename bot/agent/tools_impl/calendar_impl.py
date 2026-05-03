@@ -54,7 +54,12 @@ def _normalize_meeting_window(since: str | None, until: str | None, timezone_nam
 
     if _is_date_only(until):
         end_date = datetime.fromisoformat(until).date()
-        end = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=user_zone)
+        if _is_date_only(since) and start is not None:
+            if end_date <= start.date():
+                end_date = start.date() + timedelta(days=1)
+            end = datetime.combine(end_date, datetime.min.time(), tzinfo=user_zone)
+        else:
+            end = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=user_zone)
     elif until:
         end = datetime.fromisoformat(until.replace("Z", "+00:00"))
         if not end.tzinfo:
@@ -231,13 +236,20 @@ async def list_my_meetings(ctx: RequestContext, args: dict[str, Any]) -> dict[st
     bot_known_all = queries.bot_known_events_for_attendee(ctx.chat_id, target) if target else []
     bot_known = _filter_events_by_window(bot_known_all, since, until)
     user_events: list[dict[str, Any]] = []
+    user_busy_slots: list[dict[str, Any]] = []
     user_calendar_error: str | None = None
     user_calendar_warning: str | None = None
+    user_freebusy_error: str | None = None
     if target and since and until:
+        try:
+            user_busy_slots = await calendar.batch_freebusy([target], since, until)
+        except Exception as e:
+            user_freebusy_error = f"{type(e).__name__}: {e}"
         try:
             primary = await calendar.primary_calendar_id(target)
             if primary:
                 user_events = await calendar.list_events(primary, since, until)
+                user_events = _filter_events_by_window(user_events, since, until)
             else:
                 user_calendar_warning = "primary_calendar_not_visible_to_bot"
         except Exception as e:
@@ -252,7 +264,9 @@ async def list_my_meetings(ctx: RequestContext, args: dict[str, Any]) -> dict[st
         "user_timezone": user_timezone,
         "bot_known_events": bot_known,
         "user_calendar_events": user_events,
+        "user_busy_slots": user_busy_slots,
         "user_calendar_error": user_calendar_error,
         "user_calendar_warning": user_calendar_warning,
+        "user_freebusy_error": user_freebusy_error,
         "visibility_note": "只返回包工头可见的日程；用户主日历可能受飞书权限限制。",
     })
