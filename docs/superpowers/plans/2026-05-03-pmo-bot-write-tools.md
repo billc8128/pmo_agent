@@ -18,33 +18,83 @@
 
 ### New files (created by this plan)
 
+> **v5 update for spec v21**: now ships 18 tools across 5 MCP server
+> modules (was 9 in single tools.py). Old `bot/agent/tools.py` is
+> renamed to `bot/agent/tools_meta.py`; four new MCP module files
+> are created. Feishu wrappers also expand to cover docx/wiki/links.
+
+#### Schema + bootstrap
+
 | Path | Purpose |
 |---|---|
 | `backend/supabase/migrations/0010_bot_workspace.sql` | Single-row config table for bot's calendar/base/folder ids |
 | `backend/supabase/migrations/0011_bot_actions.sql` | Idempotency + audit + lock table |
 | `bot/scripts/__init__.py` | (empty) |
 | `bot/scripts/bootstrap_bot_workspace.py` | One-shot script to create bot's calendar / Bitable / Docs folder |
+
+#### Agent infrastructure
+
+| Path | Purpose |
+|---|---|
 | `bot/agent/request_context.py` | `RequestContext` dataclass — per-pooled-client mutable scope |
-| `bot/feishu/calendar.py` | Calendar SDK wrappers (freebusy, event create/get/delete, attendee invite, primarys) |
-| `bot/feishu/bitable.py` | Bitable SDK wrappers (app create/get, table create, record batch_create/batch_delete/search) |
-| `bot/feishu/drive.py` | Drive SDK wrappers (file upload_all/delete/create_folder, import_task create/get) |
-| `bot/feishu/contact.py` | Contact: `user.get` (timezone), `batch_get_id` (email/phone), and **raw httpx** wrapper for `/open-apis/search/v1/user` |
-| `bot/feishu/auth.py` | Shared `tenant_access_token` issuer extracted from `feishu/client.py:67` (factored out to support contact search) |
-| `bot/agent/canonical_args.py` | `compute_logical_key` + canonicalization helpers (sorted-keys JSON, UTC time normalization) |
+| `bot/agent/canonical_args.py` | `compute_logical_key` + canonicalization helpers (sorted-keys JSON, UTC time, asker auto-include, attendee dedup) |
+
+#### Feishu SDK wrappers (split per Feishu API surface)
+
+| Path | Purpose |
+|---|---|
+| `bot/feishu/auth.py` | Shared `tenant_access_token` issuer extracted from `feishu/client.py:67` |
+| `bot/feishu/calendar.py` | Calendar v4 wrappers (calendar.create, primarys, freebusy.batch, calendar_event.create/get/delete/list, calendar_event_attendee.create) |
+| `bot/feishu/bitable.py` | Bitable v1 wrappers (app.create/get, app_table.create/get/batch_delete, app_table_field.list, app_table_record.batch_create/batch_delete/search) plus a `bootstrap_base()` convenience |
+| `bot/feishu/drive.py` | Drive v1 wrappers (file.upload_all/delete/create_folder, import_task.create/get) |
+| `bot/feishu/docx.py` | Docx v1 wrappers (document_block.list, document_block_children.create/batch_delete) |
+| `bot/feishu/contact.py` | Contact v3 wrappers (user.get, user.batch_get_id) + raw httpx wrapper for `/open-apis/search/v1/user` |
+| `bot/feishu/wiki.py` | Wiki v2 wrapper (space.node.get for `/wiki/<token>` redirect resolution) |
+| `bot/feishu/links.py` | Pure-function URL parser used by `resolve_feishu_link`; calls `wiki.py` only for the wiki redirect path |
+
+#### Agent tool modules (one MCP server per file)
+
+| Path | Purpose |
+|---|---|
+| `bot/agent/tools_meta.py` | **Renamed from `tools.py`**. Hosts the 7 existing read tools (list_users, lookup_user, get_recent_turns, get_project_overview, get_activity_stats, today_iso extension, generate_image) + 3 new meta tools (resolve_people, undo_last_action, expanded today_iso). Exports `build_meta_mcp(ctx)`. |
+| `bot/agent/tools_calendar.py` | schedule_meeting + cancel_meeting + list_my_meetings. Exports `build_calendar_mcp(ctx)`. |
+| `bot/agent/tools_bitable.py` | append_action_items + query_action_items + create_bitable_table + append_to_my_table + query_my_table + describe_my_table. Exports `build_bitable_mcp(ctx)`. |
+| `bot/agent/tools_doc.py` | create_meeting_doc + create_doc + append_to_doc + private `_drive_import_markdown(ctx, action_id, title, markdown)` helper. Exports `build_doc_mcp(ctx)`. |
+| `bot/agent/tools_external.py` | read_doc + read_external_table + resolve_feishu_link. Exports `build_external_mcp(ctx)`. |
+
+#### Tests (one file per tool module + helpers)
+
+| Path | Purpose |
+|---|---|
 | `bot/tests/__init__.py` | (empty) |
 | `bot/tests/conftest.py` | pytest fixtures: in-memory bot_actions stub, fake `RequestContext`, time-freeze |
 | `bot/tests/test_canonical_args.py` | logical_key hashing tests |
-| `bot/tests/test_queries_bot_actions.py` | DB helper tests (insert / mark_failed / mark_undone / GC / unique-constraint dispatch) |
+| `bot/tests/test_queries_bot_actions.py` | DB helper tests |
 | `bot/tests/test_request_context.py` | RequestContext closure-capture sanity test |
-| `bot/tests/test_tools_resolve_people.py` | resolve_people tests (3-tier resolution, error handling) |
-| `bot/tests/test_tools_today_iso.py` | today_iso extension test (timezone fetch) |
-| `bot/tests/test_tools_schedule_meeting.py` | schedule_meeting Phase -1 / 0 / 1 / 2 / 3 tests including conflict + partial-success |
-| `bot/tests/test_tools_cancel_meeting.py` | cancel_meeting tests (last:true + explicit event_id, status gates, source_meeting_action_id) |
-| `bot/tests/test_tools_list_my_meetings.py` | list_my_meetings tests (self default, primarys lookup, dual result sets) |
-| `bot/tests/test_tools_append_action_items.py` | append tests (ambiguous flow, target persistence, ambiguous post-send failure) |
-| `bot/tests/test_tools_query_action_items.py` | query tests |
-| `bot/tests/test_tools_create_meeting_doc.py` | doc tests (Path A 3-step, partial paths, undo cleanup) |
-| `bot/tests/test_tools_undo_last_action.py` | undo tests (per dispatch type, 404-as-success, last_for_me sentinels) |
+| `bot/tests/test_feishu_auth.py` | tenant_access_token issuer (respx mock) |
+| `bot/tests/test_feishu_calendar.py` | calendar.py wrapper tests |
+| `bot/tests/test_feishu_bitable.py` | bitable.py wrapper tests |
+| `bot/tests/test_feishu_drive.py` | drive.py wrapper tests |
+| `bot/tests/test_feishu_docx.py` | docx.py wrapper tests |
+| `bot/tests/test_feishu_contact.py` | contact.py wrapper tests (incl. raw httpx search_users) |
+| `bot/tests/test_feishu_wiki.py` | wiki.py wrapper test |
+| `bot/tests/test_feishu_links.py` | URL parser unit tests (docx / wiki / base / sheet patterns) |
+| `bot/tests/test_tools_meta_resolve_people.py` | resolve_people 3-tier resolution |
+| `bot/tests/test_tools_meta_today_iso.py` | today_iso extension (timezone via contact.user.get) |
+| `bot/tests/test_tools_meta_undo_last_action.py` | undo dispatch (one test file per action_type arm) |
+| `bot/tests/test_tools_calendar_schedule_meeting.py` | schedule_meeting Phase -1 / 0 / 1a / 1b / 2.X.5 / 3 |
+| `bot/tests/test_tools_calendar_cancel_meeting.py` | cancel_meeting (last:true + explicit event_id + Phase 2a.5 snapshot) |
+| `bot/tests/test_tools_calendar_list_my_meetings.py` | dual result sets, primarys lookup, rate-limit not applicable |
+| `bot/tests/test_tools_bitable_append_action_items.py` | ambiguous flow, client_token, source_action_id marker |
+| `bot/tests/test_tools_bitable_query_action_items.py` | basic query |
+| `bot/tests/test_tools_bitable_create_table.py` | **NEW v21**: create_bitable_table (workspace gate, schema validation) |
+| `bot/tests/test_tools_bitable_my_table.py` | **NEW v21**: append_to_my_table + query_my_table + describe_my_table (workspace gate, action_items_table_id refusal) |
+| `bot/tests/test_tools_doc_create_meeting_doc.py` | Path A 3-step, partial paths |
+| `bot/tests/test_tools_doc_create_doc.py` | **NEW v21**: create_doc (same Path A, no meeting linkage) |
+| `bot/tests/test_tools_doc_append_to_doc.py` | **NEW v21**: append_to_doc (authorship gate, block_id capture, undo block-level delete) |
+| `bot/tests/test_tools_external_read_doc.py` | **NEW v21**: read_doc (block-list → markdown render, truncation, 403 messaging) |
+| `bot/tests/test_tools_external_read_external_table.py` | **NEW v21**: read_external_table (rate limit 5/h, page_size cap, 403) |
+| `bot/tests/test_tools_external_resolve_feishu_link.py` | **NEW v21**: URL parsing for docx/wiki/base, wiki redirect via wiki.py |
 
 ### Modified files
 
@@ -52,19 +102,19 @@
 |---|---|
 | `bot/requirements.txt` | Add `pytest`, `pytest-asyncio`, `respx`, `freezegun` |
 | `bot/feishu/client.py` | Replace inline `tenant_access_token` POST in `fetch_self_info` with `feishu/auth.py:get_tenant_access_token()` (no functional change) |
-| `bot/db/queries.py` | Add `bot_workspace` + `bot_actions` helpers (~12 new functions) |
-| `bot/agent/tools.py` | Convert `build_pmo_mcp` to factory `build_pmo_mcp(ctx)`, add 8 new tools as inner functions, extend `today_iso` |
-| `bot/agent/runner.py` | Add `RequestContext` per `_PooledClient`, `answer*` accept `message_id`/`chat_id`/`sender_open_id` kwargs, expand `allowed_tools`, replace `SYSTEM_PROMPT` tool inventory |
-| `bot/agent/imaging.py` | (no change to signature; caller in tools.py changes how it's called) |
-| `bot/app.py` | `_handle_message` calls `answer_streaming(...)` with new kwargs |
-| `bot/README.md` | Document the 10 Feishu scopes that need to be enabled |
+| `bot/db/queries.py` | Add `bot_workspace` + `bot_actions` helpers (~16 new functions, includes append_to_doc/read_doc support) |
+| `bot/agent/tools.py` | **Renamed to `bot/agent/tools_meta.py`** — see Task 6.1. Module body becomes a factory `build_meta_mcp(ctx)` and loses `_current_conversation_key_var` + `set_current_conversation`. The 8 calendar/bitable/doc/external tools live in their own files. |
+| `bot/agent/runner.py` | Add `RequestContext` per `_PooledClient`, `answer*` accept `message_id`/`chat_id`/`sender_open_id` kwargs. Replace single `mcp_servers={"pmo": ...}` with five servers (`pmo_meta`, `pmo_calendar`, `pmo_bitable`, `pmo_doc`, `pmo_external`). Expand `allowed_tools` with the new `mcp__pmo_<domain>__*` prefixes. Replace `SYSTEM_PROMPT` tool inventory. |
+| `bot/agent/imaging.py` | (no change to signature; caller in tools_meta.py changes how it's called — uses `ctx.conversation_key`) |
+| `bot/app.py` | (a) `_handle_message` calls `answer_streaming(...)` with new kwargs. (b) Line 255 (`tool_name.removeprefix("mcp__pmo__")`) updated to strip any of the 5 new prefixes (`mcp__pmo_meta__`, `mcp__pmo_calendar__`, `mcp__pmo_bitable__`, `mcp__pmo_doc__`, `mcp__pmo_external__`) before display. |
+| `bot/README.md` | Document the 12 Feishu scopes that need to be enabled (was 10 — adds `wiki:wiki:readonly` and `docs:document.media:download` for v21 read-any) |
 
 ### Removed (pure deletions)
 
 | Path / lines | Why |
 |---|---|
-| `bot/agent/tools.py:29-31` (`_current_conversation_key_var` + `set_current_conversation`) | Replaced by `RequestContext` closure |
-| `bot/agent/runner.py:244` (`agent_tools.set_current_conversation(conversation_key)`) | Same |
+| `bot/agent/tools.py:26-31` (`_current_conversation_key_var` + `set_current_conversation`) | Replaced by `RequestContext` closure (the file itself is renamed to `tools_meta.py`; deletion happens during the rename). |
+| `bot/agent/runner.py` (`agent_tools.set_current_conversation(conversation_key)` call) | Same. |
 
 ---
 
@@ -1904,7 +1954,7 @@ git commit -am "feat(db): acquire/release_bootstrap_lock with DELETE-on-release"
 
 ---
 
-# Task Group 4: Feishu auth + SDK wrappers (8 tasks)
+# Task Group 4: Feishu auth + SDK wrappers (10 tasks — v21 expanded)
 
 > **Spec ref:** §3.1, §3.3, §3.4, §3.5, §3.6, §3.8, §4. Spec §3.3bis API endpoint vs SDK attribute path table is the source of truth for resource names.
 
@@ -2601,21 +2651,328 @@ Commit:
 git commit -am "feat(feishu): drive v1 SDK wrappers (upload_all, import_task create/get, file delete)"
 ```
 
-### Task 4.7: ~~feishu/docx.py wrappers~~ — DELETED (iter-3 fix)
+### Task 4.7: feishu/docx.py wrappers (RESURRECTED for spec v21)
 
-> **Removed in plan iter-3.** v1 ships **Path A only** for
-> `create_meeting_doc` (drive.v1.import_task — see Task 8.5). Spec §3.8
-> mentions Path B (block-by-block append via `docx.v1`) as a future
-> fallback if `drive:drive` import permissions can't be granted in
-> production, but v1 doesn't include the Path B selection logic, undo
-> dispatch for Path B docs, or smoke tests for it. Adding Path B to
-> v1 is a deferred decision — if production hits permission denial,
-> file an issue and resurrect this task with full integration scope
-> (selection logic + undo dispatch + smoke).
->
-> File `bot/feishu/docx.py` is NOT created in v1. `bot/tests/test_feishu_docx.py` is NOT created either.
+> **iter-3 history:** This task was deleted in plan iter-3 because v1 only
+> needed `create_meeting_doc` Path A (drive.v1.import_task). v21 reintroduces
+> docx because **`read_doc` and `append_to_doc` need block-level access**
+> (Path A only handles whole-doc creation). Path B append is now a first-class
+> tool. Scope: read-any (block list) + write-own (block append/delete).
 
-### Task 4.8: Verify SDK call shapes against installed lark-oapi
+**Files:**
+- Create: `bot/feishu/docx.py`
+- Test: `bot/tests/test_feishu_docx.py`
+
+- [ ] **Step 1: Write failing test for `list_blocks` and `append_blocks`**
+
+```python
+import pytest
+from unittest.mock import MagicMock
+
+from feishu import docx
+
+
+@pytest.mark.asyncio
+async def test_list_blocks_returns_paginated_list(monkeypatch):
+    fake_resp_page1 = MagicMock(success=lambda: True)
+    fake_resp_page1.data.items = [MagicMock(block_id="b1"), MagicMock(block_id="b2")]
+    fake_resp_page1.data.has_more = True
+    fake_resp_page1.data.page_token = "tok2"
+
+    fake_resp_page2 = MagicMock(success=lambda: True)
+    fake_resp_page2.data.items = [MagicMock(block_id="b3")]
+    fake_resp_page2.data.has_more = False
+
+    calls = []
+    def fake_list(req):
+        calls.append(req)
+        return fake_resp_page1 if len(calls) == 1 else fake_resp_page2
+
+    fake_client = MagicMock()
+    fake_client.docx.v1.document_block.list = fake_list
+    monkeypatch.setattr(docx, "_client", lambda: fake_client)
+
+    blocks = await docx.list_blocks("doc_token_123")
+    assert [b.block_id for b in blocks] == ["b1", "b2", "b3"]
+```
+
+- [ ] **Step 2: Run test → expect import error / NotImplemented**
+
+```bash
+cd bot && pytest tests/test_feishu_docx.py::test_list_blocks_returns_paginated_list -v
+```
+
+- [ ] **Step 3: Implement `bot/feishu/docx.py`**
+
+```python
+"""Docx v1 wrappers — block-level read/append/delete on documents."""
+from __future__ import annotations
+
+from typing import Any
+
+import lark_oapi as lark
+from lark_oapi.api.docx.v1 import (
+    BatchDeleteDocumentBlockChildrenRequest,
+    BatchDeleteDocumentBlockChildrenRequestBody,
+    CreateDocumentBlockChildrenRequest,
+    CreateDocumentBlockChildrenRequestBody,
+    ListDocumentBlockRequest,
+)
+
+from .client import _client  # existing helper that returns lark_oapi.Client
+
+
+async def list_blocks(document_id: str) -> list[Any]:
+    """Return all blocks of a document, walking pagination."""
+    blocks: list[Any] = []
+    page_token: str | None = None
+    while True:
+        req = (
+            ListDocumentBlockRequest.builder()
+            .document_id(document_id)
+            .page_size(500)
+        )
+        if page_token:
+            req = req.page_token(page_token)
+        resp = _client().docx.v1.document_block.list(req.build())
+        if not resp.success():
+            raise RuntimeError(f"docx.list_blocks failed: {resp.code} {resp.msg}")
+        blocks.extend(resp.data.items or [])
+        if not resp.data.has_more:
+            return blocks
+        page_token = resp.data.page_token
+
+
+async def append_blocks(
+    document_id: str,
+    parent_block_id: str,
+    children: list[Any],
+    *,
+    index: int = -1,
+) -> list[str]:
+    """Append children blocks under parent_block_id; returns new block_ids."""
+    body = (
+        CreateDocumentBlockChildrenRequestBody.builder()
+        .children(children)
+        .index(index)
+        .build()
+    )
+    req = (
+        CreateDocumentBlockChildrenRequest.builder()
+        .document_id(document_id)
+        .block_id(parent_block_id)
+        .request_body(body)
+        .build()
+    )
+    resp = _client().docx.v1.document_block_children.create(req)
+    if not resp.success():
+        raise RuntimeError(f"docx.append_blocks failed: {resp.code} {resp.msg}")
+    return [c.block_id for c in (resp.data.children or [])]
+
+
+async def delete_blocks(
+    document_id: str, parent_block_id: str, block_ids: list[str]
+) -> None:
+    """Delete the specified children block_ids under parent_block_id."""
+    body = (
+        BatchDeleteDocumentBlockChildrenRequestBody.builder()
+        .block_ids(block_ids)
+        .build()
+    )
+    req = (
+        BatchDeleteDocumentBlockChildrenRequest.builder()
+        .document_id(document_id)
+        .block_id(parent_block_id)
+        .request_body(body)
+        .build()
+    )
+    resp = _client().docx.v1.document_block_children.batch_delete(req)
+    if not resp.success():
+        # 404 / NotFound is acceptable (already deleted) — caller may swallow.
+        raise RuntimeError(
+            f"docx.delete_blocks failed: code={resp.code} msg={resp.msg}"
+        )
+```
+
+- [ ] **Step 4: Run tests → green**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bot/feishu/docx.py bot/tests/test_feishu_docx.py
+git commit -m "feat(feishu): docx.v1 block list/append/delete wrappers"
+```
+
+### Task 4.8: feishu/wiki.py wrapper (NEW for spec v21)
+
+> Only needed for `resolve_feishu_link` to redirect `/wiki/<token>` URLs
+> to their underlying obj_token + obj_type. Single function.
+
+**Files:**
+- Create: `bot/feishu/wiki.py`
+- Test: `bot/tests/test_feishu_wiki.py`
+
+- [ ] **Step 1: Write failing test**
+
+```python
+import pytest
+from unittest.mock import MagicMock
+
+from feishu import wiki
+
+
+@pytest.mark.asyncio
+async def test_resolve_node_returns_obj_metadata(monkeypatch):
+    fake_resp = MagicMock(success=lambda: True)
+    fake_resp.data.node = MagicMock(obj_token="docx_xxx", obj_type="docx")
+    fake_client = MagicMock()
+    fake_client.wiki.v2.space_node.get = lambda req: fake_resp
+    monkeypatch.setattr(wiki, "_client", lambda: fake_client)
+
+    out = await wiki.resolve_node("wikcnXXXXXX")
+    assert out == {"obj_token": "docx_xxx", "obj_type": "docx"}
+```
+
+- [ ] **Step 2: Implement `bot/feishu/wiki.py`**
+
+```python
+"""Wiki v2 wrapper — resolve a /wiki/<token> URL to its underlying object."""
+from __future__ import annotations
+
+from lark_oapi.api.wiki.v2 import GetNodeSpaceRequest
+
+from .client import _client
+
+
+async def resolve_node(token: str) -> dict[str, str]:
+    """Given a wiki node token, return {'obj_token', 'obj_type'}.
+
+    obj_type is one of 'docx', 'sheet', 'bitable', 'mindnote', 'file'.
+    """
+    req = GetNodeSpaceRequest.builder().token(token).build()
+    resp = _client().wiki.v2.space_node.get(req)
+    if not resp.success():
+        raise RuntimeError(f"wiki.resolve_node failed: {resp.code} {resp.msg}")
+    node = resp.data.node
+    return {"obj_token": node.obj_token, "obj_type": node.obj_type}
+```
+
+- [ ] **Step 3: Run test → green; commit**
+
+```bash
+git add bot/feishu/wiki.py bot/tests/test_feishu_wiki.py
+git commit -m "feat(feishu): wiki.v2 space_node resolver for /wiki/<token>"
+```
+
+### Task 4.9: feishu/links.py URL parser (NEW for spec v21)
+
+> Pure function — no I/O except for the wiki redirect path. Powers
+> `resolve_feishu_link` (Task 7.4).
+
+**Files:**
+- Create: `bot/feishu/links.py`
+- Test: `bot/tests/test_feishu_links.py`
+
+- [ ] **Step 1: Write failing tests covering each URL pattern**
+
+```python
+import pytest
+
+from feishu import links
+
+
+def test_parse_docx_url():
+    out = links.parse_url("https://example.feishu.cn/docx/doxcnAAAA")
+    assert out == {"kind": "docx", "token": "doxcnAAAA"}
+
+
+def test_parse_sheet_url():
+    out = links.parse_url("https://example.feishu.cn/sheets/shtcnBBBB?sheet=ABC")
+    assert out == {"kind": "sheet", "token": "shtcnBBBB", "sheet_id": "ABC"}
+
+
+def test_parse_base_url_with_table():
+    out = links.parse_url(
+        "https://example.feishu.cn/base/bascnCCCC?table=tblD&view=vewE"
+    )
+    assert out == {
+        "kind": "bitable",
+        "app_token": "bascnCCCC",
+        "table_id": "tblD",
+        "view_id": "vewE",
+    }
+
+
+def test_parse_wiki_url():
+    out = links.parse_url("https://example.feishu.cn/wiki/wikcnFFFF")
+    assert out == {"kind": "wiki", "token": "wikcnFFFF"}
+
+
+def test_parse_unknown_url_raises():
+    with pytest.raises(ValueError):
+        links.parse_url("https://example.com/random")
+```
+
+- [ ] **Step 2: Implement `bot/feishu/links.py`**
+
+```python
+"""Pure URL parser for Feishu doc/wiki/sheet/base links.
+
+resolve_feishu_link uses parse_url to figure out what kind of object the
+user pasted, then optionally calls wiki.resolve_node for /wiki/ redirects.
+"""
+from __future__ import annotations
+
+import re
+from urllib.parse import parse_qs, urlparse
+
+_DOCX_RE = re.compile(r"^/docx/([A-Za-z0-9]+)$")
+_DOC_LEGACY_RE = re.compile(r"^/doc/([A-Za-z0-9]+)$")
+_SHEET_RE = re.compile(r"^/sheets/([A-Za-z0-9]+)$")
+_BASE_RE = re.compile(r"^/base/([A-Za-z0-9]+)$")
+_WIKI_RE = re.compile(r"^/wiki/([A-Za-z0-9]+)$")
+
+
+def parse_url(url: str) -> dict[str, str]:
+    """Parse a Feishu URL into {kind, token, ...}.
+
+    Recognised kinds: 'docx', 'doc' (legacy), 'sheet', 'bitable', 'wiki'.
+    Raises ValueError for unrecognised URLs.
+    """
+    parsed = urlparse(url.strip())
+    path = parsed.path
+    qs = parse_qs(parsed.query or "")
+
+    if m := _DOCX_RE.match(path):
+        return {"kind": "docx", "token": m.group(1)}
+    if m := _DOC_LEGACY_RE.match(path):
+        return {"kind": "doc", "token": m.group(1)}
+    if m := _SHEET_RE.match(path):
+        out = {"kind": "sheet", "token": m.group(1)}
+        if sheet_id := qs.get("sheet", [None])[0]:
+            out["sheet_id"] = sheet_id
+        return out
+    if m := _BASE_RE.match(path):
+        out = {"kind": "bitable", "app_token": m.group(1)}
+        if table_id := qs.get("table", [None])[0]:
+            out["table_id"] = table_id
+        if view_id := qs.get("view", [None])[0]:
+            out["view_id"] = view_id
+        return out
+    if m := _WIKI_RE.match(path):
+        return {"kind": "wiki", "token": m.group(1)}
+
+    raise ValueError(f"unrecognized Feishu URL: {url}")
+```
+
+- [ ] **Step 3: Run tests → green; commit**
+
+```bash
+git add bot/feishu/links.py bot/tests/test_feishu_links.py
+git commit -m "feat(feishu): URL parser for docx/wiki/base/sheet links"
+```
+
+### Task 4.10: Verify SDK call shapes against installed lark-oapi
 
 **Files:** none (manual verification)
 
@@ -2631,8 +2988,13 @@ paths = [
     'lark_oapi.api.calendar.v4.model.create_calendar_event_request',
     'lark_oapi.api.calendar.v4.model.calendar_event',
     'lark_oapi.api.bitable.v1.model.batch_create_app_table_record_request',
+    'lark_oapi.api.bitable.v1.model.create_app_table_request',
     'lark_oapi.api.drive.v1.model.upload_all_file_request',
     'lark_oapi.api.drive.v1.model.import_task',
+    'lark_oapi.api.docx.v1.model.list_document_block_request',
+    'lark_oapi.api.docx.v1.model.create_document_block_children_request',
+    'lark_oapi.api.docx.v1.model.batch_delete_document_block_children_request',
+    'lark_oapi.api.wiki.v2.model.get_node_space_request',
 ]
 for p in paths:
     mod = importlib.import_module(p)
@@ -2764,17 +3126,27 @@ git commit -m "feat(bootstrap): bot_workspace bootstrap script with lock + idemp
 
 ---
 
-# Task Group 6: RequestContext refactor (3 tasks)
+# Task Group 6: RequestContext refactor + MCP module split (5 tasks — v21 expanded)
 
-> **Spec ref:** §5.0, §11 step 5. Pure refactor — no behavior change.
+> **Spec ref:** §5.0, §11 step 5, §10 row 119 (split MCP servers).
+>
+> **v21 change**: this group used to be a 3-task pure refactor. v21 also
+> splits the single `bot/agent/tools.py` into 5 domain MCP modules
+> (`tools_meta`, `tools_calendar`, `tools_bitable`, `tools_doc`,
+> `tools_external`), so the refactor + split are landed as one atomic
+> 5-task transaction with a single commit at the end of 6.5.
+>
+> **CRITICAL — atomic transaction across 6.1 → 6.5**: do NOT commit until
+> Task 6.5 step 5. The repo is in a broken state during 6.1–6.4 because
+> `runner.py` and `app.py` reference symbols that don't exist yet. Tests
+> only pass after the whole transaction is complete.
 
-### Task 6.1: Define RequestContext + tools.py factory pattern
-
-> **CRITICAL — atomic transaction with 6.2 + 6.3**: do NOT commit after 6.1 alone. The repo will be in a broken state (`runner.py:188` calls `build_pmo_mcp()` no-arg but tools.py now requires `build_pmo_mcp(ctx)`). The single commit happens at the end of Task 6.3. Step 6 of this task explicitly says "expect failure here, that's fine, fix in 6.2".
+### Task 6.1: Rename tools.py → tools_meta.py + define RequestContext + factory pattern
 
 **Files:**
 - Create: `bot/agent/request_context.py`
-- Modify: `bot/agent/tools.py` (rewrite `build_pmo_mcp` to take `ctx`; remove `_current_conversation_key_var`)
+- Move: `bot/agent/tools.py` → `bot/agent/tools_meta.py` (use `git mv` to preserve history)
+- Modify: `bot/agent/tools_meta.py` (rewrite `build_pmo_mcp` → `build_meta_mcp(ctx)`; remove `_current_conversation_key_var`)
 - Test: `bot/tests/test_request_context.py`
 
 - [ ] **Step 1: Write failing test for closure capture**
@@ -2836,52 +3208,198 @@ class RequestContext:
 
 - [ ] **Step 4: Run, expect pass**
 
-- [ ] **Step 5: Refactor `tools.py` — convert `build_pmo_mcp` to factory**
+- [ ] **Step 5: Rename file and refactor to factory**
 
-Replace `def build_pmo_mcp()` with:
+```bash
+git mv bot/agent/tools.py bot/agent/tools_meta.py
+```
+
+Then edit `bot/agent/tools_meta.py`:
+
 ```python
-def build_pmo_mcp(ctx: RequestContext):
-    """Factory: returns an MCP server whose tool implementations close
-    over `ctx`. Called once per _PooledClient. See spec §5.0.
+"""pmo_meta MCP server — read-only profile/turn/activity tools + meta
+helpers (today_iso, resolve_people, undo_last_action, generate_image).
+
+The 8 calendar/bitable/doc/external tools live in tools_calendar.py,
+tools_bitable.py, tools_doc.py, tools_external.py respectively. Each
+file exports its own build_<domain>_mcp(ctx) factory. See spec §10
+row 119 for why we split.
+"""
+from claude_agent_sdk import create_sdk_mcp_server, tool
+
+from agent.request_context import RequestContext
+
+
+def build_meta_mcp(ctx: RequestContext):
+    """Factory: returns the meta MCP server bound to ctx. Called once per
+    _PooledClient. See spec §5.0.
     """
-    # Wrap every existing @tool with a closure that reads ctx.* directly
-    # instead of the old _current_conversation_key_var.
-    @tool("today_iso", ..., {})
+
+    @tool("today_iso", "...", {})
     async def today_iso(args: dict) -> dict:
-        # ... existing body, unchanged
+        # body uses ctx.sender_open_id (Task 7.1)
         ...
 
-    # ... all 7 existing read tools wrapped similarly
+    @tool("list_users", "...", {})
+    async def list_users(args: dict) -> dict:
+        ...  # body unchanged from old tools.py
+
+    # ... lookup_user, get_recent_turns, get_project_overview,
+    # get_activity_stats, generate_image (uses ctx.conversation_key)
+    # resolve_people (Task 7.2), undo_last_action (Task 9.1)
 
     return create_sdk_mcp_server(
-        name="pmo", version="0.1.0",
-        tools=[today_iso, list_users, lookup_user, get_recent_turns,
-               get_project_overview, get_activity_stats, generate_image],
+        name="pmo_meta",  # ← name change cascades to allowed_tools prefix
+        version="0.1.0",
+        tools=[
+            today_iso, list_users, lookup_user, get_recent_turns,
+            get_project_overview, get_activity_stats, generate_image,
+            resolve_people, undo_last_action,
+        ],
     )
 ```
 
-Remove the module-global `_current_conversation_key_var` and `set_current_conversation` function.
+Delete the module-global `_current_conversation_key_var` and
+`set_current_conversation` function. For `generate_image`, replace
+`_current_conversation_key_var` reads with `ctx.conversation_key`.
 
-For `generate_image`, replace `_current_conversation_key_var` reads with `ctx.conversation_key`.
+> **Note**: `resolve_people` and `undo_last_action` are stubbed in this
+> task (just enough to make `build_meta_mcp(ctx)` import); their real
+> implementations land in Task 7.2 and Task 9.1 respectively.
 
-- [ ] **Step 6: Run all existing tests + new test**
+- [ ] **Step 6: Run new test**
 
 ```bash
-cd bot && pytest tests/ -v
+cd bot && pytest tests/test_request_context.py -v
 ```
 
-Expected: all pass; no behavioral change since runner.py still calls `build_pmo_mcp()` with no arg.
+Expected: pass.
 
-We need to fix that next, in Task 6.2. For now this commit will leave runner.py temporarily broken; do it as one transaction:
+The full test suite WILL break here because `runner.py` still references the old `build_pmo_mcp()` and `tools.py` paths. That's fixed in 6.2–6.4.
 
 - [ ] **Step 7: NO COMMIT YET — proceed to Task 6.2**
 
-### Task 6.2: Wire RequestContext through runner.py
+### Task 6.2: Skeleton four new MCP module files
+
+> Each file gets a no-tool `build_<domain>_mcp(ctx)` factory. Real tools
+> are added later (Task Groups 7–9 for the read/write tools, Task 9 for
+> undo). Skeletons exist now so runner.py can register all 5 MCP servers
+> in one go.
+
+**Files:**
+- Create: `bot/agent/tools_calendar.py`
+- Create: `bot/agent/tools_bitable.py`
+- Create: `bot/agent/tools_doc.py`
+- Create: `bot/agent/tools_external.py`
+
+- [ ] **Step 1: Create skeletons (one identical pattern, 4 files)**
+
+`bot/agent/tools_calendar.py`:
+```python
+"""pmo_calendar MCP server — schedule_meeting, cancel_meeting,
+list_my_meetings. Real bodies land in Task Group 8 (write tools).
+"""
+from claude_agent_sdk import create_sdk_mcp_server
+
+from agent.request_context import RequestContext
+
+
+def build_calendar_mcp(ctx: RequestContext):
+    return create_sdk_mcp_server(
+        name="pmo_calendar",
+        version="0.1.0",
+        tools=[],  # filled by Tasks 8.1, 8.2, 8.3
+    )
+```
+
+`bot/agent/tools_bitable.py`:
+```python
+"""pmo_bitable MCP server — append_action_items, query_action_items,
+create_bitable_table, append_to_my_table, query_my_table,
+describe_my_table. Real bodies land in Tasks 7.7/7.8 + 8.4 + 8.8/8.9.
+"""
+from claude_agent_sdk import create_sdk_mcp_server
+
+from agent.request_context import RequestContext
+
+
+def build_bitable_mcp(ctx: RequestContext):
+    return create_sdk_mcp_server(
+        name="pmo_bitable", version="0.1.0", tools=[],
+    )
+```
+
+`bot/agent/tools_doc.py`:
+```python
+"""pmo_doc MCP server — create_meeting_doc, create_doc, append_to_doc.
+Shared private helper `_drive_import_markdown` is defined here too.
+Real bodies land in Tasks 8.5, 8.6, 8.7.
+"""
+from claude_agent_sdk import create_sdk_mcp_server
+
+from agent.request_context import RequestContext
+
+
+def build_doc_mcp(ctx: RequestContext):
+    return create_sdk_mcp_server(
+        name="pmo_doc", version="0.1.0", tools=[],
+    )
+```
+
+`bot/agent/tools_external.py`:
+```python
+"""pmo_external MCP server — read_doc, read_external_table,
+resolve_feishu_link. Read-any tools (no workspace gate). Real bodies
+land in Tasks 7.4, 7.5, 7.6.
+"""
+from claude_agent_sdk import create_sdk_mcp_server
+
+from agent.request_context import RequestContext
+
+
+def build_external_mcp(ctx: RequestContext):
+    return create_sdk_mcp_server(
+        name="pmo_external", version="0.1.0", tools=[],
+    )
+```
+
+- [ ] **Step 2: Verify imports**
+
+```bash
+cd bot && python -c "
+from agent.tools_calendar import build_calendar_mcp
+from agent.tools_bitable import build_bitable_mcp
+from agent.tools_doc import build_doc_mcp
+from agent.tools_external import build_external_mcp
+from agent.request_context import RequestContext
+ctx = RequestContext()
+build_calendar_mcp(ctx); build_bitable_mcp(ctx)
+build_doc_mcp(ctx); build_external_mcp(ctx)
+print('all 4 skeletons import cleanly')
+"
+```
+
+Expected: prints success. No commit yet.
+
+### Task 6.3: Wire RequestContext + 5 MCP servers through runner.py
 
 **Files:**
 - Modify: `bot/agent/runner.py`
 
-- [ ] **Step 1: Add ctx field to _PooledClient**
+- [ ] **Step 1: Update imports**
+
+Replace the old `from agent import tools as agent_tools` with imports of all 5 builders:
+
+```python
+from agent.request_context import RequestContext
+from agent.tools_meta import build_meta_mcp
+from agent.tools_calendar import build_calendar_mcp
+from agent.tools_bitable import build_bitable_mcp
+from agent.tools_doc import build_doc_mcp
+from agent.tools_external import build_external_mcp
+```
+
+- [ ] **Step 2: Add ctx field to _PooledClient**
 
 ```python
 @dataclass
@@ -2893,9 +3411,7 @@ class _PooledClient:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 ```
 
-Add `from agent.request_context import RequestContext`.
-
-- [ ] **Step 2: Update _get_client to create ctx + pass to factory**
+- [ ] **Step 3: Update _get_client — register 5 MCP servers, expand allowed_tools**
 
 ```python
 async def _get_client(conversation_key: str) -> _PooledClient:
@@ -2905,9 +3421,45 @@ async def _get_client(conversation_key: str) -> _PooledClient:
             ctx = RequestContext()
             options = ClaudeAgentOptions(
                 system_prompt=SYSTEM_PROMPT,
-                allowed_tools=[...],  # unchanged for now
-                mcp_servers={"pmo": build_pmo_mcp(ctx)},  # ← pass ctx
-                disallowed_tools=[...],
+                allowed_tools=[
+                    # Read tools (existing) + new meta tools
+                    "mcp__pmo_meta__list_users",
+                    "mcp__pmo_meta__lookup_user",
+                    "mcp__pmo_meta__get_recent_turns",
+                    "mcp__pmo_meta__get_project_overview",
+                    "mcp__pmo_meta__get_activity_stats",
+                    "mcp__pmo_meta__today_iso",
+                    "mcp__pmo_meta__generate_image",
+                    "mcp__pmo_meta__resolve_people",
+                    "mcp__pmo_meta__undo_last_action",
+                    # Calendar
+                    "mcp__pmo_calendar__schedule_meeting",
+                    "mcp__pmo_calendar__cancel_meeting",
+                    "mcp__pmo_calendar__list_my_meetings",
+                    # Bitable
+                    "mcp__pmo_bitable__append_action_items",
+                    "mcp__pmo_bitable__query_action_items",
+                    "mcp__pmo_bitable__create_bitable_table",
+                    "mcp__pmo_bitable__append_to_my_table",
+                    "mcp__pmo_bitable__query_my_table",
+                    "mcp__pmo_bitable__describe_my_table",
+                    # Doc
+                    "mcp__pmo_doc__create_meeting_doc",
+                    "mcp__pmo_doc__create_doc",
+                    "mcp__pmo_doc__append_to_doc",
+                    # External (read-any)
+                    "mcp__pmo_external__read_doc",
+                    "mcp__pmo_external__read_external_table",
+                    "mcp__pmo_external__resolve_feishu_link",
+                ],
+                mcp_servers={
+                    "pmo_meta": build_meta_mcp(ctx),
+                    "pmo_calendar": build_calendar_mcp(ctx),
+                    "pmo_bitable": build_bitable_mcp(ctx),
+                    "pmo_doc": build_doc_mcp(ctx),
+                    "pmo_external": build_external_mcp(ctx),
+                },
+                disallowed_tools=[...],  # unchanged
                 max_turns=settings.agent_max_duration_seconds,
             )
             client = ClaudeSDKClient(options=options)
@@ -2918,7 +3470,12 @@ async def _get_client(conversation_key: str) -> _PooledClient:
         return slot
 ```
 
-- [ ] **Step 3: Update answer_streaming signature + ctx mutation**
+> **Order of `allowed_tools` matters for the system prompt's tool
+> inventory section** — the agent reads tools in declaration order.
+> Group them by domain (meta → calendar → bitable → doc → external).
+> See spec §11 step 6.
+
+- [ ] **Step 4: Update answer_streaming signature + ctx mutation**
 
 ```python
 async def answer_streaming(
@@ -2938,7 +3495,7 @@ async def answer_streaming(
             # ... rest unchanged
 ```
 
-- [ ] **Step 4: Update answer() signature + delegate**
+- [ ] **Step 5: Update answer() signature + delegate**
 
 ```python
 async def answer(
@@ -2955,9 +3512,9 @@ async def answer(
     return answer_text or "(空回答 — 试试换个问法?)"
 ```
 
-- [ ] **Step 5: NO COMMIT — proceed to 6.3**
+- [ ] **Step 6: NO COMMIT — proceed to 6.4**
 
-### Task 6.3: Update app.py call sites
+### Task 6.4: Update app.py call sites + prefix-strip for new MCP names
 
 **Files:**
 - Modify: `bot/app.py`
@@ -2985,37 +3542,92 @@ answer = await asyncio.wait_for(
 )
 ```
 
-- [ ] **Step 3: Run all tests**
+- [ ] **Step 3: Update tool-name prefix strip (app.py:255)**
+
+The old code stripped a single `mcp__pmo__` prefix when displaying tool
+calls in the chat trace. v21 has 5 prefixes; replace it with a helper:
+
+```python
+# Old:
+# display_name = tool_name.removeprefix("mcp__pmo__")
+
+# New:
+_PMO_PREFIXES = (
+    "mcp__pmo_meta__",
+    "mcp__pmo_calendar__",
+    "mcp__pmo_bitable__",
+    "mcp__pmo_doc__",
+    "mcp__pmo_external__",
+)
+
+
+def _strip_pmo_prefix(tool_name: str) -> str:
+    for p in _PMO_PREFIXES:
+        if tool_name.startswith(p):
+            return tool_name[len(p):]
+    return tool_name
+
+
+display_name = _strip_pmo_prefix(tool_name)
+```
+
+- [ ] **Step 4: NO COMMIT — proceed to 6.5**
+
+### Task 6.5: Verify + atomic commit for the whole 6.1–6.4 transaction
+
+- [ ] **Step 1: Run full pytest suite**
 
 ```bash
 cd bot && pytest tests/ -v
 ```
 
-Expected: all pass.
+Expected: all pass. The new MCP modules have no tools yet, but
+`build_<domain>_mcp(ctx)` returns valid empty servers; the runner
+registers them; `allowed_tools` references future tools that don't
+exist yet (Claude Agent SDK is permissive: unmatched tool names just
+never fire).
 
-- [ ] **Step 4: Manual smoke (read-only flow still works)**
+- [ ] **Step 2: Manual smoke — read-only flow still works**
 
 Send a question to the bot in Feishu (e.g., "@包工头 albert 昨天做了啥").
-Expected: existing read-only behavior unchanged.
+Expected: existing read-only behavior unchanged. The 7 read tools now
+live under `mcp__pmo_meta__*` prefix; chat trace should show tool names
+without that prefix.
 
-- [ ] **Step 5: Commit (the whole 6.1+6.2+6.3 transaction)**
+- [ ] **Step 3: Commit (the whole 6.1+6.2+6.3+6.4 transaction)**
 
 ```bash
-git add bot/agent/request_context.py bot/agent/tools.py bot/agent/runner.py bot/app.py bot/tests/test_request_context.py
-git commit -m "refactor(agent): RequestContext closure replaces module global; runner threads message_id/chat_id/sender_open_id"
+git add bot/agent/request_context.py bot/agent/tools_meta.py \
+        bot/agent/tools_calendar.py bot/agent/tools_bitable.py \
+        bot/agent/tools_doc.py bot/agent/tools_external.py \
+        bot/agent/runner.py bot/app.py bot/tests/test_request_context.py
+git rm bot/agent/tools.py 2>/dev/null || true  # already moved by git mv
+git commit -m "refactor(agent): split tools.py into 5 domain MCP modules + RequestContext closure"
 ```
+
+> **Why one commit and not five**: each intermediate state breaks
+> imports or tests. Splitting tools.py without updating runner.py
+> breaks the agent at startup; updating runner.py without skeletons
+> for the new modules raises ImportError. Atomic transaction is the
+> only safe unit. (Same pattern used in spec v17 for the schema +
+> queries transaction.)
 
 ---
 
-# Task Group 7: Read tools (3 tasks)
+# Task Group 7: Read tools (8 tasks — v21 expanded)
 
-> **Spec ref:** §3.1, §3.2 (extension), §3.7. These are simpler than write tools — no Phase 2.X.5, no idempotency.
+> **Spec ref:** §3.1 (resolve_people), §3.2 (today_iso extension), §3.7 (query_action_items), §3.11 (read_doc), §3.13 (query_my_table), §3.14 (describe_my_table), §3.16 (read_external_table), §3.17 (resolve_feishu_link).
+>
+> Read tools are simpler than write tools — no Phase 2.X.5, no idempotency,
+> no `bot_actions` rows. Read-any tools (`read_doc`, `read_external_table`,
+> `resolve_feishu_link`) live in `tools_external.py`. Read-own bitable
+> tools (`query_my_table`, `describe_my_table`) live in `tools_bitable.py`.
 
 ### Task 7.1: today_iso extension (timezone field)
 
 **Files:**
-- Modify: `bot/agent/tools.py` (the `today_iso` inner function)
-- Test: `bot/tests/test_tools_today_iso.py`
+- Modify: `bot/agent/tools_meta.py` (the `today_iso` inner function)
+- Test: `bot/tests/test_tools_meta_today_iso.py`
 
 - [ ] TDD per spec §3.2: tool calls `feishu.contact.get_user(open_id=ctx.sender_open_id)` and adds `user_timezone` + `user_today_local` fields.
 
@@ -3024,8 +3636,8 @@ git commit -m "refactor(agent): RequestContext closure replaces module global; r
 ### Task 7.2: resolve_people (3-tier resolution)
 
 **Files:**
-- Modify: `bot/agent/tools.py` (new tool)
-- Test: `bot/tests/test_tools_resolve_people.py`
+- Modify: `bot/agent/tools_meta.py` (new tool)
+- Test: `bot/tests/test_tools_meta_resolve_people.py`
 
 - [ ] Implement per spec §3.1:
   - Step 1: query `profiles` + `feishu_links` (existing `db.queries.lookup_by_feishu_open_id` is for the reverse direction; add new `lookup_handle_or_email` query if needed)
@@ -3038,18 +3650,238 @@ git commit -m "refactor(agent): RequestContext closure replaces module global; r
 ### Task 7.3: query_action_items
 
 **Files:**
-- Modify: `bot/agent/tools.py`
-- Test: `bot/tests/test_tools_query_action_items.py`
+- Modify: `bot/agent/tools_bitable.py`
+- Test: `bot/tests/test_tools_bitable_query_action_items.py`
 
 - [ ] Reads from the bot's Bitable `action_items` table via `feishu.bitable.search_records(table_id=ws.action_items_table_id, ...)` with optional filters (owner / project / status / since / until).
 - [ ] Pass `user_id_type="open_id"`.
 - [ ] Commit.
 
+### Task 7.4: resolve_feishu_link (NEW v21)
+
+> **Spec ref:** §3.17. Pure URL → metadata resolver. Wires `feishu/links.py`
+> + `feishu/wiki.py` so the LLM can paste a Feishu URL and get back
+> `{kind, token, ...}` for use in subsequent tool calls.
+
+**Files:**
+- Modify: `bot/agent/tools_external.py`
+- Test: `bot/tests/test_tools_external_resolve_feishu_link.py`
+
+- [ ] **Step 1: Failing test for docx + base + wiki redirect**
+
+```python
+import pytest
+from unittest.mock import AsyncMock
+
+from agent.request_context import RequestContext
+from agent.tools_external import build_external_mcp
+
+
+@pytest.mark.asyncio
+async def test_resolve_docx_url(monkeypatch):
+    ctx = RequestContext()
+    server = build_external_mcp(ctx)
+    tool_fn = next(t for t in server._tools if t.name == "resolve_feishu_link")
+    out = await tool_fn({"url": "https://example.feishu.cn/docx/dxAAAA"})
+    assert out["content"][0]["text"] == json.dumps(
+        {"kind": "docx", "token": "dxAAAA"}, ensure_ascii=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_wiki_redirects(monkeypatch):
+    from feishu import wiki
+    monkeypatch.setattr(
+        wiki, "resolve_node",
+        AsyncMock(return_value={"obj_token": "dxBBBB", "obj_type": "docx"}),
+    )
+    ctx = RequestContext()
+    server = build_external_mcp(ctx)
+    tool_fn = next(t for t in server._tools if t.name == "resolve_feishu_link")
+    out = await tool_fn({"url": "https://example.feishu.cn/wiki/wikC"})
+    payload = json.loads(out["content"][0]["text"])
+    assert payload == {"kind": "docx", "token": "dxBBBB", "via_wiki": "wikC"}
+```
+
+- [ ] **Step 2: Implement in `tools_external.py`**
+
+```python
+from feishu import links, wiki
+
+
+@tool(
+    "resolve_feishu_link",
+    "Parse a Feishu URL (docx / wiki / base / sheet) and return its kind "
+    "and underlying token. Use this when the user pastes a doc/base link "
+    "before calling read_doc / read_external_table.",
+    {"url": str},
+)
+async def resolve_feishu_link(args: dict) -> dict:
+    try:
+        parsed = links.parse_url(args["url"])
+        if parsed["kind"] == "wiki":
+            node = await wiki.resolve_node(parsed["token"])
+            kind_map = {
+                "docx": "docx", "doc": "doc",
+                "bitable": "bitable", "sheet": "sheet",
+            }
+            redirected = {
+                "kind": kind_map.get(node["obj_type"], node["obj_type"]),
+                "token": node["obj_token"],
+                "via_wiki": parsed["token"],
+            }
+            return _ok(redirected)
+        return _ok(parsed)
+    except ValueError as e:
+        return _err(str(e))
+```
+
+- [ ] **Step 3: Register tool in `build_external_mcp`**, run tests → green; commit:
+
+```bash
+git add bot/agent/tools_external.py bot/tests/test_tools_external_resolve_feishu_link.py
+git commit -m "feat(tools): resolve_feishu_link — parse Feishu URL → {kind, token}"
+```
+
+### Task 7.5: read_doc (NEW v21)
+
+> **Spec ref:** §3.11. Read-any tool: any docx the bot can `docs:document:readonly`-access (or that the user shared with it). Walks blocks, renders to markdown, truncates at 50 KB.
+
+**Files:**
+- Modify: `bot/agent/tools_external.py`
+- Test: `bot/tests/test_tools_external_read_doc.py`
+
+- [ ] **Step 1: Failing test — render simple doc + truncation + 403 mapping**
+
+```python
+@pytest.mark.asyncio
+async def test_read_doc_renders_blocks(monkeypatch):
+    from feishu import docx
+    fake_blocks = [
+        MagicMock(block_type=2, text=MagicMock(elements=[
+            MagicMock(text_run=MagicMock(content="Hello world"))
+        ])),
+        MagicMock(block_type=4, heading2=MagicMock(elements=[
+            MagicMock(text_run=MagicMock(content="Section A"))
+        ])),
+    ]
+    monkeypatch.setattr(docx, "list_blocks", AsyncMock(return_value=fake_blocks))
+
+    ctx = RequestContext()
+    server = build_external_mcp(ctx)
+    tool_fn = next(t for t in server._tools if t.name == "read_doc")
+    out = await tool_fn({"document_id": "doc_xxx"})
+    payload = json.loads(out["content"][0]["text"])
+    assert "Hello world" in payload["markdown"]
+    assert "## Section A" in payload["markdown"]
+    assert payload["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_doc_403_returns_friendly_error(monkeypatch):
+    from feishu import docx
+    monkeypatch.setattr(
+        docx, "list_blocks",
+        AsyncMock(side_effect=RuntimeError("docx.list_blocks failed: 99991663 PermissionDenied")),
+    )
+    ctx = RequestContext()
+    server = build_external_mcp(ctx)
+    tool_fn = next(t for t in server._tools if t.name == "read_doc")
+    out = await tool_fn({"document_id": "doc_xxx"})
+    assert out["isError"] is True
+    payload = json.loads(out["content"][0]["text"])
+    assert "PermissionDenied" in payload["error"] or "403" in payload["error"]
+```
+
+- [ ] **Step 2: Implement (with markdown renderer for text/heading/list/code/quote/table block types per spec §3.11)**
+
+Key behaviors:
+- Walk via `feishu.docx.list_blocks(document_id)`.
+- Render each block to markdown using a `_render_block(block)` helper (see spec §3.11 mapping).
+- After rendering, truncate at 50 000 characters; set `truncated=True` and append `"…(truncated; ask for next section by block_id)"` so the LLM can decide to call again with `start_block_id`.
+- Map Feishu's `99991663` (Permission denied) to a friendly error message that suggests the user share the doc.
+
+- [ ] **Step 3: Run tests → green; commit:**
+
+```bash
+git add bot/agent/tools_external.py bot/tests/test_tools_external_read_doc.py
+git commit -m "feat(tools): read_doc — render arbitrary docx to markdown"
+```
+
+### Task 7.6: read_external_table (NEW v21)
+
+> **Spec ref:** §3.16. Read-any bitable. Rate-limited to 5 calls per hour
+> per `conversation_key` (in-memory deque per slot, reset on bot restart).
+> Page size capped at 100; offset-paginated.
+
+**Files:**
+- Modify: `bot/agent/tools_external.py`
+- Test: `bot/tests/test_tools_external_read_external_table.py`
+
+- [ ] **Step 1: Failing test — happy path + rate-limit + page_size cap**
+
+(Use `freezegun` to advance time across the rate-limit window.)
+
+- [ ] **Step 2: Implement** with module-level `_external_table_calls: dict[str, deque[float]]` keyed by `ctx.conversation_key`. Drop entries older than 3600s. Returns `{records, has_more, next_page_token}` shape.
+
+- [ ] **Step 3: Run tests → green; commit:**
+
+```bash
+git add bot/agent/tools_external.py bot/tests/test_tools_external_read_external_table.py
+git commit -m "feat(tools): read_external_table with 5/hour rate limit"
+```
+
+### Task 7.7: describe_my_table (NEW v21)
+
+> **Spec ref:** §3.14. Returns the schema (field name + field_type) of one
+> of the bot's own bitable tables. Workspace gate: refuse any
+> `app_token != ws.base_app_token`. Refuse `table_id == ws.action_items_table_id`
+> (LLM should use `query_action_items` for that).
+
+**Files:**
+- Modify: `bot/agent/tools_bitable.py`
+- Test: `bot/tests/test_tools_bitable_my_table.py` (shared file with 7.8)
+
+- [ ] **Step 1: Failing test — workspace-gate refusal + happy path**
+
+- [ ] **Step 2: Implement using `feishu.bitable.list_fields(app_token, table_id)`. Return `{table_id, fields: [{name, type}]}`.**
+
+- [ ] **Step 3: Commit:** `feat(tools): describe_my_table — schema readout for bot-owned tables`
+
+### Task 7.8: query_my_table (NEW v21)
+
+> **Spec ref:** §3.13. Same workspace gate as 7.7. Filter/sort syntax mirrors
+> `query_action_items`. Page size capped at 100. Returns `{records, has_more}`.
+
+**Files:**
+- Modify: `bot/agent/tools_bitable.py`
+- Test: `bot/tests/test_tools_bitable_my_table.py` (shared file)
+
+- [ ] **Step 1: Failing test — workspace-gate refusal + filter pass-through**
+
+- [ ] **Step 2: Implement using `feishu.bitable.search_records`.**
+
+- [ ] **Step 3: Commit:** `feat(tools): query_my_table — read bot-owned bitable rows`
+
 ---
 
-# Task Group 8: Write tools (5 tasks, one per tool)
+# Task Group 8: Write tools (9 tasks — v21 expanded)
 
-> Each task follows the spec §3.X for inputs / phases / failure handling, and the §5.1 skeleton for the three-phase pattern.
+> Each task follows the spec §3.X for inputs / phases / failure handling,
+> and the §5.1 skeleton for the three-phase pattern.
+>
+> **v21 added:** create_doc (8.6), append_to_doc (8.7),
+> create_bitable_table (8.8), append_to_my_table (8.9). These all reuse
+> the same workspace gate + Phase -1 / 0 / 1 / 2.X / 2.X.5 / 3 pattern;
+> append_to_doc additionally enforces an authorship gate (the doc must
+> have been created by the bot, identified by a `bot_actions` row with
+> `action_type IN ('create_doc','create_meeting_doc','append_to_doc')`).
+>
+> **File mapping** (where each tool body lives — important since the spec
+> v21 split MCP modules):
+> - schedule_meeting / cancel_meeting / list_my_meetings → `tools_calendar.py`
+> - append_action_items / create_bitable_table / append_to_my_table → `tools_bitable.py`
+> - create_meeting_doc / create_doc / append_to_doc → `tools_doc.py`
 
 ### Task 8.1: schedule_meeting (split into 8.1a–8.1g for granularity)
 
@@ -3061,8 +3893,8 @@ git commit -m "refactor(agent): RequestContext closure replaces module global; r
 #### Task 8.1a: schedule_meeting Phase -1 + 0 (validation + Phase 0 dedup)
 
 **Files:**
-- Modify: `bot/agent/tools.py` (add `schedule_meeting` inner function inside `build_pmo_mcp(ctx)`)
-- Test: `bot/tests/test_tools_schedule_meeting.py`
+- Modify: `bot/agent/tools_calendar.py` (add `schedule_meeting` inner function inside `build_calendar_mcp(ctx)`)
+- Test: `bot/tests/test_tools_calendar_schedule_meeting.py`
 
 - [ ] **Step 1: Write the first three failing tests**
 
@@ -3254,8 +4086,8 @@ git commit -am "feat(tools): schedule_meeting Phase -1 + Phase 0 (validation + d
 > §5.1 + Codex plan-review iter-3 #2).
 
 **Files:**
-- Modify: `bot/agent/tools.py` (insert Phase 1a before the existing Phase 1)
-- Modify: `bot/tests/test_tools_schedule_meeting.py`
+- Modify: `bot/agent/tools_calendar.py` (insert Phase 1a before the existing Phase 1)
+- Modify: `bot/tests/test_tools_calendar_schedule_meeting.py`
 
 - [ ] **Step 1: Write failing tests for the five Phase 1a branches**
 
@@ -3425,8 +4257,8 @@ git commit -am "feat(tools): schedule_meeting Phase 1a (exact-message idempotenc
 > from the original plan, just nested inside that block.
 
 **Files:**
-- Modify: `bot/agent/tools.py`
-- Modify: `bot/tests/test_tools_schedule_meeting.py`
+- Modify: `bot/agent/tools_calendar.py`
+- Modify: `bot/tests/test_tools_calendar_schedule_meeting.py`
 
 - [ ] **Step 1: Write failing tests for the three insert outcomes**
 
@@ -3688,8 +4520,8 @@ async def test_phase_2_1_conflict_marks_success_outcome(
 > Tasks 8.2–8.5 list the **Phase 2.x specifics** below; Phase -1 / 0 / 1a / 1b / 3 are the same skeleton from 8.1a–c, and are NOT repeated. When in doubt, copy 8.1a's tool body and adjust Phase 2.x.
 
 **Files:**
-- Modify: `bot/agent/tools.py`
-- Test: `bot/tests/test_tools_cancel_meeting.py`
+- Modify: `bot/agent/tools_calendar.py`
+- Test: `bot/tests/test_tools_calendar_cancel_meeting.py`
 
 Phases per spec §3.4:
 - Resolution rules: `event_id` (status-gated, action_type IN schedule|restore) OR `last:true` (newest-row guard via `last_bot_action_for_sender_in_chat`, with already-cancelled idempotency check)
@@ -3706,8 +4538,8 @@ Phases per spec §3.4:
 ### Task 8.3: list_my_meetings
 
 **Files:**
-- Modify: `bot/agent/tools.py`
-- Test: `bot/tests/test_tools_list_my_meetings.py`
+- Modify: `bot/agent/tools_calendar.py`
+- Test: `bot/tests/test_tools_calendar_list_my_meetings.py`
 
 Spec §3.5:
 - target defaults to `"self"` → `ctx.sender_open_id`
@@ -3739,8 +4571,8 @@ not a Python dict.
 ### Task 8.4: append_action_items
 
 **Files:**
-- Modify: `bot/agent/tools.py`
-- Test: `bot/tests/test_tools_append_action_items.py`
+- Modify: `bot/agent/tools_bitable.py`
+- Test: `bot/tests/test_tools_bitable_append_action_items.py`
 
 Spec §3.6:
 - Phase -1: ambiguous-project flow → return `needs_input` without `bot_actions` row
@@ -3755,8 +4587,8 @@ Spec §3.6:
 ### Task 8.5: create_meeting_doc (Path A 3-step)
 
 **Files:**
-- Modify: `bot/agent/tools.py`
-- Test: `bot/tests/test_tools_create_meeting_doc.py`
+- Modify: `bot/agent/tools_doc.py`
+- Test: `bot/tests/test_tools_doc_create_meeting_doc.py`
 
 Spec §3.8 Path A. Path B can be a future addition; keep this implementation Path A only.
 
@@ -3773,13 +4605,110 @@ Failure handling per spec §3.8: pre-upload fail → `failed`; ambiguous (cleanu
 - [ ] Tests cover all 5 failure paths.
 - [ ] Commit.
 
+> **Refactor before 8.6**: factor the Path A 3-step body into a private
+> helper `_drive_import_markdown(ctx, *, action_id, title, markdown) → {
+> doc_token, source_file_token, import_ticket, url}` so create_doc (8.6)
+> can reuse it without duplicating the four-phase logic. The helper is a
+> module-level function in `tools_doc.py` (NOT exposed as a tool).
+
+### Task 8.6: create_doc (NEW v21 — generic doc creation, no meeting linkage)
+
+> **Spec ref:** §3.10. Same Path A pipeline as `create_meeting_doc`,
+> but takes a `title` + `markdown` directly and does NOT cross-link to a
+> meeting `bot_action`. Workspace gate: target folder must be
+> `ws.docs_folder_token`.
+
+**Files:**
+- Modify: `bot/agent/tools_doc.py`
+- Test: `bot/tests/test_tools_doc_create_doc.py`
+
+- [ ] **Step 1: Failing test — happy path uses shared `_drive_import_markdown` helper**
+
+```python
+@pytest.mark.asyncio
+async def test_create_doc_happy_path(monkeypatch, fake_ctx):
+    monkeypatch.setattr(
+        tools_doc, "_drive_import_markdown",
+        AsyncMock(return_value={
+            "doc_token": "doc_AAA",
+            "source_file_token": "src_BBB",
+            "import_ticket": "tkt_CCC",
+            "url": "https://example.feishu.cn/docx/doc_AAA",
+        }),
+    )
+    # ... fake bot_actions stub asserts target_id=doc_AAA, target_kind='docx'
+```
+
+- [ ] **Step 2: Implement** — copy 8.5's Phase -1 / 0 / 1 / 3 skeleton; in Phase 2 call `_drive_import_markdown(ctx, action_id=row.id, title=args["title"], markdown=args["markdown"])`. action_type is `'create_doc'`. Logical_key canonicalization includes title + sha256(markdown).
+
+- [ ] **Step 3: Commit:** `feat(tools): create_doc — generic Path A markdown→docx upload`
+
+### Task 8.7: append_to_doc (NEW v21 — block-level append with authorship gate)
+
+> **Spec ref:** §3.12. Append a markdown snippet as new blocks at the end of
+> a doc the bot owns. **Authorship gate**: refuse unless the document is
+> referenced as `target_id` in some `bot_actions WHERE action_type IN
+> ('create_doc','create_meeting_doc','append_to_doc') AND status IN
+> ('success','reconciled_unknown')`. Save the new `block_ids` in
+> `result.block_ids` so undo can `docx.delete_blocks(parent, block_ids)`.
+
+**Files:**
+- Modify: `bot/agent/tools_doc.py`
+- Test: `bot/tests/test_tools_doc_append_to_doc.py`
+
+- [ ] **Step 1: Failing tests — authorship gate refusal + happy path + undo block-id capture**
+
+- [ ] **Step 2: Implement**:
+  - Phase -1: workspace + authorship gate via new `queries.is_doc_authored_by_bot(doc_token)` helper (one SELECT against `bot_actions`).
+  - Phase 0/1: standard skeleton.
+  - Phase 2: render markdown to docx blocks, call `feishu.docx.append_blocks(document_id=doc_token, parent_block_id=<root>, children=blocks)`; capture returned `block_ids`.
+  - Phase 2.5: `record_bot_action_target_pending(target_kind='docx_block_append', target_id=doc_token, result={"block_ids": [...], "parent_block_id": <root>})`.
+  - Phase 3: `mark_bot_action_success`.
+- [ ] **Step 3: Commit:** `feat(tools): append_to_doc with authorship gate + block-id capture`
+
+### Task 8.8: create_bitable_table (NEW v21 — schema-defined table inside bot's base)
+
+> **Spec ref:** §3.15. Create a new table inside `ws.base_app_token`. Workspace
+> gate: refuse any other `app_token`. Validates field type names against the
+> Feishu enum (text / number / single_select / multi_select / date / user / etc.).
+
+**Files:**
+- Modify: `bot/agent/tools_bitable.py`
+- Test: `bot/tests/test_tools_bitable_create_table.py`
+
+- [ ] **Step 1: Failing tests — schema validation + duplicate-name idempotency**
+
+- [ ] **Step 2: Implement**:
+  - Phase 2: `feishu.bitable.create_table(app_token=ws.base_app_token, name=args["name"], fields=args["schema"])`. Capture `table_id`.
+  - Phase 2.5: `record_bot_action_target_pending(target_kind='bitable_table', target_id=table_id)`.
+  - Phase 3: success.
+- [ ] **Step 3: Commit:** `feat(tools): create_bitable_table with workspace gate + schema validation`
+
+### Task 8.9: append_to_my_table (NEW v21 — write rows to a bot-owned table)
+
+> **Spec ref:** §3.18. Same workspace gate. Refuses
+> `table_id == ws.action_items_table_id` and redirects the LLM to
+> `append_action_items` (which has the project-disambiguation Phase -1 flow).
+
+**Files:**
+- Modify: `bot/agent/tools_bitable.py`
+- Test: `bot/tests/test_tools_bitable_my_table.py` (shared file with 7.7/7.8)
+
+- [ ] **Step 1: Failing tests — refusal for action_items_table_id, happy path with `client_token`**
+
+- [ ] **Step 2: Implement**:
+  - Phase 2: `feishu.bitable.batch_create_records(table_id=args["table_id"], records=args["records"], client_token=row.id)` with hidden `source_action_id` per record.
+  - Phase 2.5: `record_bot_action_target_pending(target_kind='bitable_records', target_id=args["table_id"], result={"record_ids": [...]})`.
+  - Phase 3: success.
+- [ ] **Step 3: Commit:** `feat(tools): append_to_my_table — write rows to bot-owned bitable`
+
 ---
 
 # Task Group 9: undo_last_action (1 task, but big)
 
 > **Spec ref:** §3.9. This is the safety net (§1.4); ship together with the write tools.
 
-### Task 9.1: undo_last_action — split into 9.1a–9.1f for granularity
+### Task 9.1: undo_last_action — split into 9.1a–9.1g for granularity
 
 > **Depends on:** Task Group 3 (DB helpers including `last_bot_action_for_sender_in_chat`), Task 4.4 + 4.5 + 4.6 (Feishu wrappers), Tasks 8.1–8.5 (the rows undo will compensate must already be writable).
 > **Spec ref:** §3.9 entire section, §1.4 acceptance criteria.
@@ -3787,8 +4716,8 @@ Failure handling per spec §3.8: pre-upload fail → `failed`; ambiguous (cleanu
 #### Task 9.1a: undo_last_action shell + last_for_me sentinel handling
 
 **Files:**
-- Modify: `bot/agent/tools.py`
-- Test: `bot/tests/test_tools_undo_last_action.py`
+- Modify: `bot/agent/tools_meta.py` (`undo_last_action` is part of `build_meta_mcp(ctx)`)
+- Test: `bot/tests/test_tools_meta_undo_last_action.py`
 
 - [ ] **Step 1: Failing tests for sentinel paths + explicit selectors**
 
@@ -4071,54 +5000,69 @@ This is the most complex undo path. Reference spec §3.9 cancel_meeting branch v
 
 - [ ] **Commit**.
 
+#### Task 9.1g: undo dispatch for the 4 new v21 write tools
+
+> **Spec ref:** §3.9 v21 dispatch table additions. Each new write-tool
+> action_type gets its own dispatch arm, mirroring the existing pattern
+> (404-as-success idempotency, no fences).
+
+- [ ] **Failing tests** — one test per action_type, asserting target_kind dispatch and 404-as-success:
+  - `action_type='create_doc', target_kind='docx'` → `drive.delete_file(token=target_id, type='docx')` + `.md` cleanup; both 404-tolerant.
+  - `action_type='append_to_doc', target_kind='docx_block_append'` → `docx.delete_blocks(document_id=target_id, parent_block_id=result.parent_block_id, block_ids=result.block_ids)`; missing-block 404 → success. **Does NOT delete the doc itself** — only the blocks this action appended.
+  - `action_type='create_bitable_table', target_kind='bitable_table'` → `bitable.delete_table(app_token=ws.base_app_token, table_id=target_id)`; 404 OK.
+  - `action_type='append_to_my_table', target_kind='bitable_records'` → `bitable.batch_delete_records(app_token=ws.base_app_token, table_id=target_id, record_ids=result.record_ids)`; per-record 404 tolerated and reported as `{partial: true, deleted: N, missing: M}`.
+
+- [ ] **Implementation**: extend the dispatcher in `tools_meta.undo_last_action` (Task 9.1a's match-statement) with these four new arms. Each arm transitions the source row `success → undone` via `retire_source_action(row.id)` and writes a new audit row of `action_type=f'undo_{source_action_type}'`.
+
+- [ ] **Commit**: `feat(tools): undo dispatch for create_doc / append_to_doc / create_bitable_table / append_to_my_table`
+
 ---
 
-# Task Group 10: Wire into agent runner (2 tasks)
+# Task Group 10: Wire into agent runner (1 task — v21 simplified)
 
-### Task 10.1: Expand allowed_tools
+> **v21 change**: the original 10.1 ("expand allowed_tools") is now done
+> as part of Task 6.3 (since 6.3 had to register all 5 MCP servers
+> together for the runner to start at all). What's left is the
+> SYSTEM_PROMPT update.
 
-**Files:**
-- Modify: `bot/agent/runner.py`
-
-- [ ] Add 8 new `mcp__pmo__*` entries to the `allowed_tools` list at `runner.py:179`:
-  ```python
-  "mcp__pmo__resolve_people",
-  "mcp__pmo__schedule_meeting",
-  "mcp__pmo__cancel_meeting",
-  "mcp__pmo__list_my_meetings",
-  "mcp__pmo__append_action_items",
-  "mcp__pmo__query_action_items",
-  "mcp__pmo__create_meeting_doc",
-  "mcp__pmo__undo_last_action",
-  ```
-- [ ] Commit: `feat(agent): expose 8 new MCP tools to the LLM`
-
-### Task 10.2: Replace SYSTEM_PROMPT tool inventory + read-only sentence
+### Task 10.1: Replace SYSTEM_PROMPT tool inventory + read-only sentence
 
 **Files:**
 - Modify: `bot/agent/runner.py` (`SYSTEM_PROMPT` constant)
 
-Per spec §9 (iter-30 / row 117):
+Per spec §9 + §10 row 122 (v21 expansion):
 
-1. Replace the tool inventory list (around `runner.py:84`) to include the 8 new tools.
+1. Replace the tool inventory list (around `runner.py:84`) to include all
+   18 tools, grouped by domain:
+   - **Meta**: today_iso, list_users, lookup_user, get_recent_turns, get_project_overview, get_activity_stats, generate_image, resolve_people, undo_last_action
+   - **Calendar**: schedule_meeting, cancel_meeting, list_my_meetings
+   - **Bitable**: append_action_items, query_action_items, create_bitable_table, append_to_my_table, query_my_table, describe_my_table
+   - **Doc**: create_meeting_doc, create_doc, append_to_doc
+   - **External (read-any)**: read_doc, read_external_table, resolve_feishu_link
 2. Remove the "这是只读问答助手" / "你不能：写代码、改文件、跑命令" lines.
-3. Append the §9 directive block:
+3. Append the v21 directive block (extends §9 with the new tools):
    ```
    你现在可以在飞书做事，不只是回答问题。
 
    默认行为：用文字回复。只有在用户意图明确指向某个写工具时才调用：
-   订会/取消会议/看日程 → calendar 工具；记一下/写到表里 → action_items 工具；写成文档/整理纪要 → create_meeting_doc.
+   订会/取消会议/看日程 → calendar 工具；记一下/写到表里 → action_items / append_to_my_table；
+   写成文档 → create_meeting_doc / create_doc / append_to_doc；
+   建表 → create_bitable_table；
+   读他人/外部资源 → read_doc / read_external_table / resolve_feishu_link.
 
    硬规则：
    - 调用任何接受人员参数的工具前必须先调 resolve_people。如果它返回 ambiguous 或 unresolved，必须先反问用户澄清。绝不要猜。
    - 传给 schedule_meeting 的所有时间必须是 RFC3339 with timezone。先调 today_iso 拿到提问者所在时区。
    - schedule_meeting 返回 conflict 时，把冲突告诉用户并提议替代时间，不要盲目重试。
-   - 不要修改不是你创建的飞书资源。只能取消/编辑你自己 bot_actions 中的事件。
+   - 不要修改不是你创建的飞书资源。只能取消/编辑你自己 bot_actions 中的事件、文档、表。
+   - append_to_doc 仅作用于由 bot 自己创建的文档（authorship gate）；不要尝试 append 到用户分享给你的链接。
+   - read_external_table 每小时每会话最多 5 次。命中限制就告诉用户改用文字描述。
+   - 用户粘贴飞书 URL 时先调 resolve_feishu_link 拿到 {kind, token}，再决定调 read_doc 还是 read_external_table。
    - list_my_meetings 返回非空 visibility_note 或 user_calendar_events 看起来稀疏时，把这个不确定性告诉用户；绝不在没承认可见性限制的情况下断言"你没有会"。
    - 第一人称日历问题（"我下午有啥会" / "我下周三有空吗"），调用 list_my_meetings 时不传 target — 工具默认返回 asker。绝不为了拿 asker 的 open_id 而调 resolve_people。
    ```
 
-- [ ] Commit: `feat(agent): replace SYSTEM_PROMPT tool inventory + add Feishu write directives`
+- [ ] Commit: `feat(agent): replace SYSTEM_PROMPT tool inventory for v21 — 18 tools across 5 MCP servers`
 
 ---
 
@@ -4176,6 +5120,19 @@ Each scenario is a checkbox item — verify in Feishu UI + DB:
 - [ ] **§3.9 + iter-20 row 114: 404-as-success undo replay**: schedule a meeting, manually delete the event in the Feishu UI (simulating "delete succeeded but DB UPDATE crashed mid-flight"), then ask the bot to undo — confirm the bot treats `EventNotFound` as the desired end state, marks the source row `undone`, and writes a normal undo audit row (not a failure).
 - [ ] **iter-21 doc cleanup non-404 retryability**: schedule a doc that produces a docx + source `.md` in 文档柜. Manually revoke `drive:drive` scope on the bot in Feishu admin (or simulate with auth-error injection). Ask the bot to undo — confirm undo treats the cleanup failure as retryable, leaves the source row's status unchanged, and on a re-undo (after restoring scope) completes successfully.
 
+#### v21 additions (spec §11 step 9 v21)
+
+- [ ] **v21 / §3.10 create_doc**: ask the bot to "起草一份关于 X 的笔记，保存到文档柜". Confirm a Docx is created in the bot's docs folder and a `bot_actions` row exists with `action_type='create_doc', target_kind='docx'`. The doc title and body match what the LLM produced.
+- [ ] **v21 / §3.12 append_to_doc authorship gate**: ask the bot to "在我刚才那篇笔记后面追加一段进度". Confirm new blocks appear at the end of the same doc; `bot_actions` row has `target_kind='docx_block_append'` and `result.block_ids` is non-empty. Then paste a Feishu doc URL the bot did NOT create and ask for an append — confirm refusal with an authorship-gate message.
+- [ ] **v21 / §3.12 undo append_to_doc deletes only the new blocks**: undo the append above; confirm the appended blocks vanish but the original doc body is intact, and the source `create_doc` row remains `success` (NOT `undone`).
+- [ ] **v21 / §3.15 create_bitable_table**: ask the bot to "建一张多维表，叫『风险登记』，字段：标题/责任人/状态". Confirm new table appears in the bot's base; `bot_actions` row has `target_kind='bitable_table'`.
+- [ ] **v21 / §3.18 append_to_my_table redirects action_items**: ask the bot to write a row into the `action_items` table directly via `append_to_my_table` — confirm tool refuses and the LLM (per system prompt) falls back to `append_action_items`.
+- [ ] **v21 / §3.13 query_my_table workspace gate**: ask the bot to query a table in some external base (paste an unrelated `app_token` via the args). Confirm refusal with workspace-gate message.
+- [ ] **v21 / §3.11 read_doc happy path**: share a docx with the bot, ask "把这篇文档总结成 3 点" → confirm the bot calls `read_doc` and returns a summary based on actual content (markdown rendering preserves headings + lists).
+- [ ] **v21 / §3.11 read_doc 50KB truncation**: paste a very long doc (>50 KB rendered) → confirm `truncated=true` in tool result and the bot's reply mentions it asked for the next chunk by `start_block_id` (or summarizes only the visible portion).
+- [ ] **v21 / §3.16 read_external_table rate limit**: in one chat, ask the bot 6 times in quick succession to read different external bitables → confirm the 6th call returns the rate-limit error and the bot apologizes + suggests text description.
+- [ ] **v21 / §3.17 resolve_feishu_link wiki redirect**: paste a `/wiki/<token>` URL whose underlying object is a docx → confirm the bot internally calls `resolve_feishu_link` (visible in tool trace), gets back `{kind: 'docx', token: '...', via_wiki: '...'}`, then proceeds to `read_doc`.
+
 - [ ] **Step 3: Document failures in `docs/specs/2026-05-02-pmo-bot-write-tools-design.md` §10 omissions table for follow-up**
 
 - [ ] **Step 4: Commit smoke-test notes**
@@ -4203,14 +5160,24 @@ git commit -m "test(smoke): record results of v1 write-tools E2E smoke run"
 | 1. Scope verification | 1 | 30 min (manual + admin console) |
 | 2. Schema migrations | 4 | 1 hour |
 | 3. db/queries.py | 10 | 4-5 hours |
-| 4. Feishu wrappers | 7 | 4-5 hours (Task 4.7 dropped in iter-3 — Path B deferred) |
+| 4. Feishu wrappers | 10 | 6-7 hours (v21: docx/wiki/links restored + 2 new) |
 | 5. Bootstrap script | 1 | 1 hour |
-| 6. RequestContext refactor | 3 | 2 hours |
-| 7. Read tools | 3 | 2 hours |
-| 8. Write tools | 5 | 6-8 hours (cancel_meeting + create_doc are big) |
-| 9. undo_last_action | 1 | 4 hours (largest single task) |
-| 10. Runner wiring | 2 | 30 min |
-| 11. Smoke test | 1 | 1-2 hours |
-| **Total** | **39** (8.1 split into 7 sub-tasks; 9.1 split into 6 sub-tasks; 4.7 dropped) | **~30 hours** |
+| 6. RequestContext refactor + MCP module split | 5 | 3 hours (v21: +rename, +4 module skeletons, +app.py prefix) |
+| 7. Read tools | 8 | 4-5 hours (v21: +5 — resolve_feishu_link, read_doc, read_external_table, describe_my_table, query_my_table) |
+| 8. Write tools | 9 | 9-12 hours (v21: +4 — create_doc, append_to_doc, create_bitable_table, append_to_my_table) |
+| 9. undo_last_action | 1 | 5 hours (split into 9.1a–9.1g; v21 added 9.1g for 4 new write-tool arms) |
+| 10. Runner wiring | 1 | 30 min (v21: 10.1 absorbed into 6.3) |
+| 11. Smoke test | 1 | 2-3 hours (v21: +10 new scenarios) |
+| **Total** | **52** (8.1 split into 7 sub-tasks; 9.1 split into 7 sub-tasks; 4.7 restored, +4.8 wiki, +4.9 links; +6.2 skeletons, +6.4 app.py, +6.5 verify; +5 read tools; +4 write tools; +9.1g undo arms) | **~45 hours** |
 
-Spread over 3-5 working days for one developer.
+Spread over 5-7 working days for one developer.
+
+> **v21 changelog vs plan v4** (for Codex review):
+> - File structure table: 5 MCP module files instead of 1 tools.py; 8 new tool tests; 3 new feishu wrappers (docx/wiki/links).
+> - Task Group 4: 8 → 10 tasks (4.7 docx restored, 4.8 wiki added, 4.9 links added).
+> - Task Group 6: 3 → 5 tasks; the original 6.1 swallowed the file rename, 6.2 adds 4 module skeletons, 6.4 adds app.py prefix-strip update, 6.5 verifies the atomic transaction.
+> - Task Group 7: 3 → 8 tasks (resolve_feishu_link, read_doc, read_external_table, describe_my_table, query_my_table added).
+> - Task Group 8: 5 → 9 tasks (create_doc, append_to_doc, create_bitable_table, append_to_my_table added). Path A 3-step factored into shared `_drive_import_markdown` helper.
+> - Task Group 9: 9.1f → 9.1g for the 4 new write-tool undo arms.
+> - Task Group 10: collapsed to 1 task (allowed_tools moved into 6.3).
+> - Task Group 11: +10 v21 smoke scenarios.
