@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -100,12 +101,11 @@ def build_meta_tools(ctx: RequestContext):
 
     @tool(
         "today_iso",
-        "Return current UTC date and useful anchors. Also includes the asker open_id.",
+        "Return current date/time anchors in the asker's timezone. Also includes the asker open_id.",
         {},
     )
     async def today_iso(args: dict) -> dict[str, Any]:
-        now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        now_utc = datetime.now(timezone.utc)
         user_timezone = "Asia/Shanghai"
         user_timezone_source = "fallback"
         if ctx.sender_open_id:
@@ -118,10 +118,25 @@ def build_meta_tools(ctx: RequestContext):
                     user_timezone_source = "feishu_contact"
             except Exception:
                 pass
+        try:
+            user_zone = ZoneInfo(user_timezone)
+        except ZoneInfoNotFoundError:
+            user_timezone = "Asia/Shanghai"
+            user_timezone_source = "fallback_invalid_timezone"
+            user_zone = ZoneInfo(user_timezone)
+        now = now_utc.astimezone(user_zone)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        day_after_tomorrow_start = today_start + timedelta(days=2)
         return ok(
             {
+                "now_utc": now_utc.isoformat(),
                 "now": now.isoformat(),
+                "current_date": now.date().isoformat(),
                 "today_start": today_start.isoformat(),
+                "tomorrow_start": tomorrow_start.isoformat(),
+                "day_after_tomorrow_start": day_after_tomorrow_start.isoformat(),
+                "day_after_tomorrow_date": day_after_tomorrow_start.date().isoformat(),
                 "yesterday_start": (today_start - timedelta(days=1)).isoformat(),
                 "yesterday_end": today_start.isoformat(),
                 "seven_days_ago": (now - timedelta(days=7)).isoformat(),

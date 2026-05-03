@@ -218,7 +218,7 @@ async def primary_calendar_id(open_id: str) -> str | None:
     req = PrimarysCalendarRequest.builder().user_id_type("open_id").request_body(body).build()
     resp = await asyncio.to_thread(_lark_client().calendar.v4.calendar.primarys, req)
     if not resp.success():
-        return None
+        raise RuntimeError(f"calendar.primary_calendar_id failed: {resp.code} {resp.msg}")
     for item in (resp.data.calendars or []):
         if getattr(item, "user_id", None) == open_id and getattr(item, "calendar", None):
             return item.calendar.calendar_id

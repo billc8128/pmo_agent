@@ -1,13 +1,95 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent.request_context import RequestContext
 from agent.tool_utils import err, ok
 from agent.tools_impl.common import fail_action, parse_rfc3339, start_action, workspace_or_error
 from db import queries
 from feishu import calendar
+
+
+def _zoneinfo_or_default(timezone_name: str | None) -> tuple[str, ZoneInfo]:
+    name = timezone_name or "Asia/Shanghai"
+    try:
+        return name, ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return "Asia/Shanghai", ZoneInfo("Asia/Shanghai")
+
+
+async def _timezone_for_user(ctx: RequestContext) -> str:
+    if not ctx.sender_open_id:
+        return "Asia/Shanghai"
+    try:
+        from feishu import contact
+
+        user = await contact.get_user(ctx.sender_open_id)
+        return user.get("time_zone") or "Asia/Shanghai"
+    except Exception:
+        return "Asia/Shanghai"
+
+
+def _is_date_only(value: str | None) -> bool:
+    return bool(value) and len(value or "") == 10 and "T" not in (value or "")
+
+
+def _normalize_meeting_window(since: str | None, until: str | None, timezone_name: str) -> tuple[str | None, str | None]:
+    if not since and not until:
+        return None, None
+    timezone_name, user_zone = _zoneinfo_or_default(timezone_name)
+    if _is_date_only(since):
+        start_date = datetime.fromisoformat(since).date()
+        start = datetime.combine(start_date, datetime.min.time(), tzinfo=user_zone)
+    elif since:
+        start = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        if not start.tzinfo:
+            start = start.replace(tzinfo=user_zone)
+    elif _is_date_only(until):
+        end_date = datetime.fromisoformat(until).date()
+        start = datetime.combine(end_date, datetime.min.time(), tzinfo=user_zone)
+    else:
+        start = None
+
+    if _is_date_only(until):
+        end_date = datetime.fromisoformat(until).date()
+        end = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=user_zone)
+    elif until:
+        end = datetime.fromisoformat(until.replace("Z", "+00:00"))
+        if not end.tzinfo:
+            end = end.replace(tzinfo=user_zone)
+    elif start is not None:
+        end = start + timedelta(days=1)
+    else:
+        end = None
+
+    if start is not None and end is not None and end <= start:
+        end = start + timedelta(days=1)
+    return start.isoformat() if start else None, end.isoformat() if end else None
+
+
+def _parse_window_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _filter_events_by_window(events: list[dict[str, Any]], since: str | None, until: str | None) -> list[dict[str, Any]]:
+    start = _parse_window_datetime(since)
+    end = _parse_window_datetime(until)
+    if not start or not end:
+        return events
+    filtered: list[dict[str, Any]] = []
+    for event in events:
+        try:
+            event_start = _parse_window_datetime(event.get("start_time"))
+            event_end = _parse_window_datetime(event.get("end_time")) or event_start
+        except (TypeError, ValueError):
+            continue
+        if event_start and event_start < end and event_end and event_end > start:
+            filtered.append(event)
+    return filtered
 
 
 async def schedule_meeting(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -142,22 +224,35 @@ async def cancel_meeting(ctx: RequestContext, args: dict[str, Any]) -> dict[str,
 
 async def list_my_meetings(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:
     target = args.get("target_open_id") or (None if args.get("target") in {None, "", "self"} else args.get("target")) or ctx.sender_open_id
-    since = args.get("since") or args.get("time_min")
-    until = args.get("until") or args.get("time_max")
-    bot_known = queries.bot_known_events_for_attendee(ctx.chat_id, target) if target else []
+    requested_since = args.get("since") or args.get("time_min")
+    requested_until = args.get("until") or args.get("time_max")
+    user_timezone = await _timezone_for_user(ctx)
+    since, until = _normalize_meeting_window(requested_since, requested_until, user_timezone)
+    bot_known_all = queries.bot_known_events_for_attendee(ctx.chat_id, target) if target else []
+    bot_known = _filter_events_by_window(bot_known_all, since, until)
     user_events: list[dict[str, Any]] = []
+    user_calendar_error: str | None = None
+    user_calendar_warning: str | None = None
     if target and since and until:
         try:
             primary = await calendar.primary_calendar_id(target)
             if primary:
                 user_events = await calendar.list_events(primary, since, until)
-        except Exception:
+            else:
+                user_calendar_warning = "primary_calendar_not_visible_to_bot"
+        except Exception as e:
+            user_calendar_error = f"{type(e).__name__}: {e}"
             user_events = []
     return ok({
         "target_open_id": target,
-        "since": since,
-        "until": until,
+        "requested_since": requested_since,
+        "requested_until": requested_until,
+        "normalized_since": since,
+        "normalized_until": until,
+        "user_timezone": user_timezone,
         "bot_known_events": bot_known,
         "user_calendar_events": user_events,
+        "user_calendar_error": user_calendar_error,
+        "user_calendar_warning": user_calendar_warning,
         "visibility_note": "只返回包工头可见的日程；用户主日历可能受飞书权限限制。",
     })

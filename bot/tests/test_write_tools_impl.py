@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from agent.request_context import RequestContext
 from agent.tool_utils import content_payload
@@ -32,6 +33,30 @@ def _meta_tool(ctx: RequestContext, name: str):
 
 
 def test_today_iso_uses_feishu_contact_timezone(monkeypatch):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = datetime(2026, 5, 3, 16, 27, tzinfo=timezone.utc)
+            return fixed.astimezone(tz) if tz else fixed
+
+    monkeypatch.setattr("agent.tools_meta.datetime", FixedDateTime)
+    monkeypatch.setattr(
+        "feishu.contact.get_user",
+        lambda open_id: asyncio.sleep(0, result={"time_zone": "Asia/Shanghai"}),
+    )
+
+    result = asyncio.run(_meta_tool(_ctx(), "today_iso")({}))
+    payload = content_payload(result)
+
+    assert payload["user_timezone"] == "Asia/Shanghai"
+    assert payload["user_timezone_source"] == "feishu_contact"
+    assert payload["current_date"] == "2026-05-04"
+    assert payload["today_start"] == "2026-05-04T00:00:00+08:00"
+    assert payload["day_after_tomorrow_date"] == "2026-05-06"
+    assert payload["day_after_tomorrow_start"] == "2026-05-06T00:00:00+08:00"
+
+
+def test_today_iso_preserves_non_default_feishu_contact_timezone(monkeypatch):
     monkeypatch.setattr(
         "feishu.contact.get_user",
         lambda open_id: asyncio.sleep(0, result={"time_zone": "America/Los_Angeles"}),
@@ -184,6 +209,59 @@ def test_start_action_failed_message_requires_new_message(monkeypatch):
 
     assert row is None
     assert replay["isError"] is True
+
+
+def test_list_my_meetings_expands_date_only_window_in_user_timezone(monkeypatch):
+    monkeypatch.setattr(
+        "feishu.contact.get_user",
+        lambda open_id: asyncio.sleep(0, result={"time_zone": "Asia/Shanghai"}),
+    )
+    monkeypatch.setattr("db.queries.bot_known_events_for_attendee", lambda *args, **kwargs: [
+        {"title": "错日程", "start_time": "2026-05-04T17:00:00+08:00", "end_time": "2026-05-04T18:00:00+08:00"},
+        {"title": "后天会", "start_time": "2026-05-06T10:00:00+08:00", "end_time": "2026-05-06T10:30:00+08:00"},
+    ])
+    monkeypatch.setattr("feishu.calendar.primary_calendar_id", lambda open_id: asyncio.sleep(0, result="cal-1"))
+    captured = []
+
+    async def list_events(calendar_id, since, until):
+        captured.append((calendar_id, since, until))
+        return [{"title": "站会", "start_time": since, "end_time": until}]
+
+    monkeypatch.setattr("feishu.calendar.list_events", list_events)
+
+    result = asyncio.run(calendar_impl.list_my_meetings(_ctx(), {
+        "since": "2026-05-06",
+        "until": "2026-05-06",
+    }))
+    payload = content_payload(result)
+
+    assert captured == [("cal-1", "2026-05-06T00:00:00+08:00", "2026-05-07T00:00:00+08:00")]
+    assert payload["normalized_since"] == "2026-05-06T00:00:00+08:00"
+    assert payload["normalized_until"] == "2026-05-07T00:00:00+08:00"
+    assert payload["user_calendar_events"][0]["title"] == "站会"
+    assert [event["title"] for event in payload["bot_known_events"]] == ["后天会"]
+
+
+def test_list_my_meetings_surfaces_calendar_read_errors(monkeypatch):
+    monkeypatch.setattr(
+        "feishu.contact.get_user",
+        lambda open_id: asyncio.sleep(0, result={"time_zone": "Asia/Shanghai"}),
+    )
+    monkeypatch.setattr("db.queries.bot_known_events_for_attendee", lambda *args, **kwargs: [])
+
+    async def fail_primary(*args, **kwargs):
+        raise RuntimeError("calendar.primary_calendar_id failed: 99991672 Access denied")
+
+    monkeypatch.setattr("feishu.calendar.primary_calendar_id", fail_primary)
+
+    result = asyncio.run(calendar_impl.list_my_meetings(_ctx(), {
+        "since": "2026-05-06",
+        "until": "2026-05-06",
+    }))
+    payload = content_payload(result)
+
+    assert "99991672" in payload["user_calendar_error"]
+    assert payload["user_calendar_events"] == []
 
 
 def test_cancel_meeting_delete_failure_after_snapshot_becomes_partial_success(monkeypatch):
