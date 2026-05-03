@@ -47,6 +47,25 @@ selects on the new tables.
 
 ---
 
+## 1.5 RequestContext extension (~15 min)
+
+Required before any subscription tool can be implemented (§5.0 of
+spec).
+
+**Files**:
+- `bot/agent/request_context.py` — add `chat_type`, `asker_user_id`,
+  `asker_handle` fields
+- `bot/app.py::_handle_message` — populate them from
+  `ParsedMessageEvent.chat_type` and the existing
+  `db_queries.lookup_by_feishu_open_id` call (already present for
+  the `[asker]` framing). Pass into agent runner's context.
+- `bot/agent/runner.py` — accept the new fields in
+  `answer_streaming(...)` kwargs, push to `slot.ctx`.
+
+**Exit criterion**: a tool calling
+`ctx.chat_type / ctx.asker_user_id` returns the right values for
+both p2p and group messages.
+
 ## 2. Bot config + DB layer (~30 min)
 
 **Files**:
@@ -55,17 +74,24 @@ selects on the new tables.
   - `delivery_loop_interval_seconds: int = 15`
   - `notification_render_max_seconds: int = 60`
 - `bot/db/queries.py` — new functions:
-  - `fetch_unprocessed_events(limit)`
-  - `mark_event_processed(event_id)`
-  - `fetch_enabled_subscriptions(scope_kind=None, scope_id=None)`
-  - `notification_exists(event_id, sub_id)`
-  - `write_decision_log(...)`
-  - `write_notification_row(...)`
+  - `fetch_events_needing_decision(limit)` — picks rows where
+    `processed_at IS NULL` OR `processed_version < payload_version`
+  - `mark_event_processed(event_id, payload_version)`
+  - `fetch_enabled_subscriptions_for_scope(scope_kind, scope_id)` —
+    returns ALL enabled rows for that scope (for sibling-rule
+    decision context)
+  - `get_notification(event_id, sub_id)` — for upsert-aware decider
+  - `write_decision_log(... + input_tokens, output_tokens)`
+  - `upsert_notification_row(...)` — overwrites pending decisions
+    when payload_version increases; never overwrites `sent`
   - `fetch_pending_notifications(limit)`
   - `mark_notification_sent(id, msg_id, text)`
   - `mark_notification_failed(id, error)`
-  - `recent_notifications_for_subscription(sub_id, since_minutes)`
-  - `daily_count_for_owner(scope_kind, scope_id, since_local_midnight)`
+  - `recent_notifications_for_scope(scope_kind, scope_id,
+    since_minutes)` — returns rows with `decided_at` so judge can
+    do real timestamp math
+  - `daily_sent_count_for_scope(scope_kind, scope_id,
+    since_local_midnight)`
   - `lookup_notification_by_feishu_msg_id(msg_id)`
   - `add_subscription(scope_kind, scope_id, description, created_by, chat_id)`
   - `list_subscriptions(scope_kind, scope_id)`
@@ -73,6 +99,8 @@ selects on the new tables.
   - `remove_subscription(id, scope_kind, scope_id)`
   - `feishu_link_for_user_id(user_id)` — returns open_id, name,
     timezone for renderer's mention/timezone logic
+  - `resolve_subject_open_id(user_id)` — used by the new renderer
+    tool `resolve_subject_mention`
 
 All writes use `sb_admin()`.
 
@@ -149,9 +177,10 @@ seconds and writes a notification row.
 
 ---
 
-## 5. Renderer module (~30 min)
+## 5. Renderer module (~45 min)
 
-**File**: `bot/agent/renderer.py` (new)
+**File**: `bot/agent/renderer.py` (new), and a tiny additional MCP
+tool registration for `resolve_subject_mention`.
 
 Public API:
 
@@ -164,10 +193,18 @@ async def render_notification(
 ```
 
 Implementation:
+- Register a new read-only MCP tool `resolve_subject_mention` that
+  wraps `queries.resolve_subject_open_id(user_id)` and returns
+  `{ open_id, display_name }` or `{ open_id: null }`. Group renders
+  need this for `<at user_id="...">` mentions; user-scope renders
+  may also use it.
 - Build a one-shot `ClaudeAgentOptions` with the renderer prompt
-  (§4.2 of spec) and a curated tool subset (read-only:
-  `mcp__pmo__list_users`, `lookup_user`, `get_recent_turns`,
-  `get_project_overview`, `get_activity_stats`, `today_iso`)
+  (§4.2 of spec) and a curated tool subset:
+    `list_users, lookup_user, get_recent_turns,
+     get_project_overview, get_activity_stats, today_iso,
+     resolve_subject_mention`
+  Image generation, write tools, external readers, resolve_people
+  are all explicitly NOT in this subset.
 - No SDK client pooling — each render is independent and
   short-lived
 - Hard timeout via `asyncio.wait_for` at
@@ -309,6 +346,24 @@ Concrete script:
    subsequent events are suppressed with `quiet_hours`
 10. From a group `@bot 订阅 vibelive 进展` — verify chat-scoped
     subscription, and a subsequent matching event reaches the group
+    with a real `<at user_id="ou_...">` mention of the turn author
+    (i.e. that `resolve_subject_mention` actually got called and
+    the renderer used the real open_id, not just `@handle`).
+11. **Sibling-rule veto regression**: with both "vibelive 进展告诉我"
+    and "今晚别打扰" subscribed, fast-forward owner local clock into
+    "tonight" range (or insert a turn during real night), verify
+    the matching event is suppressed with
+    `suppressed_by='quiet_hours'` even though the candidate
+    subscription positively matches.
+12. **Late-summary race regression**: insert a turn row with
+    `agent_summary IS NULL`, observe one decision (likely
+    suppressed `mismatch`); 30s later, UPDATE the turn to fill
+    `agent_summary`; observe `events.payload_version` bumped to 2,
+    decider re-considers, second decision sends.
+13. **5-min dedup**: after step 4 succeeds, immediately insert
+    another similar vibelive turn within 5 minutes; verify the
+    second event is suppressed `duplicate_in_window` and references
+    the first notification's `decided_at` in its `reason`.
 
 If any step fails: triage in the order of decider prompt → judge
 JSON parsing → renderer prompt → delivery wiring → tool

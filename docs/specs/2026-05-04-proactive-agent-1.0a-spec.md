@@ -72,21 +72,43 @@ create table events (
     source_id     text not null,                -- (source, source_id) is unique
     user_id       uuid references profiles(id), -- subject of the event, if known
     project_root  text,                         -- canonical project, if applicable
-    occurred_at   timestamptz not null,
-    ingested_at   timestamptz not null default now(),
-    processed_at  timestamptz,                  -- null = not yet decided on
-    payload       jsonb not null,
+    occurred_at      timestamptz not null,
+    ingested_at      timestamptz not null default now(),
+    processed_at     timestamptz,                       -- null = not yet decided on
+    processed_version int default 0,                    -- which payload_version was decided on
+    payload_version  int not null default 1,            -- bumped each time payload mutates
+    payload          jsonb not null,
     unique (source, source_id)
 );
 
+-- Pick up: never-processed events AND events whose payload was
+-- updated after the last decision (e.g. agent_summary arrived late).
 create index events_unprocessed_idx
     on events (ingested_at)
-    where processed_at is null;
+    where processed_at is null or processed_version < payload_version;
 ```
 
-The `processed_at` column is the watermark for the decider loop.
-Once the decider has fanned an event out to all enabled
-subscriptions, it sets `processed_at = now()`.
+The decider's watermark is **(processed_at IS NULL) OR
+(processed_version < payload_version)**. The `payload_version`
+counter exists because turn events get an empty `agent_summary`
+on insert and the real summary arrives via UPDATE 5-30s later from
+the summarise edge function. Without versioning, we'd either:
+- decide on the empty summary → notification missing the punch line
+- block forever waiting → notifications never go out for turns the
+  summariser failed on
+
+Versioning lets us decide once on what we have, then **re-decide
+when the payload becomes meaningfully better**. The trigger §2.6
+bumps `payload_version` only when fields the decider actually reads
+change (`agent_summary`, `agent_response_full`) — not on every
+trivial update.
+
+For each (event, subscription) pair, the unique constraint on
+`notifications(event_id, subscription_id)` means re-deciding is
+idempotent: if we already wrote a `pending` or `sent` row, the
+re-decision either rewrites it (still pending, hasn't gone out) or
+no-ops (already sent, can't unsend). The decider checks
+notification status before overwriting.
 
 For 1.0a only one source exists: `source = 'turn'`, `source_id =
 turns.id::text`. The trigger lives in §2.5.
@@ -179,6 +201,10 @@ create table decision_logs (
     judge_output    jsonb  not null,
     model           text   not null,
     latency_ms      int,
+    -- Token usage so we can size the budget honestly (§7).
+    -- Some endpoints don't return usage; columns are nullable.
+    input_tokens    int,
+    output_tokens   int,
     created_at      timestamptz not null default now()
 );
 
@@ -197,9 +223,19 @@ how prompt iteration becomes data-driven and how the
 
 ```sql
 create function on_turn_to_event() returns trigger as $$
+declare
+    payload_significantly_changed boolean;
 begin
+    -- Only bump payload_version when fields the decider actually reads
+    -- changed. Pure metadata updates (last_seen_at etc.) shouldn't
+    -- trigger reprocessing.
+    payload_significantly_changed :=
+        (tg_op = 'INSERT') or
+        (coalesce(old.agent_summary, '')      is distinct from coalesce(new.agent_summary, '')) or
+        (coalesce(old.agent_response_full,'') is distinct from coalesce(new.agent_response_full, ''));
+
     insert into events (source, source_id, user_id, project_root,
-                        occurred_at, payload)
+                        occurred_at, payload, payload_version)
     values (
         'turn',
         new.id::text,
@@ -214,11 +250,19 @@ begin
             'user_message', new.user_message,
             'agent_summary', new.agent_summary,
             'user_message_at', new.user_message_at
-        )
+        ),
+        1
     )
     on conflict (source, source_id) do update
         set payload = excluded.payload,
-            ingested_at = now();
+            payload_version = case
+                when payload_significantly_changed then events.payload_version + 1
+                else events.payload_version
+            end,
+            ingested_at = case
+                when payload_significantly_changed then now()
+                else events.ingested_at
+            end;
     return new;
 end $$ language plpgsql;
 
@@ -228,13 +272,15 @@ create trigger turns_to_events
 ```
 
 We trigger on UPDATE too because `agent_summary` is filled in
-asynchronously by the summarise edge function — we want the latest
-payload, not the empty insert.
+asynchronously by the summarise edge function. The
+`payload_significantly_changed` guard ensures the decider only
+re-considers an event when the new content is materially different
+— writing the same summary twice does not cause two notifications.
 
-The trigger is **idempotent** (`on conflict do update`). If we
-re-trigger or replay, we don't fan out twice — the decider's
-per-event watermark + per-(event, subscription) unique constraint
-handle that.
+The trigger is **idempotent in the trivial sense** (same input →
+same row), and the version field plus the
+`notifications(event_id, subscription_id)` unique constraint give
+the decider safe re-processing semantics.
 
 ### 2.7 RLS
 
@@ -267,29 +313,68 @@ Runs in the bot process as an `asyncio.create_task(...)` started in
 async def decider_loop():
     while True:
         await asyncio.sleep(30)
-        events = fetch_unprocessed_events(limit=100)
+        # "unprocessed" = never decided OR decided on a stale payload_version
+        events = fetch_events_needing_decision(limit=100)
         for ev in events:
-            for sub in fetch_enabled_subscriptions():
-                # Idempotency: skip if a notification row already
-                # exists for this (event, sub) pair.
-                if notification_exists(ev.id, sub.id):
+            for sub in fetch_enabled_subscriptions(scope=event_scope(ev)):
+                existing = get_notification(ev.id, sub.id)
+                if existing and existing.status == 'sent':
+                    # Already delivered — can't unsend, leave it
                     continue
+                if existing and existing.status == 'pending':
+                    # We decided last round but haven't delivered yet
+                    # (payload changed between decision and render);
+                    # rewrite the row in place if the new decision
+                    # disagrees, else leave as-is
+                    pass
                 decision = await judge(ev, sub, context_for(sub))
                 write_decision_log(ev, sub, decision, model, latency)
-                write_notification_row(ev, sub, decision)
-            mark_event_processed(ev.id)
+                upsert_notification_row(ev, sub, decision)
+            mark_event_processed(ev.id, ev.payload_version)
 ```
 
-`context_for(sub)` is the bundle the judge needs:
+`mark_event_processed(event_id, version)` does:
+```sql
+update events
+   set processed_at = now(), processed_version = $version
+ where id = $event_id;
+```
 
-- The subscription's full text
-- The subscription's other recent notifications (last 30min) so the
-  judge can dedup
-- The subscriber's daily count (for daily-cap awareness)
-- The subscriber's wall clock in their timezone (for quiet hours)
-- Whether the event subject (`event.user_id`) is the same as the
-  subscription owner (so the judge can apply the user's rule about
-  self-events; default is to send, since user decision #2)
+So a later UPDATE to that turn row that bumps `payload_version`
+will pull the event back into `fetch_events_needing_decision`.
+
+`context_for(sub)` is the bundle the judge needs. Critically, the
+judge sees **all of the owner's preferences**, not just the
+candidate subscription, because exclusions and quiet-hours are
+written as separate `subscriptions` rows but must be able to
+suppress matches from a *different* row. Concretely:
+
+- **Candidate subscription**: the row currently being decided on
+  (positive description, e.g. "vibelive 进展告诉我"). The judge
+  considers this the potential match source.
+- **All sibling subscriptions for the same scope**: every other
+  enabled row owned by the same `(scope_kind, scope_id)`, ordered
+  newest-first. These contain exclusions ("项目 C 不要"), quiet-hours
+  ("今晚别打扰我"), and other modifiers that must veto the candidate
+  if applicable.
+- **Recent notifications for this scope** (last 30min, with
+  per-row `decided_at` ISO timestamps so the 5-min dedup rule can
+  actually be applied): payload + status (sent / suppressed) so the
+  judge can dedup against earlier deliveries AND avoid reasoning
+  itself in circles by re-suppressing things already suppressed for
+  the same reason.
+- **Daily count** for the owner (notifications with status='sent'
+  since local-midnight in the owner's timezone).
+- **Owner wall clock** in their timezone.
+- **is_subject_the_owner**: whether `event.user_id` matches the
+  subscription scope. Default is to send (per user decision #2);
+  individual subscription descriptions can flip this if they
+  explicitly say so.
+
+The judge's verdict is therefore a function of (event, candidate
+sub, all sibling subs, recent notifs, time, subject-relation), and
+"项目 C 不要" or "今晚别打扰" written as a sibling row will reliably
+veto a candidate match.
 
 Errors during decision → log, mark this (event, sub) skipped (do
 not write a notification row), do not block the rest of the batch.
@@ -326,11 +411,20 @@ async def delivery_loop():
 - System prompt: see §4
 - User message: structured payload — event payload + subscription
   description + scope hint
-- Tools available: same set as the existing question-answering
-  agent (read-only — list_users, lookup_user, get_recent_turns,
-  get_project_overview, get_activity_stats, today_iso). Write tools
-  (calendar / bitable / doc) are explicitly disallowed during
-  rendering. The renderer must not take side effects.
+- Tools available: read-only subset — `list_users`, `lookup_user`,
+  `get_recent_turns`, `get_project_overview`, `get_activity_stats`,
+  `today_iso`, plus a new **`resolve_subject_mention(user_id)`**
+  tool that returns the linked Feishu open_id (and display name) so
+  the renderer can emit a real `<at user_id="ou_xxx"></at>` for
+  group mentions. Image generation, write tools (calendar / bitable
+  / doc), external link readers, and `resolve_people` (which is
+  ambiguity-aware and prompts for follow-ups) are all explicitly
+  disallowed during rendering — the renderer must produce a final
+  string in one shot with no side effects.
+
+  As a fallback when `resolve_subject_mention` returns nothing
+  (subject hasn't bound their Feishu account), the renderer uses
+  `@<handle>` plain text so the message is still readable.
 - Output: markdown text, post-processed via the existing
   `markdown_to_post` and sent as a `post` message (to keep parity
   with the existing answer style).
@@ -369,16 +463,37 @@ A single prompt, ~600 tokens. Filled with a small Python format
 function. Pseudocode:
 
 ```
-你是 pmo_agent 的通知决策器。给你一条新事件、订阅人的偏好列表、
-以及最近的通知历史。判断要不要给这个订阅发通知。
+你是 pmo_agent 的通知决策器。给你一条新事件 + 订阅人的全部偏好 +
+最近通知历史。判断要不要给候选订阅发通知。
 
-## 当前订阅
+## 候选订阅（Candidate）
 
+  id: {uuid}
   scope: {user | chat}
   description: "{用户原话}"
-  owner_local_time: {wall clock in their timezone}
-  owner_today_count: {他们今天已收到的通知数}
-  owner_recent_subjects: [...过去 30 分钟收到过的通知主题摘要...]
+
+## 订阅人的其他生效偏好（Sibling rules）
+
+按时间倒序，**任何一条都可能 veto 候选订阅**——比如某条说"项目 C
+不要"、"凌晨别打扰"、"我自己干的事不用提醒"——只要它和事件相关，
+就压过候选订阅。
+
+  - id={uuid}, "{原话}"
+  - id={uuid}, "{原话}"
+  ...
+
+## 订阅人状态
+
+  owner_local_time: {wall clock in their timezone, e.g. "2026-05-04 23:42 Asia/Shanghai"}
+  owner_today_sent_count: {今天已**实际发出**（status='sent'）的通知数}
+  owner_recent_notifications: [
+    { decided_at: "2026-05-04T23:30:00+08:00",
+      status: "sent" | "suppressed",
+      subject_summary: "albert 在 vibelive 调播放器 buffer",
+      project_root: "/Users/.../vibelive",
+      suppressed_by: null | "..." },
+    ...
+  ]   # last 30 minutes; 用 decided_at 判去重时间窗
 
 ## 事件
 
@@ -389,30 +504,38 @@ function. Pseudocode:
   is_subject_the_owner: {true | false}
   payload:
     user_message: "{用户输入的 prompt}"
-    agent_summary: "{一句话总结}"
+    agent_summary: "{一句话总结，可能为空 — 此时只能凭 user_message
+                    判断主题}"
 
 ## 决策原则
 
-1. description 是用户原话，按字面意思 + 合理引申理解。
-2. 排除规则覆盖匹配规则（"项目 C 不要" 压过 "团队进展告诉我"）。
-3. 静音时段：description 提到不要打扰的时段、且 owner_local_time
-   在该时段内 → send=false, suppressed_by="quiet_hours"。
-4. 5min 去重：如果 owner_recent_subjects 里有同主题的近期通知
-   → send=false, suppressed_by="duplicate_in_window"。
-5. 每日上限：如果 owner_today_count >= 20，且 description 没有
-   明确说"重要事件 break through"
-   → send=false, suppressed_by="daily_cap"。
+1. **排除/静音类 sibling 优先**：先扫一遍 sibling rules，看有没有任何
+   一条会因当前事件或当前时间触发否定（"项目 X 不要"、"凌晨别打扰"、
+   "周末不发"等）。命中就 send=false，suppressed_by 取最贴切的那个
+   分类（"explicit_exclude" 或 "quiet_hours"）。
+2. **去重**：扫 owner_recent_notifications，看 decided_at 在 5 分钟内
+   且 subject 同主题的条目（status 不限 sent/suppressed 都算占住坑）。
+   命中 → send=false, suppressed_by="duplicate_in_window"。
+3. **每日上限**：owner_today_sent_count >= 20 → send=false,
+   suppressed_by="daily_cap"。除非 sibling rules 里写了"重要事件
+   break through"。
+4. **是否匹配候选订阅**：到此都没否决，看候选 description 是否覆盖
+   当前事件。命中 → send=true，写 matched_aspect 和 preview_hint。
+5. **agent_summary 缺失**：如果 payload.agent_summary 为空且
+   user_message 不足以判断主题 → send=false, suppressed_by="mismatch"，
+   reason 注明 "summary not available yet"。等下一次 payload_version
+   bump 重审。
 6. 拿不准 → send=false。
 
 ## 输出 JSON
 
 {
   "send": bool,
-  "matched_aspect": "description 里哪一块匹配的（一句话）",
-  "preview_hint": "如果 send=true，1 句话告诉渲染阶段重点写什么",
+  "matched_aspect": "候选 description 里哪一块匹配的（一句话），未发出可空",
+  "preview_hint": "若 send=true，1 句话告诉渲染阶段重点写什么",
   "suppressed_by": "duplicate_in_window | quiet_hours | daily_cap |
                     explicit_exclude | mismatch | null",
-  "reason": "一句话说明判断依据"
+  "reason": "一句话说明判断依据，必须能让用户日后追问'为什么没通知'时复盘"
 }
 ```
 
@@ -446,9 +569,10 @@ Key differences from the question-answering prompt:
 - 直接说事，不要 "我来告诉你" / "让我看看" 这种空话
 - 重点写 [1] 改了什么 [2] 思考 / 技术方案。后者从 turn 上下文
   里挖（用 get_recent_turns / get_project_overview）
-- 群通知里提到事件主体时用 飞书 mention 语法
-  `<at user_id="{open_id}"></at>`，但前提是从 feishu_links 能查
-  到那个人的 open_id；查不到就用 @handle 文字
+- 群通知里提到事件主体时调用 resolve_subject_mention(user_id) 拿
+  open_id，然后用 `<at user_id="ou_xxx"></at>` 飞书 mention 语法。
+  resolve_subject_mention 返回空说明那个人还没绑定飞书 → 直接写
+  `@<handle>` 文字版本。**不要假设格式 — 一定要先调工具**。
 - 末尾加一行小字写"—— 来自订阅 {description 的一句话摘要}"
   让用户知道为什么收到这条
 - 不要加 [IMAGE:] 标记 — 主动通知里不生图（避免突然的视觉打扰）
@@ -466,6 +590,32 @@ disabled for this path (the renderer's allowed_tools list omits it).
 ---
 
 ## 5. Subscription tools
+
+### 5.0 Prerequisite: extend `RequestContext`
+
+Today `RequestContext` carries `(message_id, chat_id,
+sender_open_id, conversation_key)`. The subscription tools need
+two more fields:
+
+- `chat_type: str` — `'p2p' | 'group'`. Determines whether
+  `add_subscription` writes a user-scoped or chat-scoped row.
+- `asker_user_id: str | None` — the resolved profile UUID of the
+  asker (None if Feishu account isn't bound). Used as
+  `subscriptions.scope_id` for user scope, and as `created_by`
+  always.
+- `asker_handle: str | None` — convenience for tool error
+  messages.
+
+These are populated in `app.py::_handle_message` from
+`feishu_events.ParsedMessageEvent.chat_type` (already parsed) and
+`db_queries.lookup_by_feishu_open_id(sender_open_id)` (already
+called for the `[asker]` framing). Then passed into the runner's
+context the same way `message_id` / `chat_id` are today.
+
+This is implemented as **§2.5 of the build plan, before the four
+tools land**, because every tool depends on it.
+
+### 5.1 The four tools
 
 Four new MCP tools are added to the existing `tools.py`. They
 follow the same `_ok` / `_err` wrapper convention.
