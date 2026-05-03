@@ -58,6 +58,19 @@ def _event_to_dict(calendar_id: str, ev: Any) -> dict[str, Any]:
         "end_time": _time_to_iso(getattr(ev, "end_time", None)),
         "link": getattr(ev, "app_link", None),
         "attendees": attendees,
+        "location": _location_to_dict(getattr(ev, "location", None)),
+        "visibility": getattr(ev, "visibility", None),
+    }
+
+
+def _location_to_dict(location: Any) -> dict[str, Any] | None:
+    if not location:
+        return None
+    return {
+        "name": getattr(location, "name", None),
+        "address": getattr(location, "address", None),
+        "latitude": getattr(location, "latitude", None),
+        "longitude": getattr(location, "longitude", None),
     }
 
 
@@ -251,3 +264,20 @@ async def list_events(calendar_id: str, time_min: str, time_max: str) -> list[di
         if not resp.data.has_more:
             return events
         page_token = resp.data.page_token
+
+
+async def list_event_instances(calendar_id: str, time_min: str, time_max: str) -> list[dict[str, Any]]:
+    from lark_oapi.api.calendar.v4 import InstanceViewCalendarEventRequest
+
+    req = (
+        InstanceViewCalendarEventRequest.builder()
+        .calendar_id(calendar_id)
+        .start_time(_timestamp(time_min))
+        .end_time(_timestamp(time_max))
+        .user_id_type("open_id")
+        .build()
+    )
+    resp = await asyncio.to_thread(_lark_client().calendar.v4.calendar_event.instance_view, req)
+    if not resp.success():
+        raise RuntimeError(f"calendar.list_event_instances failed: {resp.code} {resp.msg}")
+    return [_event_to_dict(calendar_id, ev) for ev in (resp.data.items or [])]

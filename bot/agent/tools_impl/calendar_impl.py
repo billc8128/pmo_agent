@@ -248,7 +248,7 @@ async def list_my_meetings(ctx: RequestContext, args: dict[str, Any]) -> dict[st
         try:
             primary = await calendar.primary_calendar_id(target)
             if primary:
-                user_events = await calendar.list_events(primary, since, until)
+                user_events = await calendar.list_event_instances(primary, since, until)
                 user_events = _filter_events_by_window(user_events, since, until)
             else:
                 user_calendar_warning = "primary_calendar_not_visible_to_bot"

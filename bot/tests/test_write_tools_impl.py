@@ -224,14 +224,14 @@ def test_list_my_meetings_expands_date_only_window_in_user_timezone(monkeypatch)
     monkeypatch.setattr("feishu.calendar.batch_freebusy", lambda *args, **kwargs: asyncio.sleep(0, result=[]))
     captured = []
 
-    async def list_events(calendar_id, since, until):
+    async def list_event_instances(calendar_id, since, until):
         captured.append((calendar_id, since, until))
         return [
             {"title": "旧会", "start_time": "2026-05-04T10:00:00+08:00", "end_time": "2026-05-04T10:30:00+08:00"},
             {"title": "站会", "start_time": since, "end_time": until},
         ]
 
-    monkeypatch.setattr("feishu.calendar.list_events", list_events)
+    monkeypatch.setattr("feishu.calendar.list_event_instances", list_event_instances)
 
     result = asyncio.run(calendar_impl.list_my_meetings(_ctx(), {
         "since": "2026-05-06",
@@ -244,6 +244,70 @@ def test_list_my_meetings_expands_date_only_window_in_user_timezone(monkeypatch)
     assert payload["normalized_until"] == "2026-05-07T00:00:00+08:00"
     assert [event["title"] for event in payload["user_calendar_events"]] == ["站会"]
     assert [event["title"] for event in payload["bot_known_events"]] == ["后天会"]
+
+
+def test_list_my_meetings_prefers_instance_view(monkeypatch):
+    monkeypatch.setattr(
+        "feishu.contact.get_user",
+        lambda open_id: asyncio.sleep(0, result={"time_zone": "Asia/Shanghai"}),
+    )
+    monkeypatch.setattr("db.queries.bot_known_events_for_attendee", lambda *args, **kwargs: [])
+    monkeypatch.setattr("feishu.calendar.primary_calendar_id", lambda open_id: asyncio.sleep(0, result="cal-1"))
+    monkeypatch.setattr("feishu.calendar.batch_freebusy", lambda *args, **kwargs: asyncio.sleep(0, result=[]))
+    captured = []
+
+    async def list_event_instances(calendar_id, since, until):
+        captured.append((calendar_id, since, until))
+        return [{"title": "完整标题", "start_time": since, "end_time": until}]
+
+    monkeypatch.setattr("feishu.calendar.list_event_instances", list_event_instances, raising=False)
+    monkeypatch.setattr(
+        "feishu.calendar.list_events",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy list_events should not be called")),
+    )
+
+    result = asyncio.run(calendar_impl.list_my_meetings(_ctx(), {
+        "since": "2026-05-06",
+        "until": "2026-05-07",
+    }))
+    payload = content_payload(result)
+
+    assert captured == [("cal-1", "2026-05-06T00:00:00+08:00", "2026-05-07T00:00:00+08:00")]
+    assert [event["title"] for event in payload["user_calendar_events"]] == ["完整标题"]
+
+
+def test_list_my_meetings_surfaces_instance_view_access_denied(monkeypatch):
+    monkeypatch.setattr(
+        "feishu.contact.get_user",
+        lambda open_id: asyncio.sleep(0, result={"time_zone": "Asia/Shanghai"}),
+    )
+    monkeypatch.setattr("db.queries.bot_known_events_for_attendee", lambda *args, **kwargs: [])
+    monkeypatch.setattr("feishu.calendar.primary_calendar_id", lambda open_id: asyncio.sleep(0, result="cal-1"))
+    monkeypatch.setattr("feishu.calendar.batch_freebusy", lambda *args, **kwargs: asyncio.sleep(0, result=[{
+        "open_id": "ou_asker",
+        "start_time": "2026-05-06T10:00:00+08:00",
+        "end_time": "2026-05-06T10:10:00+08:00",
+        "rsvp_status": None,
+    }]))
+
+    async def fail_instance_view(*args, **kwargs):
+        raise RuntimeError("calendar.list_event_instances failed: 191002 no calendar access_role")
+
+    monkeypatch.setattr("feishu.calendar.list_event_instances", fail_instance_view, raising=False)
+    monkeypatch.setattr(
+        "feishu.calendar.list_events",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy list_events should not be called")),
+    )
+
+    result = asyncio.run(calendar_impl.list_my_meetings(_ctx(), {
+        "since": "2026-05-06",
+        "until": "2026-05-07",
+    }))
+    payload = content_payload(result)
+
+    assert "no calendar access_role" in payload["user_calendar_error"]
+    assert payload["user_calendar_events"] == []
+    assert payload["user_busy_slots"][0]["start_time"] == "2026-05-06T10:00:00+08:00"
 
 
 def test_list_my_meetings_surfaces_calendar_read_errors(monkeypatch):
