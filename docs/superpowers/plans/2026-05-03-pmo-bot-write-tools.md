@@ -28,7 +28,6 @@
 | `bot/feishu/calendar.py` | Calendar SDK wrappers (freebusy, event create/get/delete, attendee invite, primarys) |
 | `bot/feishu/bitable.py` | Bitable SDK wrappers (app create/get, table create, record batch_create/batch_delete/search) |
 | `bot/feishu/drive.py` | Drive SDK wrappers (file upload_all/delete/create_folder, import_task create/get) |
-| `bot/feishu/docx.py` | Docx SDK wrappers (Path B fallback only — `document.create`, `document_block_children.create`) |
 | `bot/feishu/contact.py` | Contact: `user.get` (timezone), `batch_get_id` (email/phone), and **raw httpx** wrapper for `/open-apis/search/v1/user` |
 | `bot/feishu/auth.py` | Shared `tenant_access_token` issuer extracted from `feishu/client.py:67` (factored out to support contact search) |
 | `bot/agent/canonical_args.py` | `compute_logical_key` + canonicalization helpers (sorted-keys JSON, UTC time normalization) |
@@ -478,6 +477,80 @@ def test_logical_key_stable_across_arg_order():
     assert k1 == k2
     assert isinstance(k1, str)
     assert len(k1) == 64  # sha256 hex
+
+
+def test_canonical_fills_default_duration_for_schedule():
+    """duration_minutes omitted vs explicitly passed 30 must collide."""
+    a = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a"]},
+        action_type="schedule_meeting",
+    )
+    b = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a"], "duration_minutes": 30},
+        action_type="schedule_meeting",
+    )
+    assert a == b
+
+
+def test_canonical_fills_default_include_asker():
+    a = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a"]},
+        action_type="schedule_meeting",
+    )
+    b = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a"], "include_asker": True},
+        action_type="schedule_meeting",
+    )
+    assert a == b
+
+
+def test_canonical_sorts_attendee_open_ids():
+    """User saying "和 albert 和 bcc" vs "和 bcc 和 albert" must collide."""
+    a = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_albert", "ou_bcc"]},
+        action_type="schedule_meeting",
+    )
+    b = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_bcc", "ou_albert"]},
+        action_type="schedule_meeting",
+    )
+    assert a == b
+
+
+def test_canonical_dedupes_attendee_open_ids():
+    """Doubling an attendee accidentally must collide."""
+    a = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a", "ou_a", "ou_b"]},
+        action_type="schedule_meeting",
+    )
+    b = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a", "ou_b"]},
+        action_type="schedule_meeting",
+    )
+    assert a == b
+
+
+def test_canonical_distinct_when_truly_different():
+    """Different titles still produce different keys (sanity)."""
+    a = canonicalize_args(
+        {"title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a"]},
+        action_type="schedule_meeting",
+    )
+    b = canonicalize_args(
+        {"title": "Y", "start_time": "2026-05-08T15:00:00+08:00",
+         "attendee_open_ids": ["ou_a"]},
+        action_type="schedule_meeting",
+    )
+    assert a != b
 ```
 
 - [ ] **Step 2: Run, expect ImportError**
@@ -508,21 +581,62 @@ from typing import Any
 
 
 def canonicalize_args(args: dict[str, Any], *, action_type: str | None = None) -> dict[str, Any]:
-    """Return args with stable key order and normalized values.
+    """Return args with stable key order, normalized values, AND
+    per-action-type default-filling so the same logical request
+    produces the same logical_key regardless of whether the user
+    typed it the long way or the short way.
 
-    For schedule_meeting, start_time is normalized to UTC so equivalent
-    +08:00 / +00:00 representations collide on the same logical_key.
+    Per Codex plan-review iter-3 #3:
+      - duration_minutes=30 omitted vs explicitly passed → same key
+      - include_asker omitted vs True → same key
+      - reminder_minutes=15 omitted vs explicit → same key
+      - attendee_open_ids ["ou_a","ou_b"] vs ["ou_b","ou_a"] → same key
+        (sorted-and-deduplicated)
+
+    Without this, a user retyping "和 albert 订下周三 3 点 30 分钟" vs
+    "和 albert 订下周三 3 点" would slip past the 60s dedup window.
     """
     out = dict(args)
-    if action_type == "schedule_meeting" and "start_time" in out:
-        try:
-            dt = datetime.fromisoformat(out["start_time"])
-            if dt.tzinfo is not None:
-                out["start_time"] = dt.astimezone(timezone.utc).isoformat()
-        except ValueError:
-            # leave as-is; downstream validation will catch malformed input
-            pass
-    # json.dumps with sort_keys gives a deterministic byte sequence
+
+    if action_type == "schedule_meeting":
+        # 1. Default-fill the optional fields.
+        out.setdefault("duration_minutes", 30)
+        out.setdefault("reminder_minutes", 15)
+        out.setdefault("include_asker", True)
+        out.setdefault("description", "")
+
+        # 2. Normalize start_time to UTC so +08:00 / +00:00 collide.
+        if "start_time" in out:
+            try:
+                dt = datetime.fromisoformat(out["start_time"])
+                if dt.tzinfo is not None:
+                    out["start_time"] = dt.astimezone(timezone.utc).isoformat()
+            except ValueError:
+                pass  # downstream validation catches it
+
+        # 3. Sort + dedupe attendee_open_ids (set semantics — order
+        #    doesn't matter to a human asking "和 albert + bcc 订会").
+        if "attendee_open_ids" in out and isinstance(out["attendee_open_ids"], list):
+            out["attendee_open_ids"] = sorted(set(out["attendee_open_ids"]))
+
+    elif action_type == "append_action_items":
+        # Per-item canonicalization: sort items by title, normalize
+        # owner_open_id casing.
+        if "items" in out and isinstance(out["items"], list):
+            out["items"] = sorted(
+                [{**item, "title": (item.get("title") or "").strip()}
+                 for item in out["items"]],
+                key=lambda i: (i.get("project") or "", i.get("title") or ""),
+            )
+
+    elif action_type == "create_meeting_doc":
+        out.setdefault("meeting_event_id", None)
+
+    # cancel_meeting / undo_last_action / list_my_meetings / query_action_items
+    # / resolve_people / today_iso don't need additional canonicalization;
+    # their logical identity matches their literal args.
+
+    # Final stable serialization
     return json.loads(json.dumps(out, sort_keys=True))
 
 
@@ -1030,7 +1144,19 @@ def get_locked_by_logical_key(logical_key: str) -> dict[str, Any] | None:
             )
             if update.data:
                 return None
-            # else: lost race — fall through to return current row state
+            # 0 rows — another worker won the race and already unlocked.
+            # Re-read by id to see the post-race state. If it's now
+            # unlocked, the slot is genuinely free; return None so the
+            # caller proceeds with their INSERT. Otherwise fall through.
+            # (Codex plan-review iter-3 #4: returning the stale `row` here
+            # would falsely report dedup hit on a >60s legitimate retry.)
+            current = (
+                sb_admin().table("bot_actions").select("*")
+                .eq("id", row["id"]).maybe_single().execute().data
+            )
+            if not current or not current.get("logical_key_locked"):
+                return None
+            row = current  # use the re-read state for the final return
 
     return row
 ```
@@ -1132,20 +1258,92 @@ def mark_bot_action_failed(action_id: str, error: str) -> dict[str, Any] | None:
 
 
 def mark_bot_action_undone(action_id: str) -> dict[str, Any] | None:
+    """Phase-1 transition guard variant: pending → undone only.
+    Used by tools that want to retire their OWN pending row (e.g., a
+    cancel_meeting Phase 3 marking the cancel row's twin schedule_meeting
+    row when both are still pending).
+
+    For the §3.9 undo dispatch path that must transition a TERMINAL
+    success/reconciled_unknown source row to undone, use
+    `retire_source_action` below — it intentionally allows
+    success/reconciled_unknown → undone without the pending guard.
+    """
     res = (
         sb_admin().table("bot_actions").update({
             "status": "undone", "logical_key_locked": False,
         }).eq("id", action_id).eq("status", "pending").execute()
     )
     return res.data[0] if res.data else None
+
+
+def retire_source_action(action_id: str) -> dict[str, Any] | None:
+    """§3.9 undo dispatch helper: transition success/reconciled_unknown
+    source row to undone AND clear logical_key_locked.
+
+    Distinct from `mark_bot_action_undone` because:
+    - mark_bot_action_undone has WHERE status='pending' (transition
+      guard against overwriting terminals); the undo path needs the
+      OPPOSITE — explicitly transition a terminal to undone.
+    - The predicate `status IN ('success','reconciled_unknown')` makes
+      this idempotent: a second undo attempt on an already-undone row
+      affects 0 rows; caller treats that as success (the desired end
+      state already holds).
+
+    Used by every §3.9 dispatch arm that retires its source row:
+    schedule_meeting / restore_schedule_meeting (after delete_event),
+    cancel_meeting (after probe-then-restore-or-just-mark),
+    append_action_items (after batch_delete), create_meeting_doc (after
+    file.delete).
+
+    The §3.9 cancel-restore R0 pre-step uses a more specific UPDATE
+    with `action_type IN (...)` AND `target_kind='calendar_event'`
+    guards (spec row 110); that lives directly in the tool body, not
+    here, because it has additional invariants.
+    """
+    res = (
+        sb_admin().table("bot_actions").update({
+            "status": "undone", "logical_key_locked": False,
+        }).eq("id", action_id).in_("status", ["success", "reconciled_unknown"]).execute()
+    )
+    if res.data:
+        return res.data[0]
+    # 0 rows: either already undone (idempotent success) or row doesn't
+    # exist. Re-read to give caller current state.
+    current = (
+        sb_admin().table("bot_actions").select("*")
+        .eq("id", action_id).maybe_single().execute().data
+    )
+    return current
 ```
 
 - [ ] **Step 4: Run, expect pass**
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add a test for retire_source_action**
+
+```python
+def test_retire_source_action_transitions_success_to_undone(fake_admin):
+    fake_admin.table.return_value.update.return_value.eq.return_value.in_.return_value.execute.return_value.data = [{
+        "id": "u1", "status": "undone", "logical_key_locked": False,
+    }]
+    row = queries.retire_source_action("u1")
+    assert row["status"] == "undone"
+    assert row["logical_key_locked"] is False
+
+
+def test_retire_source_action_idempotent_on_already_undone(fake_admin):
+    """0 rows updated → re-read; should still return current state."""
+    fake_admin.table.return_value.update.return_value.eq.return_value.in_.return_value.execute.return_value.data = []
+    fake_admin.table.return_value.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = {
+        "id": "u1", "status": "undone", "logical_key_locked": False,
+    }
+    row = queries.retire_source_action("u1")
+    assert row["status"] == "undone"
+```
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git commit -am "feat(db): mark_bot_action_success/failed/undone with transition guards"
+git commit -am "feat(db): mark_bot_action_success/failed/undone with transition guards + retire_source_action for undo dispatch"
 ```
 
 ### Task 3.7: mark_bot_action_reconciled_unknown + invariant
@@ -2257,22 +2455,19 @@ Commit:
 git commit -am "feat(feishu): drive v1 SDK wrappers (upload_all, import_task create/get, file delete)"
 ```
 
-### Task 4.7: feishu/docx.py wrappers (Path B fallback only)
+### Task 4.7: ~~feishu/docx.py wrappers~~ — DELETED (iter-3 fix)
 
-**Files:**
-- Create: `bot/feishu/docx.py`
-- Test: `bot/tests/test_feishu_docx.py`
-
-Path B is documented in spec §3.8 as fallback; ship it because Path A might not have permissions in production at first.
-
-Wraps:
-- `docx.v1.document.create`
-- `docx.v1.document_block_children.create`
-
-Commit:
-```bash
-git commit -am "feat(feishu): docx v1 wrappers (document.create + document_block_children.create) for Path B fallback"
-```
+> **Removed in plan iter-3.** v1 ships **Path A only** for
+> `create_meeting_doc` (drive.v1.import_task — see Task 8.5). Spec §3.8
+> mentions Path B (block-by-block append via `docx.v1`) as a future
+> fallback if `drive:drive` import permissions can't be granted in
+> production, but v1 doesn't include the Path B selection logic, undo
+> dispatch for Path B docs, or smoke tests for it. Adding Path B to
+> v1 is a deferred decision — if production hits permission denial,
+> file an issue and resurrect this task with full integration scope
+> (selection logic + undo dispatch + smoke).
+>
+> File `bot/feishu/docx.py` is NOT created in v1. `bot/tests/test_feishu_docx.py` is NOT created either.
 
 ### Task 4.8: Verify SDK call shapes against installed lark-oapi
 
@@ -2867,7 +3062,197 @@ async def schedule_meeting(args: dict) -> dict:
 git commit -am "feat(tools): schedule_meeting Phase -1 + Phase 0 (validation + dedup)"
 ```
 
+#### Task 8.1b-pre: schedule_meeting Phase 1a (exact-message idempotency lookup)
+
+> **Spec ref:** §5.1 skeleton — Phase 1a runs **before** the Phase 1b
+> insert. It dispatches based on whether a row already exists for
+> `(message_id, action_type)`:
+> - `success` → return cached result (webhook retry idempotency)
+> - `pending` → return "in flight"
+> - `reconciled_unknown` → return "please undo first"
+> - `failed` → call `update_for_retry` to bump attempt_count and
+>   transition back to pending; on `LogicalKeyConflict` from
+>   re-acquiring the lock, dispatch identically to Phase 1b's logical
+>   conflict
+> - `undone` → reject (the action was reversed; user must re-issue
+>   as a fresh utterance with a new logical_key)
+>
+> Without Phase 1a, an exact-message retry after a technical failure
+> never reaches `update_for_retry` and just lands as a
+> MessageActionConflict — the `failed` row is never reclaimed and the
+> error path is misreported as "concurrent call in flight" (spec
+> §5.1 + Codex plan-review iter-3 #2).
+
+**Files:**
+- Modify: `bot/agent/tools.py` (insert Phase 1a before the existing Phase 1)
+- Modify: `bot/tests/test_tools_schedule_meeting.py`
+
+- [ ] **Step 1: Write failing tests for the five Phase 1a branches**
+
+```python
+@pytest.mark.asyncio
+async def test_phase_1a_success_returns_cached_no_feishu_call(schedule_meeting, monkeypatch):
+    monkeypatch.setattr("db.queries.get_locked_by_logical_key", lambda _: None)
+    monkeypatch.setattr("db.queries.get_bot_action", lambda mid, at: {
+        "status": "success",
+        "result": {"event_id": "evt_existing", "link": "https://..."},
+    })
+    # No Feishu mocks → if any are called, AttributeError
+    result = await schedule_meeting.handler({
+        "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+        "attendee_open_ids": ["ou_a"],
+    })
+    body = json.loads(result["content"][0]["text"])
+    assert body["event_id"] == "evt_existing"
+
+
+@pytest.mark.asyncio
+async def test_phase_1a_pending_returns_in_flight(schedule_meeting, monkeypatch):
+    monkeypatch.setattr("db.queries.get_locked_by_logical_key", lambda _: None)
+    monkeypatch.setattr("db.queries.get_bot_action", lambda mid, at: {
+        "status": "pending", "result": {},
+    })
+    result = await schedule_meeting.handler({
+        "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+        "attendee_open_ids": ["ou_a"],
+    })
+    assert result["isError"] is True
+    assert "in flight" in result["content"][0]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_phase_1a_reconciled_unknown_partial_returns_undo_prompt(schedule_meeting, monkeypatch):
+    monkeypatch.setattr("db.queries.get_locked_by_logical_key", lambda _: None)
+    monkeypatch.setattr("db.queries.get_bot_action", lambda mid, at: {
+        "status": "reconciled_unknown",
+        "target_id": "evt_orphan",
+        "result": {"reconciliation_kind": "partial_success"},
+    })
+    result = await schedule_meeting.handler({
+        "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+        "attendee_open_ids": ["ou_a"],
+    })
+    assert result["isError"] is True
+    assert "undo" in result["content"][0]["text"].lower() or "撤销" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_phase_1a_failed_calls_update_for_retry_then_continues(schedule_meeting, monkeypatch):
+    """failed row → update_for_retry transitions to pending → continue from Phase 2.0."""
+    calls = {"update_for_retry": 0}
+    monkeypatch.setattr("db.queries.get_locked_by_logical_key", lambda _: None)
+    monkeypatch.setattr("db.queries.get_bot_action", lambda mid, at: {
+        "id": "u-failed", "status": "failed", "result": {},
+    })
+
+    def fake_retry(action_id, *, new_args, logical_key):
+        calls["update_for_retry"] += 1
+        return {"id": "u-failed", "status": "pending", "attempt_count": 2}
+    monkeypatch.setattr("db.queries.update_for_retry", fake_retry)
+    monkeypatch.setattr("db.queries.get_bot_workspace", lambda: None)  # Phase 2.0 fails
+
+    result = await schedule_meeting.handler({
+        "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+        "attendee_open_ids": ["ou_a"],
+    })
+    assert calls["update_for_retry"] == 1
+    assert "bot_workspace" in result["content"][0]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_phase_1a_undone_rejects_fresh_request(schedule_meeting, monkeypatch):
+    monkeypatch.setattr("db.queries.get_locked_by_logical_key", lambda _: None)
+    monkeypatch.setattr("db.queries.get_bot_action", lambda mid, at: {
+        "status": "undone", "result": {},
+    })
+    result = await schedule_meeting.handler({
+        "title": "X", "start_time": "2026-05-08T15:00:00+08:00",
+        "attendee_open_ids": ["ou_a"],
+    })
+    assert result["isError"] is True
+    assert "fresh" in result["content"][0]["text"].lower() or "已撤销" in result["content"][0]["text"]
+```
+
+- [ ] **Step 2: Run, expect failures**
+
+- [ ] **Step 3: Insert Phase 1a logic in `schedule_meeting` body BETWEEN Phase 0 and Phase 1**
+
+```python
+    # Phase 1a: idempotency check (exact-message retry path)
+    existing = queries.get_bot_action(ctx.message_id, "schedule_meeting")
+    if existing:
+        st = existing.get("status")
+        if st == "success":
+            return _ok(existing.get("result") or {})
+        if st == "pending":
+            return _err("a previous identical call is in flight")
+        if st == "reconciled_unknown":
+            return _err(
+                f"a previous identical call left a partial result on Feishu "
+                f"(target_id={existing.get('target_id')}); please ask me to "
+                f"undo it before re-issuing"
+            )
+        if st == "undone":
+            return _err(
+                "this action was undone; if you want to redo it, "
+                "issue it as a fresh request"
+            )
+        if st == "failed":
+            try:
+                retried = queries.update_for_retry(
+                    existing["id"], new_args=args, logical_key=logical_key,
+                )
+            except queries.LogicalKeyConflict as e:
+                # A different message acquired the slot since this row
+                # failed; same dispatch as Phase 1b.
+                winner = e.existing_row
+                if winner and winner.get("status") == "success":
+                    return _ok({**(winner.get("result") or {}),
+                                "deduplicated_from_logical_key": True})
+                if winner and winner.get("status") == "reconciled_unknown":
+                    return _err(
+                        f"a previous identical call left a partial result on "
+                        f"Feishu (target_id={winner.get('target_id')}); "
+                        f"please undo first"
+                    )
+                return _err("a previous identical call is in flight")
+            if retried is None:
+                return _err("a concurrent retry won the race; try again in a moment")
+            action_row = retried
+            action_id = action_row["id"]
+            # Skip Phase 1b — we already have a pending row
+            phase_1b_skipped = True
+        # 'failed' branch falls through after action_row is set above
+```
+
+Then guard the existing Phase 1b code so it only runs when Phase 1a didn't claim a row:
+
+```python
+    if not locals().get("phase_1b_skipped", False):
+        # Phase 1: pending insert + constraint dispatch (unchanged from 8.1b)
+        try:
+            action_row = queries.insert_bot_action_pending(...)
+        except queries.MessageActionConflict as e:
+            ...  # (unchanged)
+        except queries.LogicalKeyConflict as e:
+            ...  # (unchanged)
+        action_id = action_row["id"]
+```
+
+- [ ] **Step 4: Run, expect pass — all 8.1a, 8.1b-pre, and 8.1b tests**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -am "feat(tools): schedule_meeting Phase 1a (exact-message idempotency lookup with failed-retry)"
+```
+
 #### Task 8.1b: schedule_meeting Phase 1 (pending insert with constraint dispatch)
+
+> **Note (post-iter-3 fix):** Phase 1b now runs only when Phase 1a's
+> lookup returned None. Task 8.1b-pre adds the gating `if not
+> phase_1b_skipped` block; this task's implementation is unchanged
+> from the original plan, just nested inside that block.
 
 **Files:**
 - Modify: `bot/agent/tools.py`
@@ -3120,6 +3505,16 @@ async def test_phase_2_1_conflict_marks_success_outcome(
 
 ### Task 8.2: cancel_meeting
 
+> **Important — every write tool's body MUST follow the 8.1a + 8.1b-pre + 8.1b skeleton.** That means:
+> - Phase -1: tool-specific input validation
+> - Phase 0: `get_locked_by_logical_key` (logical-key dedup)
+> - **Phase 1a: `get_bot_action(message_id, action_type)` lookup with all 5 status branches** (success/pending/reconciled_unknown/undone/failed→update_for_retry)
+> - Phase 1b: `insert_bot_action_pending` (only when 1a returned None)
+> - Phase 2.x: tool-specific Feishu calls, with intermediate `target_id`/`target_kind` persistence after each artifact-producing sub-step
+> - Phase 3: `mark_bot_action_success` and (where applicable) `retire_source_action(source_row_id)` for related rows
+>
+> Tasks 8.2–8.5 list the **Phase 2.x specifics** below; Phase -1 / 0 / 1a / 1b / 3 are the same skeleton from 8.1a–c, and are NOT repeated. When in doubt, copy 8.1a's tool body and adjust Phase 2.x.
+
 **Files:**
 - Modify: `bot/agent/tools.py`
 - Test: `bot/tests/test_tools_cancel_meeting.py`
@@ -3127,11 +3522,11 @@ async def test_phase_2_1_conflict_marks_success_outcome(
 Phases per spec §3.4:
 - Resolution rules: `event_id` (status-gated, action_type IN schedule|restore) OR `last:true` (newest-row guard via `last_bot_action_for_sender_in_chat`, with already-cancelled idempotency check)
 - Phase -1: extract `calendar_id` and `source_meeting_action_id` from source row
-- Phase 1: pending insert
+- Phase 0 / 1a / 1b: standard skeleton (8.1a-c)
 - Phase 2a: `get_event(need_attendee=True, user_id_type="open_id")` → `pre_cancel_event_snapshot`
 - Phase 2a.5: persist `target_id=<original_event_id>`, `target_kind='calendar_event_cancel'`, `result.pre_cancel_event_snapshot`, `result.calendar_id`, `result.source_meeting_action_id`
 - Phase 2b: `delete_event`
-- Phase 3: `mark_bot_action_success` + transition source row to `undone`
+- Phase 3: `mark_bot_action_success` for the cancel row + `retire_source_action(source_meeting_action_id)` to transition the original schedule row to `undone`
 
 - [ ] Tests cover: explicit event_id (success/pending/undone/failed gates), `last:true` newest-row sentinels, idempotency double-cancel, cross-chat refusal.
 - [ ] Commit: `feat(tools): cancel_meeting with snapshot-before-delete and source-row retire`
@@ -3355,7 +3750,7 @@ async def test_undo_schedule_deletes_event_and_marks_undone(undo, monkeypatch):
         captured["delete"] = (calendar_id, event_id)
     monkeypatch.setattr("feishu.calendar.delete_event", fake_delete)
     monkeypatch.setattr(
-        "db.queries.mark_bot_action_undone",
+        "db.queries.retire_source_action",
         lambda action_id: captured.setdefault("undone", action_id),
     )
 
@@ -3384,7 +3779,7 @@ async def test_undo_schedule_404_treated_as_success(undo, monkeypatch):
 
     captured = {}
     monkeypatch.setattr(
-        "db.queries.mark_bot_action_undone",
+        "db.queries.retire_source_action",
         lambda action_id: captured.setdefault("undone", action_id),
     )
     result = await undo.handler({"last_for_me": True})
@@ -3411,7 +3806,7 @@ async def test_undo_schedule_404_treated_as_success(undo, monkeypatch):
             await delete_event(calendar_id=cal_id, event_id=event_id)
         except EventNotFound:
             pass  # 404 = success, the desired end state already holds
-        queries.mark_bot_action_undone(source_row["id"])
+        queries.retire_source_action(source_row["id"])
         queries.write_undo_audit(
             action_id=source_row["id"],
             ctx=ctx,
@@ -3557,6 +3952,25 @@ Each scenario is a checkbox item — verify in Feishu UI + DB:
 - [ ] Group chat: user A schedules, user B says "取消刚才那个会" → bot refuses.
 - [ ] Bootstrap recovery: manually delete the bot's Bitable base, then issue a write request → bot self-heals + posts warning.
 - [ ] **§1.4 acceptance: undo across LRU eviction**: schedule a meeting, wait long enough that the original `message_id` falls out of `feishu/events.py:_seen_events` LRU (~5 min), then say "撤销刚才那个" — confirm undo still resolves via `chat_id+sender_open_id` scoping (NOT message_id) and successfully deletes the event.
+- [ ] **Spec §11 step 9 cross-process logical-key dedup**: from a shell, fire two concurrent `curl` POSTs to `/feishu/webhook` carrying the **same chat_id, sender_open_id, and tool args** but **different `message_id`s** (simulate webhook retries from two upstream replicas). Confirm:
+  - Exactly ONE meeting is created on Feishu (not two).
+  - Both `bot_actions` rows exist; the loser has the partial-UNIQUE conflict outcome (either "deduplicated_from_logical_key=True" or "in flight" depending on timing).
+  - The loser's row has the same `logical_key` as the winner.
+  - This proves the DB partial UNIQUE — `bot_actions_logical_locked_uniq` — is the load-bearing cross-process exclusion (spec §5.2 + §6.2).
+  - Sample shell snippet:
+    ```bash
+    PAYLOAD='{"header":{"event_id":"e1","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_test"}},"message":{"chat_id":"oc_test","chat_type":"p2p","message_id":"MSG_A","message_type":"text","content":"{\"text\":\"@bot 帮我和 ou_a 订下周三 3 点的会\"}","mentions":[]}}}'
+    P2=$(echo "$PAYLOAD" | sed 's/MSG_A/MSG_B/; s/e1/e2/')
+    curl -s -X POST localhost:8000/feishu/webhook -d "$PAYLOAD" &
+    curl -s -X POST localhost:8000/feishu/webhook -d "$P2" &
+    wait
+    psql "$SUPABASE_DB_URL" -c \
+      "SELECT id, message_id, status, result->>'deduplicated_from_logical_key' AS dedup
+       FROM bot_actions
+       WHERE message_id IN ('MSG_A','MSG_B')
+       ORDER BY created_at;"
+    ```
+  - Expected: one row `success`, one row with `dedup='true'` (or `status='success'` plus error noting "in flight" if the timing was tighter than commit-visible).
 - [ ] **§3.9 + iter-20 row 114: 404-as-success undo replay**: schedule a meeting, manually delete the event in the Feishu UI (simulating "delete succeeded but DB UPDATE crashed mid-flight"), then ask the bot to undo — confirm the bot treats `EventNotFound` as the desired end state, marks the source row `undone`, and writes a normal undo audit row (not a failure).
 - [ ] **iter-21 doc cleanup non-404 retryability**: schedule a doc that produces a docx + source `.md` in 文档柜. Manually revoke `drive:drive` scope on the bot in Feishu admin (or simulate with auth-error injection). Ask the bot to undo — confirm undo treats the cleanup failure as retryable, leaves the source row's status unchanged, and on a re-undo (after restoring scope) completes successfully.
 
@@ -3587,7 +4001,7 @@ git commit -m "test(smoke): record results of v1 write-tools E2E smoke run"
 | 1. Scope verification | 1 | 30 min (manual + admin console) |
 | 2. Schema migrations | 4 | 1 hour |
 | 3. db/queries.py | 10 | 4-5 hours |
-| 4. Feishu wrappers | 8 | 5-6 hours |
+| 4. Feishu wrappers | 7 | 4-5 hours (Task 4.7 dropped in iter-3 — Path B deferred) |
 | 5. Bootstrap script | 1 | 1 hour |
 | 6. RequestContext refactor | 3 | 2 hours |
 | 7. Read tools | 3 | 2 hours |
@@ -3595,6 +4009,6 @@ git commit -m "test(smoke): record results of v1 write-tools E2E smoke run"
 | 9. undo_last_action | 1 | 4 hours (largest single task) |
 | 10. Runner wiring | 2 | 30 min |
 | 11. Smoke test | 1 | 1-2 hours |
-| **Total** | **40** | **~30 hours** |
+| **Total** | **39** (8.1 split into 7 sub-tasks; 9.1 split into 6 sub-tasks; 4.7 dropped) | **~30 hours** |
 
 Spread over 3-5 working days for one developer.
