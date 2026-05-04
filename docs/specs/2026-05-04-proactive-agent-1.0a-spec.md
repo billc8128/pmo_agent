@@ -109,22 +109,35 @@ the summarise edge function. Without versioning, we'd either:
 
 Versioning lets us decide once on what we have, then **re-decide
 when the payload becomes meaningfully better**. The trigger §2.6
-bumps `payload_version` only when fields the decider actually reads
-change (`agent_summary`, `agent_response_full`) — not on every
-trivial update.
+bumps `payload_version` whenever the **fingerprint** of the
+decider-relevant fields changes — that fingerprint covers
+`user_message`, `agent_summary`, `agent_response_full`,
+`project_path`, `project_root`, and `user_message_at`. Pure
+metadata updates (e.g. `device_label` corrections, `created_at`)
+don't shift the fingerprint and don't trigger reprocessing.
 
 **Notification rewrite rules** (enforced in `upsert_notification_row`):
 
 | Existing status | New decided version | Action |
 |-----------------|---------------------|--------|
 | (no row)        | any                 | INSERT |
-| `pending`       | > old               | UPDATE in place — decision changed but nothing has gone out yet |
-| `pending`       | ≤ old               | no-op (already evaluated this version) |
-| `suppressed`    | > old               | UPDATE in place — late summary changed our mind |
+| `pending`       | > old               | UPDATE in place (decision changed before delivery picked it up) |
+| `pending`       | ≤ old               | no-op |
+| `claimed`       | any                 | no-op — delivery loop owns it; if delivery succeeds the row becomes `sent` and freezes; if delivery fails the row drops back to `pending` and the next decider iteration can rewrite it. (See §3.2 lease release.) |
+| `suppressed`    | > old               | UPDATE in place |
 | `suppressed`    | ≤ old               | no-op |
-| `failed`        | > old               | UPDATE in place — retry on better payload |
+| `failed`        | > old               | UPDATE in place |
 | `failed`        | ≤ old               | no-op |
 | `sent`          | any                 | no-op — can't unsend, freeze the record |
+
+The `claimed` row's no-op rule is what closes the staleness gap:
+once delivery has begun, the decider stops mutating that row until
+delivery either commits (`sent`, frozen) or fails (releases lease
+back to `pending`). This means a v1 decision that's already mid-
+render won't be silently rewritten to v2 underneath the renderer;
+instead, when v1 finishes (sent or failed), the next decider pass
+sees the higher payload_version and either freezes the v1 send (if
+already delivered) or re-decides on v2.
 
 This is what makes the late-summary regression test (validation
 step 12) pass: the first decision writes `suppressed/mismatch`
@@ -181,10 +194,18 @@ create table notifications (
     subscription_id uuid   not null references subscriptions(id) on delete cascade,
     status          text   not null check (status in (
                        'pending',          -- decided send, awaiting render+push
+                       'claimed',          -- delivery loop owns this row, rendering/sending
                        'sent',             -- delivered to Feishu
                        'suppressed',       -- decider said no, kept for audit
                        'failed'            -- render or push errored permanently
                      )),
+    -- Concurrency control between decider rewrites and delivery loop.
+    -- delivery sets claimed_at + claim_id when transitioning
+    -- pending → claimed; both must match on mark_sent / mark_failed
+    -- so a stale claim can't overwrite a row the decider has since
+    -- rewritten or another worker has re-claimed.
+    claimed_at      timestamptz,
+    claim_id        uuid,
     suppressed_by   text,                  -- 'duplicate_in_window' / 'quiet_hours' /
                                            -- 'daily_cap' / 'explicit_exclude' / null
     rendered_text   text,                  -- final user-facing markdown
@@ -259,17 +280,38 @@ how prompt iteration becomes data-driven and how the
 create function on_turn_to_event() returns trigger as $$
 declare
     payload_significantly_changed boolean;
+    new_fingerprint text;
+    old_fingerprint text;
 begin
+    -- Build a fingerprint of every field that ends up in the event
+    -- payload AND that the decider or renderer can read. Anything
+    -- not on this list is metadata that doesn't justify a re-judge.
+    new_fingerprint := md5(concat_ws(
+        '|',
+        coalesce(new.user_message, ''),
+        coalesce(new.agent_summary, ''),
+        coalesce(new.agent_response_full, ''),
+        coalesce(new.project_path, ''),
+        coalesce(new.project_root, ''),
+        coalesce(new.user_message_at::text, '')
+    ));
+
     -- Compute "did decider-relevant fields actually change?" Branch
     -- explicitly on TG_OP so we never reference OLD on INSERT.
     if tg_op = 'INSERT' then
         payload_significantly_changed := true;
     else
+        old_fingerprint := md5(concat_ws(
+            '|',
+            coalesce(old.user_message, ''),
+            coalesce(old.agent_summary, ''),
+            coalesce(old.agent_response_full, ''),
+            coalesce(old.project_path, ''),
+            coalesce(old.project_root, ''),
+            coalesce(old.user_message_at::text, '')
+        ));
         payload_significantly_changed :=
-            (coalesce(old.agent_summary, '')
-                is distinct from coalesce(new.agent_summary, ''))
-            or (coalesce(old.agent_response_full, '')
-                is distinct from coalesce(new.agent_response_full, ''));
+            new_fingerprint is distinct from old_fingerprint;
     end if;
 
     insert into events (source, source_id, user_id, project_root,
@@ -287,10 +329,11 @@ begin
             'project_root', new.project_root,
             'user_message', new.user_message,
             'agent_summary', new.agent_summary,
-            -- Renderer needs the full agent response when summarising
-            -- the technical content of a notification; including it
-            -- in payload is what makes it legitimate to compare
-            -- agent_response_full in payload_significantly_changed.
+            -- Renderer needs the full agent response when writing
+            -- a 200-400 char brief; storing it on the event row
+            -- means the renderer doesn't have to re-fetch from the
+            -- turns table. The decider does NOT receive this verbatim
+            -- — see judge prompt in §4.1: it gets a capped excerpt.
             'agent_response_full', new.agent_response_full,
             'user_message_at', new.user_message_at
         ),
@@ -367,33 +410,52 @@ async def decider_loop():
         # vibelive turn must reach every user / chat with a relevant
         # subscription, regardless of where the event originated.
         all_subs = fetch_all_enabled_subscriptions()
-        # Group by (scope_kind, scope_id) so we can give the judge
-        # the full sibling rule set per owner.
         subs_by_scope = group_by_scope(all_subs)
 
         for ev in events:
             decided_version = ev.payload_version
+            had_unhandled_error = False  # tracks partial failure for THIS event
+
             for scope_key, scope_subs in subs_by_scope.items():
-                # Each sub in this group is a candidate; the rest of
-                # the group is sibling context (exclusions, quiet
-                # hours, etc).
                 for candidate in scope_subs:
                     siblings = [s for s in scope_subs if s.id != candidate.id]
                     existing = get_notification(ev.id, candidate.id)
                     if existing and existing.status == 'sent':
-                        # Already delivered — can't unsend
-                        continue
+                        continue  # frozen, can't change
+                    if existing and existing.status == 'claimed':
+                        continue  # delivery loop owns it; spec §2.4
                     if existing and existing.decided_payload_version >= decided_version:
-                        # Already evaluated this exact payload version
-                        # for this (event, candidate) pair
+                        continue  # already judged this version
+                    try:
+                        decision = await judge(ev, candidate, siblings,
+                                               context_for(scope_key))
+                        write_decision_log(ev, candidate, decision,
+                                           decided_version, model,
+                                           latency, tokens)
+                        upsert_notification_row(ev, candidate, decision,
+                                                decided_version)
+                    except Exception as e:
+                        log.exception(
+                            "decider error event=%s sub=%s",
+                            ev.id, candidate.id,
+                        )
+                        had_unhandled_error = True
+                        # do NOT write a notification row;
+                        # do NOT continue the inner loop break — keep
+                        # going so other (event, candidate) pairs
+                        # still get processed
                         continue
-                    decision = await judge(ev, candidate, siblings,
-                                           context_for(scope_key))
-                    write_decision_log(ev, candidate, decision,
-                                       model, latency, tokens)
-                    upsert_notification_row(ev, candidate, decision,
-                                            decided_version)
-            mark_event_processed(ev.id, decided_version)
+
+            # Only flip processed_at when EVERY (candidate, event) pair
+            # for this event either succeeded, was a no-op (sent /
+            # claimed / same-or-older version), or was already a
+            # successful skip. Any unhandled error → leave processed_at
+            # as-is so the next iteration retries those pairs (the
+            # ones that already wrote a notification row are protected
+            # by the `decided_payload_version >= decided_version`
+            # guard, so they won't be re-judged unnecessarily).
+            if not had_unhandled_error:
+                mark_event_processed(ev.id, decided_version)
 ```
 
 `mark_event_processed(event_id, version)` does:
@@ -403,10 +465,12 @@ update events
  where id = $event_id;
 ```
 
-So a later UPDATE to that turn row that bumps `payload_version`
-will pull the event back into `fetch_events_needing_decision`, and
-the per-(event, candidate) `decided_payload_version` guard ensures
-each candidate is re-judged exactly once per real payload change.
+A later UPDATE to that turn row that bumps `payload_version` will
+pull the event back into `fetch_events_needing_decision`. The
+per-(event, candidate) `decided_payload_version` guard ensures
+each candidate is re-judged exactly once per real payload change,
+even if a previous loop iteration had partial failures and didn't
+mark the event processed.
 
 `context_for(sub)` is the bundle the judge needs. Critically, the
 judge sees **all of the owner's preferences**, not just the
@@ -451,6 +515,31 @@ sub, all sibling subs, recent notifs, time, subject-relation), and
 "项目 C 不要" or "今晚别打扰" written as a sibling row will reliably
 veto a candidate match.
 
+**Judge input construction (cost guard)**: The full payload stored
+on `events` includes `agent_response_full` for the renderer's
+benefit. The decider does NOT pass the full body to the judge. It
+calls `build_judge_event(payload)` which returns a smaller dict:
+
+```python
+def build_judge_event(payload: dict) -> dict:
+    return {
+        **{k: payload[k] for k in (
+            "turn_id", "agent", "project_path", "project_root",
+            "user_message_at",
+        )},
+        "user_message": (payload.get("user_message") or "")[:800],
+        "agent_summary": payload.get("agent_summary"),
+        "agent_response_excerpt":
+            (payload.get("agent_response_full") or "")[:600] or None,
+    }
+```
+
+This caps each judge call at roughly 1.5k input tokens regardless of
+how chatty the underlying turn was, keeping the §7 budget honest.
+The full body is only loaded by the renderer, which runs at most
+once per `pending` notification (rather than once per
+`(event, subscription)` pair).
+
 Errors during decision → log, mark this (event, sub) skipped (do
 not write a notification row), do not block the rest of the batch.
 Next loop iteration retries because `processed_at` only flips when
@@ -464,21 +553,84 @@ acquisition can be added then.)
 
 ### 3.2 Renderer / delivery loop
 
-Separate loop, polls `notifications` with `status = 'pending'`
-every **15 seconds**.
+Separate loop, claims-then-renders `pending` notifications every
+**15 seconds**. Uses an explicit lease so it can't race with the
+decider rewriting the same row.
 
 ```
 async def delivery_loop():
     while True:
         await asyncio.sleep(15)
-        rows = fetch_pending_notifications(limit=20)
+        # Claim up to 20 rows atomically: pending → claimed.
+        claim_id = uuid4()
+        rows = claim_pending_notifications(claim_id, limit=20)
         for row in rows:
+            # row.claim_id == claim_id at this point
             try:
                 text = await render_notification(row)
-                msg_id = await deliver(row, text)
-                mark_sent(row.id, msg_id, text)
-            except Exception as e:
-                mark_failed_or_retry(row, e)
+                # Conditional commit — only if our lease is still
+                # the one on the row (decider hasn't been allowed to
+                # touch a 'claimed' row, but the constraint is
+                # belt-and-suspenders against later concurrency).
+                ok = await mark_sent_if_claimed(
+                    row.id, claim_id, msg_id=await deliver(row, text),
+                    rendered_text=text,
+                )
+                if not ok:
+                    log.warning("notif %s claim lost; skipping", row.id)
+            except TransientError:
+                # Release the lease so next iteration can retry.
+                release_claim(row.id, claim_id, reset_to='pending')
+            except PermanentError as e:
+                mark_failed_if_claimed(row.id, claim_id, error=str(e))
+```
+
+`claim_pending_notifications(claim_id, limit)` does:
+
+```sql
+update notifications
+   set status = 'claimed',
+       claim_id = $claim_id,
+       claimed_at = now()
+ where id in (
+       select id from notifications
+        where status = 'pending'
+        order by decided_at
+        limit $limit
+        for update skip locked
+   )
+returning *;
+```
+
+The `for update skip locked` lets multiple workers (when we run
+more than one in 1.0c+) cooperate without blocking. Today only one
+process runs the loop, so it's mainly future-proofing.
+
+`mark_sent_if_claimed` and `mark_failed_if_claimed` use a
+conditional UPDATE:
+
+```sql
+update notifications
+   set status = 'sent',
+       sent_at = now(),
+       feishu_msg_id = $msg_id,
+       rendered_text = $text,
+       claim_id = null,
+       claimed_at = null
+ where id = $id
+   and claim_id = $claim_id
+   and status = 'claimed'
+returning id;  -- empty result = lost the lease
+```
+
+Lease expiry: rows stuck in `claimed` for > 5 minutes (e.g. delivery
+worker crashed mid-render) are reaped at the top of each loop
+iteration:
+
+```sql
+update notifications
+   set status = 'pending', claim_id = null, claimed_at = null
+ where status = 'claimed' and claimed_at < now() - interval '5 minutes';
 ```
 
 `render_notification` is an agent invocation:
@@ -579,10 +731,12 @@ function. Pseudocode:
   project_root: {...}
   is_subject_the_owner: {true | false}
   payload:
-    user_message: "{用户输入的 prompt}"
+    user_message: "{用户输入的 prompt, 截断到前 800 字符}"
     agent_summary: "{一句话总结，可能为空 — 还没异步生成出来}"
-    agent_response_full: "{完整 agent 回复，可能为空。当 summary 缺失
-                          时如果这里有内容，仍然可以判断主题}"
+    agent_response_excerpt: "{agent 回复前 600 字符摘录，可能为空。
+                              full body 没传给你 — 那是给渲染阶段用的。
+                              当 summary 缺失但 excerpt 有内容时仍可
+                              判断主题}"
 
 ## 决策原则
 
@@ -604,8 +758,8 @@ function. Pseudocode:
    break through"。
 4. **是否匹配候选订阅**：到此都没否决，看候选 description 是否覆盖
    当前事件。命中 → send=true，写 matched_aspect 和 preview_hint。
-5. **agent_summary + agent_response_full 都缺失或不足判断**：如果
-   summary 为空，且 user_message + agent_response_full 拼起来仍然
+5. **agent_summary + agent_response_excerpt 都缺失或不足判断**：如果
+   summary 为空，且 user_message + agent_response_excerpt 拼起来仍然
    不足以判断主题 → send=false, suppressed_by="mismatch"，reason
    注明 "summary not available yet"。等下一次 payload_version bump
    重审。如果其中任何一个有足够信息，就照常判。
@@ -807,7 +961,9 @@ Numbers based on user decisions and a small team (5 people):
 - Active group subscriptions: ~2-3
 - Total subscriptions: ~25
 - Decisions per day: 200 × 25 = **5000**
-- Average decision tokens: 1.5k input + 100 output
+- Average decision tokens: ~1.5k input + 100 output (capped via
+  `build_judge_event` — full agent_response_full goes to the renderer
+  only, not multiplied by N subscriptions per event)
 
 At ARK Coding Plan rates (approx Anthropic Haiku class, but pricing
 is bundled), this fits comfortably within whatever monthly cap the

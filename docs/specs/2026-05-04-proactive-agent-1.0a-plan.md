@@ -139,9 +139,15 @@ profile has a timezone configured).
     The function must read existing.status + existing.decided_payload_version
     in the same transaction (or use a conditional UPDATE clause) to
     avoid races with the delivery loop.
-  - `fetch_pending_notifications(limit)`
-  - `mark_notification_sent(id, msg_id, text)`
-  - `mark_notification_failed(id, error)`
+  - `claim_pending_notifications(claim_id, limit)` — atomic
+    pending → claimed transition; see spec §3.2 for the SQL
+  - `release_claim(id, claim_id, reset_to)` — used on transient
+    errors to flip claimed → pending
+  - `mark_sent_if_claimed(id, claim_id, msg_id, text)` — conditional
+    UPDATE that requires the lease to still be ours
+  - `mark_failed_if_claimed(id, claim_id, error)`
+  - `reap_stale_claims(stale_after_minutes=5)` — recovery for
+    crashed delivery workers
   - `recent_notifications_for_scope(scope_kind, scope_id,
     since_minutes)` — returns rows with `decided_at` so judge can
     do real timestamp math
@@ -242,12 +248,19 @@ Wires §3.1 of the spec. Important details:
 
 - Runs serially per iteration; uses `asyncio.create_task` only at
   the top level
-- On any uncaught exception, log and `await asyncio.sleep(60)`
-  before retrying — don't let one bad iteration spin the loop
-- Sets `processed_at` only after every (event, sub) pair was either
-  written or already-existed (idempotent skip). If any decision call
-  threw, leave `processed_at` null so the next iteration retries
-  the missing pairs.
+- On any uncaught exception at the *outer* level (DB connection
+  loss, etc.), log and `await asyncio.sleep(60)` before retrying —
+  don't let one bad iteration spin the loop
+- Per-(event, candidate) errors are caught locally inside the
+  inner loop. They set a per-event `had_unhandled_error` flag.
+  Other pairs in the same iteration keep being processed.
+- `mark_event_processed(ev.id, decided_version)` is called **only
+  if `had_unhandled_error` is false**. Otherwise the event remains
+  in the unprocessed-or-stale set and gets retried next iteration.
+  Pairs that already wrote a notification row at the current
+  payload_version are protected from re-judgement by the
+  `decided_payload_version >= decided_version` guard, so retries
+  only re-judge the failed pairs.
 
 **Exit criterion**: with one fake event in the DB and one
 subscription matching it, the loop picks the event up within 30
@@ -321,15 +334,43 @@ hand-crafted post payload arrives in your DM.
 `app.py`'s `lifespan`.
 
 Wires §3.2 of spec. Each iteration:
-- Fetch up to 20 pending notifications oldest-first
-- For each: build event/subscription bundle, call renderer, call
-  appropriate send method, mark sent
-- On render error → mark failed (no retry yet)
-- On send transient error → leave pending, will retry next
-  iteration; on send permanent error → mark failed
+1. Reap stale claims: any row in `claimed` for > 5 min flips back
+   to `pending` (delivery worker probably crashed).
+2. Atomically claim up to 20 `pending` rows: pending → claimed,
+   stamping `claim_id` and `claimed_at`. Use
+   `for update skip locked` so future multi-worker setups cooperate.
+3. For each claimed row: render with the renderer (§5), send via
+   `send_to_user` / `send_to_chat`, then `mark_sent_if_claimed`
+   (UPDATE WHERE claim_id = ours AND status = 'claimed') so the
+   commit fails cleanly if the lease was somehow lost.
+4. On transient errors (5xx, network) → release the lease (status
+   back to pending, claim_id null) so next iteration retries.
+5. On permanent errors → `mark_failed_if_claimed` (same lease
+   guard).
+
+The lease is what stops a stale `pending` (one that the decider
+has since rewritten on a new payload version) from being delivered:
+the rewrite rules in spec §2.4 say the decider **never** mutates a
+`claimed` row, so once delivery has begun, the row's content for
+this delivery is frozen. If the decider had already moved the row
+to `claimed` before its rewrite would have happened, the rewrite is
+a no-op; once delivery finishes (`sent` or `pending`-after-fail),
+the next decider iteration sees the higher payload_version and
+either freezes (sent) or rewrites (back to pending).
+
+DB helpers needed in queries.py:
+- `claim_pending_notifications(claim_id, limit)` — does the
+  conditional UPDATE described in spec §3.2
+- `release_claim(notification_id, claim_id, reset_to)`
+- `mark_sent_if_claimed(notification_id, claim_id, msg_id, text)`
+- `mark_failed_if_claimed(notification_id, claim_id, error)`
+- `reap_stale_claims(stale_after_minutes=5)`
 
 **Exit criterion**: a notification row appearing in `pending` is
-delivered to the right Feishu chat within ~30 seconds.
+delivered to the right Feishu chat within ~30 seconds. A second
+test: insert a fake stale `claimed` row with `claimed_at` 10
+minutes old; observe it reaped back to `pending` on the next
+iteration.
 
 ---
 
