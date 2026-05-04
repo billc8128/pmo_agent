@@ -260,13 +260,18 @@ Wires §3.1 of the spec. Important details:
 - Per-(event, candidate) errors are caught locally inside the
   inner loop. They set a per-event `had_unhandled_error` flag.
   Other pairs in the same iteration keep being processed.
+- A second per-event flag, `had_blocking_claim`, is set whenever
+  the decider sees an `existing.status == 'claimed'` whose
+  `decided_payload_version < decided_version`. That row may
+  release back to `pending` later (transient delivery failure) at
+  the OLD version — so we must keep the event in the
+  needs-decision set to rewrite that pending up to the current
+  version.
 - `mark_event_processed(ev.id, decided_version)` is called **only
-  if `had_unhandled_error` is false**. Otherwise the event remains
-  in the unprocessed-or-stale set and gets retried next iteration.
-  Pairs that already wrote a notification row at the current
-  payload_version are protected from re-judgement by the
-  `decided_payload_version >= decided_version` guard, so retries
-  only re-judge the failed pairs.
+  if both flags are false**. Pairs that already wrote a
+  notification row at the current version are protected from
+  re-judgement by the `decided_payload_version >= decided_version`
+  guard, so retries only re-judge what actually needs it.
 
 **Exit criterion**: with one fake event in the DB and one
 subscription matching it, the loop picks the event up within 30
@@ -317,20 +322,36 @@ a markdown string that reads like a coherent 200-400 char brief.
 **File**: `bot/feishu/client.py` — add two methods:
 
 ```python
-async def send_to_user(self, open_id: str, post_content: dict) -> Optional[str]
-async def send_to_chat(self, chat_id: str, post_content: dict) -> Optional[str]
+async def send_to_user(self, open_id: str, post_content: dict,
+                        idempotency_uuid: str | None = None) -> Optional[str]
+async def send_to_chat(self, chat_id: str, post_content: dict,
+                        idempotency_uuid: str | None = None) -> Optional[str]
 ```
 
 Both call `/open-apis/im/v1/messages?receive_id_type=...` with
-`msg_type=post`. Returns the new `message_id` on success.
+`msg_type=post`. When `idempotency_uuid` is provided, also include
+`uuid=<idempotency_uuid>` as a query parameter — Feishu uses it for
+~1h server-side dedup of (app, receive_id, uuid) tuples. The
+delivery loop (§7) sets this to a deterministic UUIDv5 derived from
+`notification.id`, so a process crash between send and DB mark
+doesn't double-send.
+
+Returns the new `message_id` on success. Note the Feishu API may
+return the *previously-sent* message_id when an idempotent retry
+hits the dedup cache; the delivery loop treats that as success and
+the DB row gets the right msg_id either way.
 
 Required scope: `im:message:send_as_bot` or
 `im:message` — verify which one is already granted. If missing,
 this is the third Feishu permission we need to apply for; surface
 that to the user clearly.
 
-**Exit criterion**: with a hardcoded test open_id (yours), a
-hand-crafted post payload arrives in your DM.
+**Exit criterion**:
+- With a hardcoded test open_id (yours), a hand-crafted post
+  payload arrives in your DM.
+- Calling `send_to_user(...)` twice with the same
+  `idempotency_uuid` results in only one message in your DM (and
+  both calls return the same `message_id`).
 
 ---
 

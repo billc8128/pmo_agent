@@ -519,6 +519,11 @@ end $$;
 
 -- Atomic upsert implementing the §2.4 rewrite table.
 -- Returns 'inserted' / 'updated' / 'noop' so the caller can log.
+--
+-- Uses INSERT ... ON CONFLICT (event_id, subscription_id) so
+-- concurrent decider workers can't collide: at most one INSERT
+-- wins, the rest fall into the DO UPDATE branch and re-evaluate
+-- the rewrite table against whatever the winner wrote.
 create function upsert_notification_row(
     p_event_id        bigint,
     p_subscription_id uuid,
@@ -532,59 +537,147 @@ language plpgsql
 security definer
 as $$
 declare
-    existing record;
+    result_action text;
 begin
-    select status, decided_payload_version
-      into existing
-      from notifications
-     where event_id = p_event_id
-       and subscription_id = p_subscription_id
-     for update;
+    insert into notifications (
+        event_id, subscription_id, status, suppressed_by,
+        delivery_kind, delivery_target, decided_payload_version,
+        decided_at
+    ) values (
+        p_event_id, p_subscription_id, p_status, p_suppressed_by,
+        p_delivery_kind, p_delivery_target, p_decided_payload_version,
+        now()
+    )
+    on conflict (event_id, subscription_id) do update
+        -- Apply the rewrite table from §2.4. The CASE clauses
+        -- compare against the existing row's status/version (the
+        -- pre-update tuple is bound to the special `notifications`
+        -- alias on the LHS of SET).
+        set status = case
+                when notifications.status in ('sent', 'claimed') then notifications.status
+                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.status
+                else notifications.status
+            end,
+            suppressed_by = case
+                when notifications.status in ('sent', 'claimed') then notifications.suppressed_by
+                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.suppressed_by
+                else notifications.suppressed_by
+            end,
+            delivery_kind = case
+                when notifications.status in ('sent', 'claimed') then notifications.delivery_kind
+                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.delivery_kind
+                else notifications.delivery_kind
+            end,
+            delivery_target = case
+                when notifications.status in ('sent', 'claimed') then notifications.delivery_target
+                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.delivery_target
+                else notifications.delivery_target
+            end,
+            decided_payload_version = case
+                when notifications.status in ('sent', 'claimed') then notifications.decided_payload_version
+                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.decided_payload_version
+                else notifications.decided_payload_version
+            end,
+            decided_at = case
+                when notifications.status in ('sent', 'claimed') then notifications.decided_at
+                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.decided_at
+                else notifications.decided_at
+            end,
+            -- Wipe the rendered/sent state on a real rewrite — the
+            -- old text was for an older payload version. (Frozen
+            -- states keep their own values via the CASE above.)
+            rendered_text = case
+                when notifications.status not in ('sent', 'claimed')
+                 and excluded.decided_payload_version > notifications.decided_payload_version
+                    then null
+                else notifications.rendered_text
+            end,
+            feishu_msg_id = case
+                when notifications.status not in ('sent', 'claimed')
+                 and excluded.decided_payload_version > notifications.decided_payload_version
+                    then null
+                else notifications.feishu_msg_id
+            end,
+            sent_at = case
+                when notifications.status not in ('sent', 'claimed')
+                 and excluded.decided_payload_version > notifications.decided_payload_version
+                    then null
+                else notifications.sent_at
+            end,
+            error = case
+                when notifications.status not in ('sent', 'claimed')
+                 and excluded.decided_payload_version > notifications.decided_payload_version
+                    then null
+                else notifications.error
+            end
+    returning case
+        when xmax = 0 then 'inserted'  -- xmax=0 ⇔ this txn inserted
+        when notifications.decided_payload_version = excluded.decided_payload_version
+         and notifications.status = excluded.status then 'updated'
+        else 'noop'
+    end into result_action;
 
-    if not found then
-        insert into notifications (
-            event_id, subscription_id, status, suppressed_by,
-            delivery_kind, delivery_target, decided_payload_version
-        ) values (
-            p_event_id, p_subscription_id, p_status, p_suppressed_by,
-            p_delivery_kind, p_delivery_target, p_decided_payload_version
-        );
-        return 'inserted';
-    end if;
-
-    -- Frozen states (per §2.4 rewrite table)
-    if existing.status in ('sent', 'claimed') then
-        return 'noop';
-    end if;
-
-    -- Same or older version → no-op
-    if p_decided_payload_version <= existing.decided_payload_version then
-        return 'noop';
-    end if;
-
-    -- Newer version on pending/suppressed/failed → rewrite in place
-    update notifications
-       set status = p_status,
-           suppressed_by = p_suppressed_by,
-           delivery_kind = p_delivery_kind,
-           delivery_target = p_delivery_target,
-           decided_payload_version = p_decided_payload_version,
-           decided_at = now(),
-           rendered_text = null,    -- stale, will be regenerated
-           feishu_msg_id = null,
-           sent_at = null,
-           error = null
-     where event_id = p_event_id
-       and subscription_id = p_subscription_id;
-    return 'updated';
+    return result_action;
 end $$;
 ```
 
-All five functions are `security definer` so they can be called
-via the anon-key Supabase client AS WELL AS the service-role
-client. (Bot uses service-role; this is future-proofing for the
-1.0b web UI, where some tools may need to invoke RPCs in the
-authenticated user's context.)
+The `xmax = 0` trick distinguishes a fresh INSERT from a
+DO UPDATE conflict path. The `'noop'` return covers the case where
+either (a) existing was sent/claimed and we left it alone, or
+(b) incoming version was ≤ existing and we left it alone.
+
+All six functions are `security definer` so they can do their
+work without being bound by the caller's RLS policies. **But** that
+makes ACL hygiene critical — if anon or authenticated could call
+them they'd be a write-side RLS bypass: any browser-side code
+could mark arbitrary notifications as `sent`, claim rows it doesn't
+own, or rewrite decisions. The migration therefore explicitly
+revokes execute from the public roles and grants to service_role
+only:
+
+```sql
+-- Lock down all RPC functions defined in this section.
+do $$
+declare fn text;
+begin
+  for fn in select unnest(array[
+        'claim_pending_notifications(uuid,int)',
+        'mark_sent_if_claimed(bigint,uuid,text,text)',
+        'mark_failed_if_claimed(bigint,uuid,text)',
+        'release_claim(bigint,uuid)',
+        'reap_stale_claims(int)',
+        'upsert_notification_row(bigint,uuid,text,text,text,text,int)'
+      ])
+  loop
+    execute format('revoke execute on function %s from public', fn);
+    execute format('revoke execute on function %s from anon', fn);
+    execute format('revoke execute on function %s from authenticated', fn);
+    execute format('grant  execute on function %s to service_role', fn);
+  end loop;
+end $$;
+
+-- Pin search_path so a malicious schema in the caller's path
+-- can't shadow public.notifications and trick a security-definer
+-- function into reading the wrong table.
+alter function claim_pending_notifications(uuid,int)
+    set search_path = public, pg_temp;
+alter function mark_sent_if_claimed(bigint,uuid,text,text)
+    set search_path = public, pg_temp;
+alter function mark_failed_if_claimed(bigint,uuid,text)
+    set search_path = public, pg_temp;
+alter function release_claim(bigint,uuid)
+    set search_path = public, pg_temp;
+alter function reap_stale_claims(int)
+    set search_path = public, pg_temp;
+alter function upsert_notification_row(bigint,uuid,text,text,text,text,int)
+    set search_path = public, pg_temp;
+```
+
+In 1.0b when the web UI needs user-context operations (e.g. "delete
+my own subscription"), we add **separate** RPC functions guarded
+by `auth.uid()` checks against `subscriptions.scope_id` /
+`feishu_links.user_id`, granted to `authenticated`. The ones above
+remain service-role-only.
 
 The Python helpers in `bot/db/queries.py` (plan §2) are one-line
 wrappers:
@@ -624,7 +717,8 @@ async def decider_loop():
 
         for ev in events:
             decided_version = ev.payload_version
-            had_unhandled_error = False  # tracks partial failure for THIS event
+            had_unhandled_error = False    # partial decider failures
+            had_blocking_claim  = False    # claim on stale version blocks finalisation
 
             for scope_key, scope_subs in subs_by_scope.items():
                 for candidate in scope_subs:
@@ -633,7 +727,19 @@ async def decider_loop():
                     if existing and existing.status == 'sent':
                         continue  # frozen, can't change
                     if existing and existing.status == 'claimed':
-                        continue  # delivery loop owns it; spec §2.4
+                        # Delivery owns the row; we cannot rewrite it
+                        # (spec §2.4 frozen-while-claimed rule).
+                        # BUT: if the claimed row is at an older
+                        # payload_version than the current event, we
+                        # must NOT mark the event processed at the
+                        # current version — otherwise a transient
+                        # delivery failure would release the claim
+                        # back to `pending` (still at old version)
+                        # and the event would never be re-fetched
+                        # to rewrite that pending to a v2 decision.
+                        if existing.decided_payload_version < decided_version:
+                            had_blocking_claim = True
+                        continue
                     if existing and existing.decided_payload_version >= decided_version:
                         continue  # already judged this version
                     try:
@@ -650,21 +756,19 @@ async def decider_loop():
                             ev.id, candidate.id,
                         )
                         had_unhandled_error = True
-                        # do NOT write a notification row;
-                        # do NOT continue the inner loop break — keep
-                        # going so other (event, candidate) pairs
-                        # still get processed
                         continue
 
-            # Only flip processed_at when EVERY (candidate, event) pair
-            # for this event either succeeded, was a no-op (sent /
-            # claimed / same-or-older version), or was already a
-            # successful skip. Any unhandled error → leave processed_at
-            # as-is so the next iteration retries those pairs (the
-            # ones that already wrote a notification row are protected
-            # by the `decided_payload_version >= decided_version`
-            # guard, so they won't be re-judged unnecessarily).
-            if not had_unhandled_error:
+            # Flip processed_at only when EVERY (candidate, event)
+            # pair was either:
+            #   - successfully judged at decided_version, or
+            #   - a no-op skip (sent, or claimed AT decided_version,
+            #     or already at decided_payload_version >= decided_version).
+            # Block finalisation on:
+            #   - any unhandled exception (had_unhandled_error), or
+            #   - any claimed row at an older version
+            #     (had_blocking_claim) — we need another loop pass
+            #     after delivery resolves so we can rewrite to v2.
+            if not had_unhandled_error and not had_blocking_claim:
                 mark_event_processed(ev.id, decided_version)
 ```
 
@@ -783,22 +887,62 @@ async def delivery_loop():
             # row.claim_id == claim_id at this point
             try:
                 text = await render_notification(row)
+
+                # Idempotency: pass a stable uuid derived from the
+                # notification id so a retry after a process crash
+                # doesn't double-send. Feishu's /im/v1/messages
+                # accepts a `uuid` query param and dedupes server-
+                # side for ~1h based on (app, sender, receive_id,
+                # uuid). See deliver() spec below.
+                feishu_idempotency_uuid = stable_uuid_from_notif(row.id)
+
+                msg_id = await deliver(
+                    row, text,
+                    idempotency_uuid=feishu_idempotency_uuid,
+                )
                 # Conditional commit — only if our lease is still
-                # the one on the row (decider hasn't been allowed to
-                # touch a 'claimed' row, but the constraint is
-                # belt-and-suspenders against later concurrency).
+                # the one on the row.
                 ok = await mark_sent_if_claimed(
-                    row.id, claim_id, msg_id=await deliver(row, text),
-                    rendered_text=text,
+                    row.id, claim_id, msg_id=msg_id, rendered_text=text,
                 )
                 if not ok:
                     log.warning("notif %s claim lost; skipping", row.id)
             except TransientError:
-                # Release the lease so next iteration can retry.
                 release_claim(row.id, claim_id, reset_to='pending')
             except PermanentError as e:
                 mark_failed_if_claimed(row.id, claim_id, error=str(e))
 ```
+
+**Crash-safe send (at-most-once, with caveat)**:
+
+`stable_uuid_from_notif(notification_id)` produces a deterministic
+UUIDv5 derived from the notification's row id (namespace = a fixed
+project UUID hardcoded in `feishu/client.py`). The same row will
+always produce the same idempotency uuid.
+
+This uuid goes through to Feishu via the `uuid` query parameter
+on `/open-apis/im/v1/messages`. Feishu's documented behaviour is
+that within 1 hour, a request with the same `(app, receive_id,
+uuid)` returns the *original* message_id rather than creating a
+duplicate. So the failure scenario:
+
+1. Delivery loop renders + calls Feishu — message lands in chat,
+   gets msg_id `om_xxx`
+2. Process crashes before `mark_sent_if_claimed`
+3. After 5min reaper, row goes back to `pending`
+4. Next iteration claims it again, renders again, calls Feishu
+   with the same idempotency uuid
+5. Feishu returns `om_xxx` instead of creating a new message
+6. We `mark_sent_if_claimed` with `om_xxx`
+
+Net effect: the user sees one message, the DB row reflects truth.
+
+**Caveat (acknowledged)**: Feishu's idempotency window is ~1h. If
+the process is down longer than that, the second send WILL produce
+a duplicate. For 1.0a we accept this — multi-hour bot downtime
+is rare and worth a dup over silent data loss. If this becomes a
+problem in production we add a Feishu-msg-id read-back ("did we
+already send this notification?") before the second send.
 
 `claim_pending_notifications(claim_id, limit)` does:
 
