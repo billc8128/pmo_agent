@@ -64,12 +64,14 @@ common case for this team). The OAuth callback today does NOT
 extract `timezone` from the Feishu user_info response (see current
 `web/app/api/feishu/oauth/callback/route.ts`); part of this slice
 is to extend that callback to also read `userJson.data.timezone`
-and include it in the `feishu_links` upsert. Plan §1.7 covers
+and include it in the `feishu_links` upsert. Plan §1.6 covers
 that change.
 
 If Feishu's user_info doesn't return a timezone for a given user
 (some accounts don't set one), the column stays at its default and
 the user can later override it via the web UI in 1.0b.
+
+The callback change is plan §1.6.
 
 ### 2.2 `events` — append-only signal stream
 
@@ -224,6 +226,11 @@ create table decision_logs (
     id              bigserial primary key,
     event_id        bigint not null references events(id) on delete cascade,
     subscription_id uuid   not null references subscriptions(id) on delete cascade,
+    -- Which payload_version this decision was made on. The same
+    -- (event, subscription) pair will accumulate one row per judged
+    -- payload_version (e.g. v1 mismatch then v2 send when summary
+    -- arrives), and why_no_notification needs to surface them all.
+    payload_version int    not null,
     judge_input     jsonb  not null,
     judge_output    jsonb  not null,
     model           text   not null,
@@ -280,6 +287,11 @@ begin
             'project_root', new.project_root,
             'user_message', new.user_message,
             'agent_summary', new.agent_summary,
+            -- Renderer needs the full agent response when summarising
+            -- the technical content of a notification; including it
+            -- in payload is what makes it legitimate to compare
+            -- agent_response_full in payload_significantly_changed.
+            'agent_response_full', new.agent_response_full,
             'user_message_at', new.user_message_at
         ),
         1
@@ -568,8 +580,9 @@ function. Pseudocode:
   is_subject_the_owner: {true | false}
   payload:
     user_message: "{用户输入的 prompt}"
-    agent_summary: "{一句话总结，可能为空 — 此时只能凭 user_message
-                    判断主题}"
+    agent_summary: "{一句话总结，可能为空 — 还没异步生成出来}"
+    agent_response_full: "{完整 agent 回复，可能为空。当 summary 缺失
+                          时如果这里有内容，仍然可以判断主题}"
 
 ## 决策原则
 
@@ -591,10 +604,11 @@ function. Pseudocode:
    break through"。
 4. **是否匹配候选订阅**：到此都没否决，看候选 description 是否覆盖
    当前事件。命中 → send=true，写 matched_aspect 和 preview_hint。
-5. **agent_summary 缺失**：如果 payload.agent_summary 为空且
-   user_message 不足以判断主题 → send=false, suppressed_by="mismatch"，
-   reason 注明 "summary not available yet"。等下一次 payload_version
-   bump 重审。
+5. **agent_summary + agent_response_full 都缺失或不足判断**：如果
+   summary 为空，且 user_message + agent_response_full 拼起来仍然
+   不足以判断主题 → send=false, suppressed_by="mismatch"，reason
+   注明 "summary not available yet"。等下一次 payload_version bump
+   重审。如果其中任何一个有足够信息，就照常判。
 6. 拿不准 → send=false。
 
 ## 输出 JSON
@@ -747,7 +761,11 @@ async def why_no_notification(args: dict) -> dict:
 
 Implementation: fuzzy-match `query` against recent events' payloads
 + `decision_logs.judge_output.reason` for the asker's subscriptions
-in the given time window (default 24h).
+in the given time window (default 24h). When the same (event,
+subscription) pair has multiple decision_logs rows (one per
+`payload_version` re-judged), surface them all in chronological
+order so the user can see the evolution: "v1 suppressed (mismatch:
+summary not available), v2 suppressed (quiet_hours)".
 
 ---
 

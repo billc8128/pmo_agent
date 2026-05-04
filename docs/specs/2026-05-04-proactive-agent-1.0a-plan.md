@@ -65,30 +65,6 @@ selects on the new tables.
 
 ---
 
-## 1.6 OAuth callback: pull timezone (~10 min)
-
-Spec §2.1 requires `feishu_links.timezone` to be populated from the
-Feishu user_info response. The current callback ignores this field.
-
-**File**: `web/app/api/feishu/oauth/callback/route.ts`
-
-Steps:
-- Add `let timezone: string | null = null;` alongside the other
-  parsed fields
-- Read `userJson.data?.timezone ?? null` after the userinfo fetch
-- Add `feishu_timezone: timezone` to the upsert payload (column
-  name aligns with `feishu_name` / `feishu_email` / `feishu_mobile`
-  conventions, BUT — per spec §2.1 the column is just `timezone`
-  not `feishu_timezone`. Match the spec, even though it's a small
-  inconsistency with the other column naming. Keep schema clean.)
-- Existing rows: `default 'Asia/Shanghai'` from the migration covers
-  them; users who re-bind (or whose row is upserted by a future
-  re-OAuth) get the real timezone.
-
-**Exit criterion**: re-bind your own Feishu account and verify the
-new column is set to a non-default value (assuming your Feishu
-profile has a timezone configured).
-
 ## 1.5 RequestContext extension (~15 min)
 
 Required before any subscription tool can be implemented (§5.0 of
@@ -107,6 +83,30 @@ spec).
 **Exit criterion**: a tool calling
 `ctx.chat_type / ctx.asker_user_id` returns the right values for
 both p2p and group messages.
+
+## 1.6 OAuth callback: pull timezone (~10 min)
+
+Spec §2.1 requires `feishu_links.timezone` to be populated from the
+Feishu user_info response. The current callback ignores this field.
+
+**File**: `web/app/api/feishu/oauth/callback/route.ts`
+
+Steps:
+- Add `let timezone: string | null = null;` alongside the other
+  parsed fields
+- Read `userJson.data?.timezone ?? null` after the userinfo fetch
+- Add `timezone: timezone` to the upsert payload — the column name
+  in spec §2.1 is just `timezone`, not `feishu_timezone`, even
+  though the other Feishu-derived columns use the `feishu_` prefix.
+  We accept the small naming inconsistency to keep the schema
+  clean.
+- Existing rows: `default 'Asia/Shanghai'` from the migration covers
+  them; users who re-bind (or whose row is upserted by a future
+  re-OAuth) get the real timezone.
+
+**Exit criterion**: re-bind your own Feishu account and verify the
+new column is set to a non-default value (assuming your Feishu
+profile has a timezone configured).
 
 ## 2. Bot config + DB layer (~30 min)
 
@@ -128,9 +128,17 @@ both p2p and group messages.
     the subscription tools (`list_subscriptions`) and renderer; not
     used in the decider fan-out path.
   - `get_notification(event_id, sub_id)` — for upsert-aware decider
-  - `write_decision_log(... + input_tokens, output_tokens)`
-  - `upsert_notification_row(...)` — overwrites pending decisions
-    when payload_version increases; never overwrites `sent`
+  - `write_decision_log(... + payload_version, input_tokens, output_tokens)`
+  - `upsert_notification_row(event_id, sub_id, decision,
+                             decided_payload_version)` —
+    implements the full rewrite table from spec §2.4:
+    no row → INSERT;
+    `pending`/`suppressed`/`failed` with new version > old → UPDATE in place;
+    same version or older → no-op;
+    `sent` → no-op (frozen, never modified).
+    The function must read existing.status + existing.decided_payload_version
+    in the same transaction (or use a conditional UPDATE clause) to
+    avoid races with the delivery loop.
   - `fetch_pending_notifications(limit)`
   - `mark_notification_sent(id, msg_id, text)`
   - `mark_notification_failed(id, error)`
@@ -185,15 +193,38 @@ class Decision:
     latency_ms: int
     model: str
 
+@dataclass
+class ScopeContext:
+    """Owner state shared across every candidate in one scope."""
+    owner_local_time: str             # e.g. "2026-05-04T23:42+08:00"
+    owner_today_sent_count: int
+    recent_notifications: list[dict]  # see spec §3.1 for shape
+
 async def decide(
     event: dict,
-    subscription: dict,
-    context: dict,
+    candidate: dict,
+    siblings: list[dict],
+    scope_ctx: ScopeContext,
 ) -> Decision
 ```
 
-Where `context` is built by the caller from
-`recent_notifications_for_subscription` and `daily_count_for_owner`.
+Per spec §3.1, every judge call must see ALL of the owner's
+preferences (candidate + siblings) so exclusion / quiet-hours rules
+written in a separate `subscriptions` row can veto a positive
+match. The caller (decider loop) builds:
+- `siblings` from the same `scope_subs` group, minus the candidate
+- `scope_ctx.recent_notifications` from
+  `recent_notifications_for_scope(scope_kind, scope_id,
+  since_minutes=30)` — note: scoped to the OWNER, not to one
+  subscription, since dedup is owner-level not subscription-level.
+- `owner_today_sent_count` from `daily_sent_count_for_scope(...)`
+- `owner_local_time` from the owner's timezone (user
+  scope: feishu_links.timezone; chat scope: hardcoded
+  Asia/Shanghai for 1.0a — chat-level timezone is a future feature)
+
+`Decision.raw_input` must serialise the full bundle (candidate +
+siblings + scope_ctx + event) so decision_logs can replay any
+judgement without further DB lookups.
 
 **Exit criterion**: synthetic event + synthetic subscription, judge
 returns a coherent Decision JSON. Run 5 hand-picked cases that
