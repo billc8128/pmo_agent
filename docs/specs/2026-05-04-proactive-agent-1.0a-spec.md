@@ -539,92 +539,66 @@ as $$
 declare
     result_action text;
 begin
-    insert into notifications (
-        event_id, subscription_id, status, suppressed_by,
-        delivery_kind, delivery_target, decided_payload_version,
-        decided_at
-    ) values (
-        p_event_id, p_subscription_id, p_status, p_suppressed_by,
-        p_delivery_kind, p_delivery_target, p_decided_payload_version,
-        now()
+    -- Single-statement upsert using a WHERE guard on DO UPDATE.
+    --   - Brand-new row → INSERT, returned with xmax = 0.
+    --   - Existing row that's REWRITEABLE under §2.4 (status not in
+    --     sent/claimed AND incoming version > existing version)
+    --     → UPDATE all fields, returned with xmax != 0.
+    --   - Existing row that's NOT rewriteable → DO UPDATE's WHERE
+    --     prunes the conflict update; the INSERT failed; nothing is
+    --     returned. We see 0 rows and report 'noop'.
+    -- We can't reference `excluded.*` in RETURNING (Postgres
+    -- restriction), so the CASE inside RETURNING uses only the
+    -- post-update tuple (`notifications.*`) and `xmax`.
+    with up as (
+        insert into notifications (
+            event_id, subscription_id, status, suppressed_by,
+            delivery_kind, delivery_target, decided_payload_version,
+            decided_at
+        ) values (
+            p_event_id, p_subscription_id, p_status, p_suppressed_by,
+            p_delivery_kind, p_delivery_target, p_decided_payload_version,
+            now()
+        )
+        on conflict (event_id, subscription_id) do update
+            set status                  = excluded.status,
+                suppressed_by           = excluded.suppressed_by,
+                delivery_kind           = excluded.delivery_kind,
+                delivery_target         = excluded.delivery_target,
+                decided_payload_version = excluded.decided_payload_version,
+                decided_at              = excluded.decided_at,
+                -- Wipe the rendered/sent state on a real rewrite —
+                -- old text was for an older payload version.
+                rendered_text = null,
+                feishu_msg_id = null,
+                sent_at = null,
+                error = null
+            where notifications.status not in ('sent', 'claimed')
+              and excluded.decided_payload_version
+                  > notifications.decided_payload_version
+        returning (xmax = 0) as inserted
     )
-    on conflict (event_id, subscription_id) do update
-        -- Apply the rewrite table from §2.4. The CASE clauses
-        -- compare against the existing row's status/version (the
-        -- pre-update tuple is bound to the special `notifications`
-        -- alias on the LHS of SET).
-        set status = case
-                when notifications.status in ('sent', 'claimed') then notifications.status
-                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.status
-                else notifications.status
-            end,
-            suppressed_by = case
-                when notifications.status in ('sent', 'claimed') then notifications.suppressed_by
-                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.suppressed_by
-                else notifications.suppressed_by
-            end,
-            delivery_kind = case
-                when notifications.status in ('sent', 'claimed') then notifications.delivery_kind
-                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.delivery_kind
-                else notifications.delivery_kind
-            end,
-            delivery_target = case
-                when notifications.status in ('sent', 'claimed') then notifications.delivery_target
-                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.delivery_target
-                else notifications.delivery_target
-            end,
-            decided_payload_version = case
-                when notifications.status in ('sent', 'claimed') then notifications.decided_payload_version
-                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.decided_payload_version
-                else notifications.decided_payload_version
-            end,
-            decided_at = case
-                when notifications.status in ('sent', 'claimed') then notifications.decided_at
-                when excluded.decided_payload_version > notifications.decided_payload_version then excluded.decided_at
-                else notifications.decided_at
-            end,
-            -- Wipe the rendered/sent state on a real rewrite — the
-            -- old text was for an older payload version. (Frozen
-            -- states keep their own values via the CASE above.)
-            rendered_text = case
-                when notifications.status not in ('sent', 'claimed')
-                 and excluded.decided_payload_version > notifications.decided_payload_version
-                    then null
-                else notifications.rendered_text
-            end,
-            feishu_msg_id = case
-                when notifications.status not in ('sent', 'claimed')
-                 and excluded.decided_payload_version > notifications.decided_payload_version
-                    then null
-                else notifications.feishu_msg_id
-            end,
-            sent_at = case
-                when notifications.status not in ('sent', 'claimed')
-                 and excluded.decided_payload_version > notifications.decided_payload_version
-                    then null
-                else notifications.sent_at
-            end,
-            error = case
-                when notifications.status not in ('sent', 'claimed')
-                 and excluded.decided_payload_version > notifications.decided_payload_version
-                    then null
-                else notifications.error
-            end
-    returning case
-        when xmax = 0 then 'inserted'  -- xmax=0 ⇔ this txn inserted
-        when notifications.decided_payload_version = excluded.decided_payload_version
-         and notifications.status = excluded.status then 'updated'
-        else 'noop'
-    end into result_action;
+    select case when (select inserted from up) then 'inserted'
+                when exists (select 1 from up)  then 'updated'
+                else                                'noop'
+           end
+      into result_action;
 
     return result_action;
 end $$;
 ```
 
-The `xmax = 0` trick distinguishes a fresh INSERT from a
-DO UPDATE conflict path. The `'noop'` return covers the case where
-either (a) existing was sent/claimed and we left it alone, or
-(b) incoming version was ≤ existing and we left it alone.
+Why the WHERE guard works: when the conflict path's predicate is
+false, Postgres treats the row as **filtered**, the DO UPDATE
+becomes a no-op, the INSERT also rolls back its conflict, and the
+statement returns zero rows. This is documented behaviour of
+`ON CONFLICT ... DO UPDATE ... WHERE` and is what lets us collapse
+the §2.4 rewrite table into a single statement without the
+forbidden `excluded.*` reference in RETURNING.
+
+The `'noop'` return covers all the cases where the rewrite table
+says "leave the row alone": existing was sent/claimed, OR incoming
+version was ≤ existing version.
 
 All six functions are `security definer` so they can do their
 work without being bound by the caller's RLS policies. **But** that
@@ -889,12 +863,17 @@ async def delivery_loop():
                 text = await render_notification(row)
 
                 # Idempotency: pass a stable uuid derived from the
-                # notification id so a retry after a process crash
-                # doesn't double-send. Feishu's /im/v1/messages
-                # accepts a `uuid` query param and dedupes server-
-                # side for ~1h based on (app, sender, receive_id,
-                # uuid). See deliver() spec below.
-                feishu_idempotency_uuid = stable_uuid_from_notif(row.id)
+                # notification id PLUS the decided_payload_version.
+                # Same version → same uuid → Feishu dedupes (good,
+                # crash-after-send won't double-send). Different
+                # version → different uuid → Feishu treats as a
+                # fresh message (also good: a v2 rewrite is a
+                # fundamentally different notification body and
+                # SHOULD reach the user, not get suppressed by a
+                # v1 dedup hit). See deliver() spec below.
+                feishu_idempotency_uuid = stable_uuid_from_notif(
+                    row.id, row.decided_payload_version,
+                )
 
                 msg_id = await deliver(
                     row, text,
@@ -908,17 +887,20 @@ async def delivery_loop():
                 if not ok:
                     log.warning("notif %s claim lost; skipping", row.id)
             except TransientError:
-                release_claim(row.id, claim_id, reset_to='pending')
+                release_claim(row.id, claim_id)
             except PermanentError as e:
                 mark_failed_if_claimed(row.id, claim_id, error=str(e))
 ```
 
 **Crash-safe send (at-most-once, with caveat)**:
 
-`stable_uuid_from_notif(notification_id)` produces a deterministic
-UUIDv5 derived from the notification's row id (namespace = a fixed
-project UUID hardcoded in `feishu/client.py`). The same row will
-always produce the same idempotency uuid.
+`stable_uuid_from_notif(notification_id, decided_payload_version)`
+produces a deterministic UUIDv5 derived from the pair (namespace =
+a fixed project UUID hardcoded in `feishu/client.py`). The same
+(row, version) tuple always produces the same uuid; bumping the
+version produces a different uuid, so a rewritten v2 notification
+is sent fresh rather than being silently dedupe-d into the v1
+message Feishu still has cached.
 
 This uuid goes through to Feishu via the `uuid` query parameter
 on `/open-apis/im/v1/messages`. Feishu's documented behaviour is

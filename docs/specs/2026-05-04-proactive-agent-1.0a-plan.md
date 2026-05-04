@@ -65,8 +65,23 @@ All four tests inside a single transaction, rolled back at the end,
 so production data is untouched. Run via Supabase Management API
 or psql.
 
-**Exit criterion**: all four smoke tests pass; RLS denies anon
-selects on the new tables.
+**RPC ACL smoke tests** (run after the trigger tests, against the
+deployed database — these verify that the SECURITY DEFINER
+functions can't be invoked from the browser):
+
+5. With the **anon** key: call `claim_pending_notifications` →
+   expect `permission denied for function claim_pending_notifications`.
+6. With the **anon** key: call `upsert_notification_row(...)` with
+   any args → expect permission denied.
+7. With the **service-role** key: call `reap_stale_claims(5)` →
+   expect a successful return (likely `0` if no stale rows).
+8. Same for `mark_sent_if_claimed`, `mark_failed_if_claimed`,
+   `release_claim` — service-role can call (returns NULL on
+   non-existent row), anon gets permission denied.
+
+**Exit criterion**: all four trigger smoke tests pass; all four
+RPC ACL smoke tests pass; RLS denies anon SELECTs on
+events/subscriptions/notifications/decision_logs.
 
 ---
 
@@ -388,7 +403,8 @@ either freezes (sent) or rewrites (back to pending).
 DB helpers needed in queries.py:
 - `claim_pending_notifications(claim_id, limit)` — does the
   conditional UPDATE described in spec §3.2
-- `release_claim(notification_id, claim_id, reset_to)`
+- `release_claim(notification_id, claim_id)` — flips `claimed`
+  back to `pending` and clears the lease columns
 - `mark_sent_if_claimed(notification_id, claim_id, msg_id, text)`
 - `mark_failed_if_claimed(notification_id, claim_id, error)`
 - `reap_stale_claims(stale_after_minutes=5)`
