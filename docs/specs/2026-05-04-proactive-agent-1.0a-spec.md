@@ -750,6 +750,16 @@ async def decider_loop():
             had_blocking_claim  = False    # claim on stale version blocks finalisation
 
             for scope_key, scope_subs in subs_by_scope.items():
+                # Subscriptions are forward-from-creation. A new
+                # "vibelive 进展告诉我" subscription must not cause a
+                # cold-start fanout over all historical events that
+                # happened before the subscription existed; those
+                # historical events are still finalised for this loop
+                # once no applicable subscriptions remain.
+                scope_subs = [
+                    s for s in scope_subs
+                    if ev.ingested_at >= s.created_at
+                ]
                 for candidate in scope_subs:
                     siblings = [s for s in scope_subs if s.id != candidate.id]
                     existing = get_notification(ev.id, candidate.id)

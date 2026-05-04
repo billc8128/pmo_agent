@@ -366,6 +366,13 @@ Wires §3.1 of the spec. Important details:
   the OLD version — so we must keep the event in the
   needs-decision set to rewrite that pending up to the current
   version.
+- Subscriptions are forward-from-creation: before judging an event
+  against a scope's subscriptions, filter out subscriptions whose
+  `created_at` is later than `ev.ingested_at`. If that leaves no
+  applicable candidates, the event can still be marked processed.
+  This prevents a new subscription from cold-start fanout over all
+  historical events and keeps the ≤90s E2E notification target
+  meaningful.
 - `mark_event_processed(ev.id, decided_version)` is called **only
   if both flags are false**. Pairs that already wrote a
   notification row at the current version are protected from
