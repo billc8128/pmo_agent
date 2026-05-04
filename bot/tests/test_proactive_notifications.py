@@ -322,6 +322,47 @@ async def test_decider_does_not_mark_events_processed_when_no_subscriptions(monk
 
 
 @pytest.mark.anyio
+async def test_decider_skips_subscriptions_created_after_event(monkeypatch):
+    from agent import decider_loop
+
+    marked: list[tuple[int, int]] = []
+
+    async def should_not_decide(*args, **kwargs):
+        raise AssertionError("new subscriptions must not fan out to old events")
+
+    monkeypatch.setattr(decider_loop.decider, "decide", should_not_decide)
+    monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
+    monkeypatch.setattr(decider_loop.queries, "get_notification", lambda event_id, sub_id: None)
+    monkeypatch.setattr(
+        decider_loop.queries,
+        "mark_event_processed",
+        lambda event_id, version: marked.append((event_id, version)),
+    )
+
+    await decider_loop.process_event(
+        {
+            "id": 9,
+            "payload_version": 2,
+            "ingested_at": "2026-05-04T10:00:00+00:00",
+            "payload": {},
+        },
+        {
+            ("user", "22222222-2222-2222-2222-222222222222"): [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "scope_kind": "user",
+                    "scope_id": "22222222-2222-2222-2222-222222222222",
+                    "description": "vibelive 进展告诉我",
+                    "created_at": "2026-05-04T10:01:00+00:00",
+                }
+            ]
+        },
+    )
+
+    assert marked == [(9, 2)]
+
+
+@pytest.mark.anyio
 async def test_delivery_releases_claim_on_unexpected_row_error(monkeypatch):
     from agent import delivery_loop
     from db.queries import ClaimedBundle, Notification, Subscription

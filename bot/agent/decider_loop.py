@@ -27,6 +27,25 @@ def _row_value(row: Any, key: str, default: Any = None) -> Any:
     return getattr(row, key, default)
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def subscription_applies_to_event(event: dict[str, Any], subscription: dict[str, Any]) -> bool:
+    event_ingested_at = _parse_timestamp(event.get("ingested_at"))
+    subscription_created_at = _parse_timestamp(subscription.get("created_at"))
+    if event_ingested_at is None or subscription_created_at is None:
+        return True
+    return event_ingested_at >= subscription_created_at
+
+
 def _zone(name: str | None) -> ZoneInfo:
     try:
         return ZoneInfo(name or "Asia/Shanghai")
@@ -96,7 +115,13 @@ async def process_event(
     had_blocking_claim = False
     context_cache: dict[tuple[str, str], decider.ScopeContext] = {}
 
-    for scope_key, scope_subs in subs_by_scope.items():
+    for scope_key, raw_scope_subs in subs_by_scope.items():
+        scope_subs = [
+            sub for sub in raw_scope_subs
+            if subscription_applies_to_event(event, sub)
+        ]
+        if not scope_subs:
+            continue
         scope_kind, scope_id = scope_key
         for candidate in scope_subs:
             sub_id = candidate.get("id")
