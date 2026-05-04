@@ -193,16 +193,52 @@ profile has a timezone configured).
     `sb_admin().rpc("upsert_notification_row", {...})`.
   - `claim_pending_notifications(claim_id, limit)` — RPC wrapper
     around the `claim_pending_notifications` SQL function (§2.8);
-    that's where `for update skip locked` lives. Returns each
-    claimed row joined with the **frozen payload snapshot** from
-    decision time (NOT current events.payload), the version that
-    snapshot represents, and the full `subscription` row, so the
-    delivery loop has everything the renderer needs without a
-    second roundtrip AND with rendering decoupled from any
-    subsequent mutations to events. The Python wrapper deserialises
-    each result into a `ClaimedBundle` dataclass with
-    `.notification`, `.notif_payload_snapshot`,
-    `.notif_payload_version`, `.subscription` attributes.
+    that's where `for update skip locked` AND the version-match
+    guard live. Returns each claimed row joined with the **frozen
+    payload snapshot** from decision time (NOT current
+    events.payload), the version that snapshot represents, and the
+    full `subscription` row, so the delivery loop has everything
+    the renderer needs without a second roundtrip AND with
+    rendering decoupled from any subsequent mutations to events.
+
+    The Python wrapper deserialises each RPC row into a
+    `ClaimedBundle` dataclass:
+
+    ```python
+    @dataclass
+    class Notification:
+        id: int
+        event_id: int
+        subscription_id: str
+        status: str
+        decided_payload_version: int
+        delivery_kind: str
+        delivery_target: str
+        suppressed_by: str | None
+        # ... (all columns of the notifications table)
+
+    @dataclass
+    class Subscription:
+        id: str
+        scope_kind: str
+        scope_id: str
+        description: str
+        enabled: bool
+        # ... (all columns of the subscriptions table)
+
+    @dataclass
+    class ClaimedBundle:
+        notification: Notification
+        notif_payload_snapshot: dict      # jsonb → dict passthrough
+        notif_payload_version: int
+        subscription: Subscription
+    ```
+
+    The wrapper parses each RPC row's `notification` and
+    `subscription` jsonb columns through the dataclass constructors
+    so call sites use `b.notification.id`,
+    `b.notification.decided_payload_version`, etc. — never raw
+    `["id"]` lookups — keeping the delivery-loop code readable.
   - `release_claim(id, claim_id)` — RPC wrapper
   - `mark_sent_if_claimed(id, claim_id, msg_id, text)` — RPC
     wrapper; the SQL function returns NULL on lost lease so the
@@ -599,6 +635,18 @@ Concrete script:
     suppressed `mismatch`); 30s later, UPDATE the turn to fill
     `agent_summary`; observe `events.payload_version` bumped to 2,
     decider re-considers, second decision sends.
+
+12b. **Stale-pending-not-claimed regression** (covers spec §2.8
+    version-match guard in claim_pending_notifications): write a
+    `pending` notification at v1, immediately mutate the underlying
+    turn so `events.payload_version` becomes 2 BEFORE the delivery
+    loop runs. Run delivery once and assert that `claim_pending_…`
+    returns zero rows (the v1 pending was filtered by the version
+    guard). Then run decider once; assert the v1 pending is
+    rewritten in place to v2 (or to suppressed/v2 depending on
+    judge verdict). Run delivery again; assert it now claims the
+    v2 row and sends. Without the version guard, delivery would
+    have claimed v1 in step one and sent stale content.
 13. **5-min dedup**: after step 4 succeeds, immediately insert
     another similar vibelive turn within 5 minutes; verify the
     second event is suppressed `duplicate_in_window` and references

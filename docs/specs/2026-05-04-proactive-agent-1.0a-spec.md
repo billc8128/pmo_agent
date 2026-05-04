@@ -420,12 +420,24 @@ PL/pgSQL **RPC functions** in the migration. Python helpers in
 Functions:
 
 ```sql
--- Atomic pending → claimed transition for up to N rows. Returns
--- each claimed row PLUS the FROZEN payload snapshot taken at
--- decision time PLUS the subscription. Renderer reads
--- notif_payload_snapshot, NOT events.payload — that decoupling is
--- what guarantees a v2 mutation in events between decision and
--- delivery cannot inject new content into a v1 notification.
+-- Atomic pending → claimed transition for up to N rows. Two
+-- guarantees stack here, both load-bearing:
+--
+-- 1. Version-match filter: we only claim pending rows whose
+--    decided_payload_version equals the underlying event's current
+--    payload_version. A stale pending (decision is at v1 but the
+--    event has since moved to v2) is left alone for the decider
+--    to rewrite. This stops the delivery loop from sending a
+--    decision the judge would have made differently on the new
+--    payload.
+-- 2. Frozen snapshot: even within a claim, the renderer reads
+--    notif_payload_snapshot (frozen at decision time), NOT current
+--    events.payload. So even if events.payload mutates between
+--    claim and render (because the trigger fires concurrently),
+--    the rendered text reflects the bytes the judge ruled on.
+--
+-- Together: stale rows can't be claimed, and claimed rows can't be
+-- rendered with newer-than-decision content.
 --
 -- We return jsonb instead of composite row types because Postgres
 -- doesn't support `alias.*::row_type` casts cleanly, and the bot's
@@ -450,9 +462,19 @@ begin
                claim_id = p_claim_id,
                claimed_at = now()
          where n.id in (
-            select id from notifications
-             where status = 'pending'
-             order by decided_at
+            -- Only claim rows whose decided_payload_version still
+            -- equals the underlying event's current payload_version.
+            -- A stale pending (v1 decision while event has moved to
+            -- v2) is left alone so the decider can rewrite it on
+            -- the next iteration. Without this guard the delivery
+            -- loop would render-and-send v1 content even though
+            -- the judge would have ruled differently on v2.
+            select n2.id
+              from notifications n2
+              join events e on e.id = n2.event_id
+             where n2.status = 'pending'
+               and n2.decided_payload_version = e.payload_version
+             order by n2.decided_at
              limit p_limit
              for update skip locked
          )
@@ -653,7 +675,7 @@ begin
         'mark_failed_if_claimed(bigint,uuid,text)',
         'release_claim(bigint,uuid)',
         'reap_stale_claims(int)',
-        'upsert_notification_row(bigint,uuid,text,text,text,text,int)'
+        'upsert_notification_row(bigint,uuid,text,text,text,text,int,jsonb)'
       ])
   loop
     execute format('revoke execute on function %s from public', fn);
@@ -676,7 +698,7 @@ alter function release_claim(bigint,uuid)
     set search_path = public, pg_temp;
 alter function reap_stale_claims(int)
     set search_path = public, pg_temp;
-alter function upsert_notification_row(bigint,uuid,text,text,text,text,int)
+alter function upsert_notification_row(bigint,uuid,text,text,text,text,int,jsonb)
     set search_path = public, pg_temp;
 ```
 
@@ -900,6 +922,15 @@ async def delivery_loop():
         # snapshot + subscription, so the renderer has all the
         # context it needs without a second DB roundtrip AND its
         # input is frozen at decision time.
+        #
+        # The Python wrapper around claim_pending_notifications
+        # parses the RPC's jsonb columns into typed dataclasses:
+        #   - b.notification → Notification dataclass
+        #     (.id, .decided_payload_version, .delivery_kind, ...)
+        #   - b.subscription → Subscription dataclass
+        #   - b.notif_payload_snapshot → dict (jsonb passthrough)
+        # The pseudocode below uses attribute access for clarity;
+        # see plan §2 for the exact dataclass field list.
         bundles = claim_pending_notifications(claim_id, limit=20)
         for b in bundles:
             notif = b.notification
