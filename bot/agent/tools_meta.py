@@ -13,6 +13,27 @@ from agent.tool_utils import err, ok
 from db import queries
 
 
+def _infer_subscription_scope(ctx: RequestContext, requested_scope_kind: str | None) -> tuple[str, str]:
+    requested = (requested_scope_kind or "").strip().lower()
+    if requested not in {"", "user", "chat"}:
+        raise ValueError("scope_kind must be 'user' or 'chat'")
+    if not requested:
+        requested = "chat" if ctx.chat_type == "group" else "user"
+    if requested == "chat":
+        if not ctx.chat_id:
+            raise ValueError("当前会话没有 chat_id，不能创建群订阅")
+        return "chat", ctx.chat_id
+    if not ctx.asker_user_id:
+        raise ValueError("你还没在 web 上绑定飞书账号，先去 https://pmo-agent-sigma.vercel.app/me 绑一下")
+    return "user", ctx.asker_user_id
+
+
+def _require_bound_asker(ctx: RequestContext) -> str:
+    if not ctx.asker_user_id:
+        raise ValueError("你还没在 web 上绑定飞书账号，先去 https://pmo-agent-sigma.vercel.app/me 绑一下")
+    return ctx.asker_user_id
+
+
 def build_meta_tools(ctx: RequestContext):
     @tool(
         "list_users",
@@ -244,6 +265,160 @@ def build_meta_tools(ctx: RequestContext):
         except Exception as e:
             return err(f"{type(e).__name__}: {e}")
 
+    @tool(
+        "add_subscription",
+        "Subscribe the current user or current group to a natural-language proactive notification preference.",
+        {"description": str, "scope_kind": str},
+    )
+    async def add_subscription(args: dict) -> dict[str, Any]:
+        try:
+            asker_user_id = _require_bound_asker(ctx)
+            description = (args.get("description") or "").strip()
+            if not description:
+                return err("description is required")
+            scope_kind, scope_id = _infer_subscription_scope(ctx, args.get("scope_kind") or None)
+            row = queries.add_subscription(
+                scope_kind=scope_kind,
+                scope_id=scope_id,
+                description=description,
+                created_by=asker_user_id,
+                chat_id=ctx.chat_id or None,
+            )
+            return ok({"subscription": row, "scope_kind": scope_kind})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "list_subscriptions",
+        "List proactive notification subscriptions for the current user or current group.",
+        {"scope_kind": str},
+    )
+    async def list_subscriptions(args: dict) -> dict[str, Any]:
+        try:
+            _require_bound_asker(ctx)
+            scope_kind, scope_id = _infer_subscription_scope(ctx, args.get("scope_kind") or None)
+            rows = queries.list_subscriptions(scope_kind, scope_id)
+            return ok({"scope_kind": scope_kind, "subscriptions": rows, "count": len(rows)})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "update_subscription",
+        "Update a proactive notification subscription in the current conversation scope.",
+        {"subscription_id": str, "description": str, "enabled": bool, "scope_kind": str},
+    )
+    async def update_subscription(args: dict) -> dict[str, Any]:
+        try:
+            _require_bound_asker(ctx)
+            subscription_id = (args.get("subscription_id") or args.get("id") or "").strip()
+            if not subscription_id:
+                return err("subscription_id is required")
+            scope_kind, scope_id = _infer_subscription_scope(ctx, args.get("scope_kind") or None)
+            fields: dict[str, Any] = {}
+            if "description" in args and args.get("description") is not None:
+                desc = str(args.get("description") or "").strip()
+                if desc:
+                    fields["description"] = desc
+            if "enabled" in args and args.get("enabled") is not None:
+                fields["enabled"] = bool(args.get("enabled"))
+            row = queries.update_subscription(subscription_id, scope_kind, scope_id, **fields)
+            if not row:
+                return err("没找到当前会话 scope 下的这个订阅，不能跨私聊/群聊修改")
+            return ok({"subscription": row})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "remove_subscription",
+        "Disable a proactive notification subscription in the current conversation scope.",
+        {"subscription_id": str, "scope_kind": str},
+    )
+    async def remove_subscription(args: dict) -> dict[str, Any]:
+        try:
+            _require_bound_asker(ctx)
+            subscription_id = (args.get("subscription_id") or args.get("id") or "").strip()
+            if not subscription_id:
+                return err("subscription_id is required")
+            scope_kind, scope_id = _infer_subscription_scope(ctx, args.get("scope_kind") or None)
+            row = queries.remove_subscription(subscription_id, scope_kind, scope_id)
+            if not row:
+                return err("没找到当前会话 scope 下的这个订阅，不能跨私聊/群聊删除")
+            return ok({"subscription": row, "removed": True})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "why_no_notification",
+        "Inspect recent decision logs to explain why a proactive notification did not arrive.",
+        {"query": str, "hours": int, "scope_kind": str},
+    )
+    async def why_no_notification(args: dict) -> dict[str, Any]:
+        try:
+            _require_bound_asker(ctx)
+            scope_kind, scope_id = _infer_subscription_scope(ctx, args.get("scope_kind") or None)
+            query = (args.get("query") or "").strip().lower()
+            hours = int(args.get("hours") or 24)
+            logs = queries.recent_decision_logs_for_scope(scope_kind, scope_id, since_hours=hours)
+            groups: dict[tuple[Any, Any], dict[str, Any]] = {}
+            for row in logs:
+                judge_input = row.get("judge_input") or {}
+                event = judge_input.get("event") or {}
+                payload = event.get("payload") or {}
+                searchable = " ".join(
+                    str(payload.get(k) or "").lower()
+                    for k in ("user_message", "agent_summary", "agent_response_excerpt")
+                )
+                if query and query not in searchable:
+                    continue
+                key = (row.get("event_id"), row.get("subscription_id"))
+                group = groups.setdefault(
+                    key,
+                    {
+                        "event_id": row.get("event_id"),
+                        "subscription_id": row.get("subscription_id"),
+                        "subscription_description": (row.get("subscriptions") or {}).get("description"),
+                        "event_summary": {
+                            "user_message": (payload.get("user_message") or "")[:180],
+                            "agent_summary": payload.get("agent_summary"),
+                            "project_root": payload.get("project_root"),
+                        },
+                        "current_notification": row.get("current_notification"),
+                        "timeline": [],
+                    },
+                )
+                judge_output = row.get("judge_output") or {}
+                group["timeline"].append(
+                    {
+                        "payload_version": row.get("payload_version"),
+                        "created_at": row.get("created_at"),
+                        "send": judge_output.get("send"),
+                        "suppressed_by": judge_output.get("suppressed_by"),
+                        "reason": judge_output.get("reason"),
+                        "judge_output": {
+                            k: v
+                            for k, v in judge_output.items()
+                            if k in {"send", "matched_aspect", "suppressed_by", "reason", "preview_hint"}
+                        },
+                    }
+                )
+            out = list(groups.values())[:5]
+            for group in out:
+                group["timeline"] = sorted(group["timeline"], key=lambda x: x.get("created_at") or "")
+            return ok({"matches": out, "count": len(out)})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "resolve_subject_mention",
+        "Resolve a pmo_agent user_id to a Feishu open_id for notification @mentions.",
+        {"user_id": str},
+    )
+    async def resolve_subject_mention(args: dict) -> dict[str, Any]:
+        try:
+            return ok(queries.resolve_subject_open_id(args.get("user_id") or ""))
+        except Exception as e:
+            return err(str(e))
+
     return [
         list_users,
         lookup_user,
@@ -254,6 +429,12 @@ def build_meta_tools(ctx: RequestContext):
         today_iso,
         resolve_people,
         undo_last_action,
+        add_subscription,
+        list_subscriptions,
+        update_subscription,
+        remove_subscription,
+        why_no_notification,
+        resolve_subject_mention,
     ]
 
 

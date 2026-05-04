@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # ── Misc ──
     log_level: str = "INFO"
     agent_max_duration_seconds: int = 120
+    decider_loop_interval_seconds: int = 30
+    delivery_loop_interval_seconds: int = 15
+    notification_render_max_seconds: int = 60
 
     @property
     def cors_origins(self) -> List[str]:

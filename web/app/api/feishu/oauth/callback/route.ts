@@ -80,7 +80,7 @@ export async function GET(request: NextRequest) {
     if (!userAccessToken) {
       return backToMe(origin, { feishu: 'error', reason: 'no_access_token' });
     }
-  } catch (e) {
+  } catch {
     return backToMe(origin, { feishu: 'error', reason: 'token_exchange_threw' });
   }
 
@@ -89,6 +89,7 @@ export async function GET(request: NextRequest) {
   let name: string | null = null;
   let email: string | null = null;
   let mobile: string | null = null;
+  let timezone: string | null = null;
   try {
     const userResp = await fetch(USERINFO_URL, {
       headers: { Authorization: `Bearer ${userAccessToken}` },
@@ -105,10 +106,11 @@ export async function GET(request: NextRequest) {
     name   = userJson.data?.name ?? null;
     email  = userJson.data?.email ?? userJson.data?.enterprise_email ?? null;
     mobile = userJson.data?.mobile ?? userJson.data?.phone ?? null;
+    timezone = userJson.data?.timezone ?? null;
     if (!openId) {
       return backToMe(origin, { feishu: 'error', reason: 'no_open_id' });
     }
-  } catch (e) {
+  } catch {
     return backToMe(origin, { feishu: 'error', reason: 'userinfo_threw' });
   }
 
@@ -127,6 +129,7 @@ export async function GET(request: NextRequest) {
         feishu_name: name,
         feishu_email: email,
         feishu_mobile: mobile,
+        timezone: timezone ?? 'Asia/Shanghai',
       },
       { onConflict: 'feishu_open_id' },
     );

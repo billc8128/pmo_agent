@@ -225,9 +225,9 @@ create table notifications (
     -- content into a notification that was approved on v1. The
     -- snapshot is rewritten alongside decided_payload_version
     -- whenever the rewrite table (§2.4) updates the row in place.
-    -- Always populated for pending/sent rows; may be null for
-    -- suppressed rows (we don't need to keep the body of a message
-    -- we never sent).
+    -- Always populated, including suppressed rows, so future judge
+    -- context and why_no_notification can summarize prior decisions
+    -- without re-reading mutable events.payload.
     payload_snapshot jsonb,
     -- Idempotency guard: at most one notification row per
     -- (event, subscription); re-decisions overwrite in place when
@@ -476,7 +476,7 @@ begin
                and n2.decided_payload_version = e.payload_version
              order by n2.decided_at
              limit p_limit
-             for update skip locked
+             for update of n2 skip locked
          )
         returning n.*
     )
@@ -914,58 +914,70 @@ decider rewriting the same row.
 async def delivery_loop():
     while True:
         await asyncio.sleep(15)
-        # Reap stale claims first (worker crashed >5min ago).
-        reap_stale_claims()
-        # Claim up to 20 rows atomically: pending → claimed.
-        claim_id = uuid4()
-        # Each ClaimedBundle bundles the notification + joined event
-        # snapshot + subscription, so the renderer has all the
-        # context it needs without a second DB roundtrip AND its
-        # input is frozen at decision time.
-        #
-        # The Python wrapper around claim_pending_notifications
-        # parses the RPC's jsonb columns into typed dataclasses:
-        #   - b.notification → Notification dataclass
-        #     (.id, .decided_payload_version, .delivery_kind, ...)
-        #   - b.subscription → Subscription dataclass
-        #   - b.notif_payload_snapshot → dict (jsonb passthrough)
-        # The pseudocode below uses attribute access for clarity;
-        # see plan §2 for the exact dataclass field list.
-        bundles = claim_pending_notifications(claim_id, limit=20)
-        for b in bundles:
-            notif = b.notification
-            try:
-                text = await render_notification(
-                    notif_row=notif,
-                    # Frozen snapshot — NOT events.payload, which
-                    # may have moved on. See spec §2.4 for why.
-                    event_payload=b.notif_payload_snapshot,
-                    subscription=b.subscription,
-                )
+        try:
+            # Reap stale claims first (worker crashed >5min ago).
+            reap_stale_claims()
+            # Claim up to 20 rows atomically: pending → claimed.
+            claim_id = uuid4()
+            # Each ClaimedBundle bundles the notification + joined event
+            # snapshot + subscription, so the renderer has all the
+            # context it needs without a second DB roundtrip AND its
+            # input is frozen at decision time.
+            #
+            # The Python wrapper around claim_pending_notifications
+            # parses the RPC's jsonb columns into typed dataclasses:
+            #   - b.notification → Notification dataclass
+            #     (.id, .decided_payload_version, .delivery_kind, ...)
+            #   - b.subscription → Subscription dataclass
+            #   - b.notif_payload_snapshot → dict (jsonb passthrough)
+            # The pseudocode below uses attribute access for clarity;
+            # see plan §2 for the exact dataclass field list.
+            bundles = claim_pending_notifications(claim_id, limit=20)
+            for b in bundles:
+                notif = b.notification
+                try:
+                    text = await render_notification(
+                        notif_row=notif,
+                        # Frozen snapshot — NOT events.payload, which
+                        # may have moved on. See spec §2.4 for why.
+                        event_payload=b.notif_payload_snapshot,
+                        subscription=b.subscription,
+                    )
 
-                # Idempotency: stable uuid from (id, version) so a
-                # crash-after-send doesn't double-send AND a v2
-                # rewrite isn't silently dedupe-d into the v1
-                # message Feishu still has cached.
-                feishu_idempotency_uuid = stable_uuid_from_notif(
-                    notif.id, notif.decided_payload_version,
-                )
+                    # Idempotency: stable uuid from (id, version) so a
+                    # crash-after-send doesn't double-send AND a v2
+                    # rewrite isn't silently dedupe-d into the v1
+                    # message Feishu still has cached.
+                    feishu_idempotency_uuid = stable_uuid_from_notif(
+                        notif.id, notif.decided_payload_version,
+                    )
 
-                msg_id = await deliver(
-                    notif, text,
-                    idempotency_uuid=feishu_idempotency_uuid,
-                )
-                # Conditional commit — only if our lease is still
-                # the one on the row.
-                ok = await mark_sent_if_claimed(
-                    notif.id, claim_id, msg_id=msg_id, rendered_text=text,
-                )
-                if not ok:
-                    log.warning("notif %s claim lost; skipping", notif.id)
-            except TransientError:
-                release_claim(notif.id, claim_id)
-            except PermanentError as e:
-                mark_failed_if_claimed(notif.id, claim_id, error=str(e))
+                    msg_id = await deliver(
+                        notif, text,
+                        idempotency_uuid=feishu_idempotency_uuid,
+                    )
+                    # Conditional commit — only if our lease is still
+                    # the one on the row.
+                    ok = await mark_sent_if_claimed(
+                        notif.id, claim_id, msg_id=msg_id, rendered_text=text,
+                    )
+                    if not ok:
+                        log.warning("notif %s claim lost; skipping", notif.id)
+                except TransientError:
+                    release_claim(notif.id, claim_id)
+                except PermanentError as e:
+                    mark_failed_if_claimed(notif.id, claim_id, error=str(e))
+                except Exception as e:
+                    log.exception("delivery crashed for notif=%s", notif.id)
+                    # Unknown row-level errors should not kill the loop.
+                    # Release the lease so a code/config fix can retry
+                    # without waiting for the stale-claim reaper.
+                    release_claim(notif.id, claim_id)
+        except Exception:
+            # DB outage, malformed RPC response, or any other iteration-
+            # level failure must not terminate the background task.
+            log.exception("delivery loop iteration failed")
+            await asyncio.sleep(60)
 ```
 
 **Crash-safe send (at-most-once, with caveat)**:
@@ -1069,10 +1081,20 @@ update notifications
   (a new method on the existing `FeishuClient`)
 - `feishu_chat` → call `client.send_to_chat(chat_id, post_content)`
 
-Failures: classify as transient (5xx, network) → retry up to 3
-times with backoff inside the same loop iteration; permanent (4xx
-non-rate-limit) → mark `failed` with `error`. Rate-limit (429) →
-back off for 60s then continue the loop.
+Failures: classify as transient (5xx, network, 429) → release the
+lease immediately and let the next delivery-loop iteration retry.
+Do not sleep/backoff inline per row; one bad Feishu/network period
+must not block the whole claimed batch. Permanent errors (4xx
+non-rate-limit, renderer empty output, renderer timeout) → mark
+`failed` with `error`.
+
+Judge JSON parse failures are capped per `(event_id, subscription_id,
+payload_version)`: every parse failure writes a `decision_logs` row
+with `suppressed_by='judge_parse_error'`; after 3 consecutive parse
+failures the decider writes a suppressed notification with
+`suppressed_by='judge_failure'` and marks that pair settled for the
+current payload version. This prevents one malformed judge output
+pattern from retrying forever and burning API budget.
 
 ### 3.3 Why these are two loops
 
@@ -1171,12 +1193,15 @@ function. Pseudocode:
    break through"。
 4. **是否匹配候选订阅**：到此都没否决，看候选 description 是否覆盖
    当前事件。命中 → send=true，写 matched_aspect 和 preview_hint。
-5. **agent_summary + agent_response_excerpt 都缺失或不足判断**：如果
+5. **自己的事件默认也发**：当 `is_subject_the_owner=true` 时，仍按
+   候选订阅正常判断并发送；只有 description 或 sibling rules 明确写
+   "不要发我自己的 / 自己的不用提醒" 才 suppress。
+6. **agent_summary + agent_response_excerpt 都缺失或不足判断**：如果
    summary 为空，且 user_message + agent_response_excerpt 拼起来仍然
    不足以判断主题 → send=false, suppressed_by="mismatch"，reason
    注明 "summary not available yet"。等下一次 payload_version bump
    重审。如果其中任何一个有足够信息，就照常判。
-6. 拿不准 → send=false。
+7. 拿不准 → send=false。
 
 ## 输出 JSON
 

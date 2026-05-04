@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any, Optional
 
 import lark_oapi as lark
@@ -21,6 +22,24 @@ from lark_oapi.api.im.v1 import (
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+_NOTIFICATION_UUID_NAMESPACE = uuid.UUID("6a3a8912-5d8d-4f8f-9c4b-89d9d6270701")
+
+
+class FeishuSendError(Exception):
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+def stable_uuid_from_notif(notification_id: int, decided_payload_version: int) -> str:
+    """Deterministic Feishu idempotency key for one notification version."""
+    return str(
+        uuid.uuid5(
+            _NOTIFICATION_UUID_NAMESPACE,
+            f"notification:{notification_id}:payload_version:{decided_payload_version}",
+        )
+    )
 
 
 class FeishuClient:
@@ -176,6 +195,73 @@ class FeishuClient:
         if not resp.success():
             logger.warning("feishu reply post failed: code=%s msg=%s", resp.code, resp.msg)
             return None
+        return resp.data.message_id if resp.data else None
+
+    async def send_to_user(
+        self,
+        open_id: str,
+        post_content: dict,
+        idempotency_uuid: str | None = None,
+    ) -> Optional[str]:
+        """Send a proactive post message to a user's bot DM."""
+        return await self._create_post_message(
+            receive_id_type="open_id",
+            receive_id=open_id,
+            post_content=post_content,
+            idempotency_uuid=idempotency_uuid,
+        )
+
+    async def send_to_chat(
+        self,
+        chat_id: str,
+        post_content: dict,
+        idempotency_uuid: str | None = None,
+    ) -> Optional[str]:
+        """Send a proactive post message to a Feishu chat."""
+        return await self._create_post_message(
+            receive_id_type="chat_id",
+            receive_id=chat_id,
+            post_content=post_content,
+            idempotency_uuid=idempotency_uuid,
+        )
+
+    async def _create_post_message(
+        self,
+        *,
+        receive_id_type: str,
+        receive_id: str,
+        post_content: dict,
+        idempotency_uuid: str | None = None,
+    ) -> Optional[str]:
+        body_builder = (
+            CreateMessageRequestBody.builder()
+            .receive_id(receive_id)
+            .msg_type("post")
+            .content(json.dumps(post_content, ensure_ascii=False))
+        )
+        if idempotency_uuid:
+            body_builder = body_builder.uuid(idempotency_uuid)
+        body = body_builder.build()
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(body)
+            .build()
+        )
+        try:
+            resp = self.client.im.v1.message.create(req)
+        except Exception as e:
+            raise FeishuSendError(f"{type(e).__name__}: {e}", transient=True) from e
+        if not resp.success():
+            try:
+                code_num = int(resp.code or 0)
+            except (TypeError, ValueError):
+                code_num = 0
+            transient = code_num == 429 or 500 <= code_num < 600
+            raise FeishuSendError(
+                f"feishu send failed: code={resp.code} msg={resp.msg}",
+                transient=transient,
+            )
         return resp.data.message_id if resp.data else None
 
     async def reply_card(self, parent_message_id: str, card: dict) -> Optional[str]:

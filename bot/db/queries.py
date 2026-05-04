@@ -6,11 +6,77 @@ turns them into tool error messages the LLM can react to.
 """
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 import re
 
 from .client import sb, sb_admin
+
+
+@dataclass
+class Notification:
+    id: int
+    event_id: int
+    subscription_id: str
+    status: str
+    decided_payload_version: int
+    delivery_kind: str | None = None
+    delivery_target: str | None = None
+    suppressed_by: str | None = None
+    claimed_at: str | None = None
+    claim_id: str | None = None
+    rendered_text: str | None = None
+    feishu_msg_id: str | None = None
+    decided_at: str | None = None
+    sent_at: str | None = None
+    error: str | None = None
+    payload_snapshot: dict[str, Any] | None = None
+
+
+@dataclass
+class Subscription:
+    id: str
+    scope_kind: str
+    scope_id: str
+    description: str
+    enabled: bool
+    created_by: str | None = None
+    chat_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
+class ClaimedBundle:
+    notification: Notification
+    notif_payload_snapshot: dict[str, Any]
+    notif_payload_version: int
+    subscription: Subscription
+
+
+def _dataclass_from_row(cls, row: dict[str, Any]):
+    allowed = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in row.items() if k in allowed})
+
+
+def _jsonb_row(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        return json.loads(value)
+    raise TypeError(f"expected jsonb dict/string, got {type(value).__name__}")
+
+
+def _rpc_returned_id(data: Any) -> bool:
+    if data is None:
+        return False
+    if isinstance(data, list):
+        return bool(data)
+    return bool(data)
 
 
 def lookup_profile(handle: str) -> Optional[dict[str, Any]]:
@@ -813,3 +879,514 @@ def last_bot_action_for_sender_in_chat(chat_id: str, sender_open_id: str):
             return first
         return LastWasUnreachable
     return None
+
+
+# ── proactive notifications ─────────────────────────────────────────────
+
+
+def lookup_profile_by_user_id(user_id: str) -> Optional[dict[str, Any]]:
+    if not user_id:
+        return None
+    row = _execute_data(
+        sb().table("profiles").select("id, handle, display_name, created_at").eq("id", user_id).maybe_single()
+    )
+    return row or None
+
+
+def fetch_events_needing_decision(limit: int = 100) -> list[dict[str, Any]]:
+    rows = (
+        sb_admin()
+        .table("events_needing_decision")
+        .select("*")
+        .order("ingested_at", desc=False)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    return rows
+
+
+def mark_event_processed(event_id: int, payload_version: int) -> None:
+    (
+        sb_admin()
+        .table("events")
+        .update({"processed_at": _utc_now_iso(), "processed_version": payload_version})
+        .eq("id", event_id)
+        .execute()
+    )
+
+
+def fetch_all_enabled_subscriptions() -> list[dict[str, Any]]:
+    return (
+        sb_admin()
+        .table("subscriptions")
+        .select("*")
+        .eq("enabled", True)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+
+def fetch_subscriptions_for_scope(scope_kind: str, scope_id: str) -> list[dict[str, Any]]:
+    return (
+        sb_admin()
+        .table("subscriptions")
+        .select("*")
+        .eq("scope_kind", scope_kind)
+        .eq("scope_id", scope_id)
+        .eq("enabled", True)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+
+def get_notification(event_id: int, subscription_id: str) -> Optional[dict[str, Any]]:
+    row = _execute_data(
+        sb_admin()
+        .table("notifications")
+        .select("*")
+        .eq("event_id", event_id)
+        .eq("subscription_id", subscription_id)
+        .maybe_single()
+    )
+    return row or None
+
+
+def _decision_value(decision: Any, name: str, default: Any = None) -> Any:
+    if isinstance(decision, dict):
+        return decision.get(name, default)
+    return getattr(decision, name, default)
+
+
+def write_decision_log(
+    *,
+    event_id: int,
+    subscription_id: str,
+    payload_version: int,
+    judge_input: dict[str, Any],
+    judge_output: dict[str, Any],
+    model: str,
+    latency_ms: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> dict[str, Any] | None:
+    res = (
+        sb_admin()
+        .table("decision_logs")
+        .insert(
+            {
+                "event_id": event_id,
+                "subscription_id": subscription_id,
+                "payload_version": payload_version,
+                "judge_input": judge_input,
+                "judge_output": judge_output,
+                "model": model,
+                "latency_ms": latency_ms,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }
+        )
+        .execute()
+    )
+    return res.data[0] if res and res.data else None
+
+
+def upsert_notification_row(
+    *,
+    event_id: int,
+    subscription_id: str,
+    decision: Any,
+    decided_payload_version: int,
+    payload_snapshot: dict[str, Any],
+    delivery_kind: str | None = None,
+    delivery_target: str | None = None,
+) -> str:
+    send = bool(_decision_value(decision, "send", False))
+    suppressed_by = _decision_value(decision, "suppressed_by")
+    if send:
+        status = "pending"
+        suppressed_by = None
+    else:
+        status = "suppressed"
+        suppressed_by = suppressed_by or "mismatch"
+    data = (
+        sb_admin()
+        .rpc(
+            "upsert_notification_row",
+            {
+                "p_event_id": event_id,
+                "p_subscription_id": subscription_id,
+                "p_status": status,
+                "p_suppressed_by": suppressed_by,
+                "p_delivery_kind": delivery_kind,
+                "p_delivery_target": delivery_target,
+                "p_decided_payload_version": decided_payload_version,
+                "p_payload_snapshot": payload_snapshot,
+            },
+        )
+        .execute()
+        .data
+    )
+    return data or "noop"
+
+
+def claim_pending_notifications(claim_id: str, limit: int = 20) -> list[ClaimedBundle]:
+    rows = (
+        sb_admin()
+        .rpc(
+            "claim_pending_notifications",
+            {"p_claim_id": claim_id, "p_limit": limit},
+        )
+        .execute()
+        .data
+        or []
+    )
+    bundles: list[ClaimedBundle] = []
+    for row in rows:
+        notification = _dataclass_from_row(Notification, _jsonb_row(row.get("notification")))
+        subscription = _dataclass_from_row(Subscription, _jsonb_row(row.get("subscription")))
+        bundles.append(
+            ClaimedBundle(
+                notification=notification,
+                notif_payload_snapshot=_jsonb_row(row.get("notif_payload_snapshot")),
+                notif_payload_version=int(row.get("notif_payload_version") or notification.decided_payload_version),
+                subscription=subscription,
+            )
+        )
+    return bundles
+
+
+def release_claim(notification_id: int, claim_id: str) -> bool:
+    data = (
+        sb_admin()
+        .rpc("release_claim", {"p_id": notification_id, "p_claim_id": claim_id})
+        .execute()
+        .data
+    )
+    return _rpc_returned_id(data)
+
+
+def mark_sent_if_claimed(
+    notification_id: int,
+    claim_id: str,
+    *,
+    msg_id: str,
+    rendered_text: str,
+) -> bool:
+    data = (
+        sb_admin()
+        .rpc(
+            "mark_sent_if_claimed",
+            {
+                "p_id": notification_id,
+                "p_claim_id": claim_id,
+                "p_msg_id": msg_id,
+                "p_rendered_text": rendered_text,
+            },
+        )
+        .execute()
+        .data
+    )
+    return _rpc_returned_id(data)
+
+
+def mark_failed_if_claimed(notification_id: int, claim_id: str, error: str) -> bool:
+    data = (
+        sb_admin()
+        .rpc(
+            "mark_failed_if_claimed",
+            {"p_id": notification_id, "p_claim_id": claim_id, "p_error": error[:2000]},
+        )
+        .execute()
+        .data
+    )
+    return _rpc_returned_id(data)
+
+
+def reap_stale_claims(stale_after_minutes: int = 5) -> int:
+    data = (
+        sb_admin()
+        .rpc("reap_stale_claims", {"p_stale_after_minutes": stale_after_minutes})
+        .execute()
+        .data
+    )
+    return int(data or 0)
+
+
+def recent_notifications_for_scope(
+    scope_kind: str,
+    scope_id: str,
+    since_minutes: int = 30,
+) -> list[dict[str, Any]]:
+    since = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+    rows = (
+        sb_admin()
+        .table("notifications")
+        .select(
+            "id, event_id, subscription_id, status, suppressed_by, rendered_text, "
+            "decided_at, sent_at, payload_snapshot, delivery_kind, delivery_target, "
+            "subscriptions!inner(scope_kind, scope_id, description)"
+        )
+        .eq("subscriptions.scope_kind", scope_kind)
+        .eq("subscriptions.scope_id", scope_id)
+        .gte("decided_at", since.isoformat())
+        .order("decided_at", desc=True)
+        .limit(100)
+        .execute()
+        .data
+        or []
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("payload_snapshot") or {}
+        out.append(
+            {
+                "id": row.get("id"),
+                "event_id": row.get("event_id"),
+                "subscription_id": row.get("subscription_id"),
+                "status": row.get("status"),
+                "suppressed_by": row.get("suppressed_by"),
+                "decided_at": row.get("decided_at"),
+                "subject_summary": (
+                    row.get("rendered_text")
+                    or payload.get("agent_summary")
+                    or payload.get("user_message")
+                    or ""
+                )[:240],
+                "project_root": payload.get("project_root"),
+            }
+        )
+    return out
+
+
+def daily_sent_count_for_scope(scope_kind: str, scope_id: str, since_local_midnight: str) -> int:
+    rows = (
+        sb_admin()
+        .table("notifications")
+        .select("id, subscriptions!inner(scope_kind, scope_id)")
+        .eq("subscriptions.scope_kind", scope_kind)
+        .eq("subscriptions.scope_id", scope_id)
+        .eq("status", "sent")
+        .gte("sent_at", since_local_midnight)
+        .limit(10000)
+        .execute()
+        .data
+        or []
+    )
+    return len(rows)
+
+
+def lookup_notification_by_feishu_msg_id(msg_id: str) -> Optional[dict[str, Any]]:
+    if not msg_id:
+        return None
+    row = _execute_data(
+        sb_admin()
+        .table("notifications")
+        .select("*, subscriptions(*), events(*)")
+        .eq("feishu_msg_id", msg_id)
+        .maybe_single()
+    )
+    return row or None
+
+
+def fetch_notifications_for_event_subscription_pairs(
+    pairs: set[tuple[int, str]],
+) -> dict[tuple[int, str], dict[str, Any]]:
+    if not pairs:
+        return {}
+    event_ids = sorted({event_id for event_id, _ in pairs})
+    subscription_ids = sorted({subscription_id for _, subscription_id in pairs})
+    rows = (
+        sb_admin()
+        .table("notifications")
+        .select("id, event_id, subscription_id, status, suppressed_by, feishu_msg_id, decided_payload_version")
+        .in_("event_id", event_ids)
+        .in_("subscription_id", subscription_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {
+        (int(row["event_id"]), str(row["subscription_id"])): row
+        for row in rows
+        if (int(row.get("event_id")), str(row.get("subscription_id"))) in pairs
+    }
+
+
+def add_subscription(
+    *,
+    scope_kind: str,
+    scope_id: str,
+    description: str,
+    created_by: str,
+    chat_id: str | None = None,
+) -> dict[str, Any]:
+    res = (
+        sb_admin()
+        .table("subscriptions")
+        .insert(
+            {
+                "scope_kind": scope_kind,
+                "scope_id": scope_id,
+                "description": description,
+                "created_by": created_by,
+                "chat_id": chat_id,
+            }
+        )
+        .execute()
+    )
+    return res.data[0] if res and res.data else {}
+
+
+def list_subscriptions(scope_kind: str, scope_id: str) -> list[dict[str, Any]]:
+    return fetch_subscriptions_for_scope(scope_kind, scope_id)
+
+
+def update_subscription(
+    subscription_id: str,
+    scope_kind: str,
+    scope_id: str,
+    **fields_to_update: Any,
+) -> Optional[dict[str, Any]]:
+    payload = {
+        k: v
+        for k, v in fields_to_update.items()
+        if k in {"description", "enabled"} and v is not None
+    }
+    if not payload:
+        return get_subscription_in_scope(subscription_id, scope_kind, scope_id)
+    payload["updated_at"] = _utc_now_iso()
+    res = (
+        sb_admin()
+        .table("subscriptions")
+        .update(payload)
+        .eq("id", subscription_id)
+        .eq("scope_kind", scope_kind)
+        .eq("scope_id", scope_id)
+        .execute()
+    )
+    return res.data[0] if res and res.data else None
+
+
+def get_subscription_in_scope(
+    subscription_id: str,
+    scope_kind: str,
+    scope_id: str,
+) -> Optional[dict[str, Any]]:
+    row = _execute_data(
+        sb_admin()
+        .table("subscriptions")
+        .select("*")
+        .eq("id", subscription_id)
+        .eq("scope_kind", scope_kind)
+        .eq("scope_id", scope_id)
+        .maybe_single()
+    )
+    return row or None
+
+
+def remove_subscription(subscription_id: str, scope_kind: str, scope_id: str) -> Optional[dict[str, Any]]:
+    return update_subscription(subscription_id, scope_kind, scope_id, enabled=False)
+
+
+def feishu_link_for_user_id(user_id: str) -> Optional[dict[str, Any]]:
+    if not user_id:
+        return None
+    res = (
+        sb_admin()
+        .table("feishu_links")
+        .select(
+            "user_id, feishu_open_id, feishu_name, feishu_email, "
+            "feishu_mobile, timezone, profiles!inner(handle, display_name)"
+        )
+        .eq("user_id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    if not res or not res.data:
+        return None
+    row = _feishu_link_row_to_person(res.data)
+    row["timezone"] = res.data.get("timezone") or "Asia/Shanghai"
+    return row
+
+
+def resolve_subject_open_id(user_id: str) -> dict[str, Any]:
+    linked = feishu_link_for_user_id(user_id)
+    if not linked:
+        profile = lookup_profile_by_user_id(user_id) or {}
+        return {
+            "open_id": None,
+            "display_name": profile.get("display_name") or profile.get("handle"),
+            "handle": profile.get("handle"),
+        }
+    return {
+        "open_id": linked.get("open_id"),
+        "display_name": linked.get("display_name") or linked.get("handle"),
+        "handle": linked.get("handle"),
+    }
+
+
+def recent_decision_logs_for_scope(
+    scope_kind: str,
+    scope_id: str,
+    *,
+    since_hours: int = 24,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    rows = (
+        sb_admin()
+        .table("decision_logs")
+        .select(
+            "*, subscriptions!inner(scope_kind, scope_id, description)"
+        )
+        .eq("subscriptions.scope_kind", scope_kind)
+        .eq("subscriptions.scope_id", scope_id)
+        .gte("created_at", since.isoformat())
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    pairs = {
+        (int(row["event_id"]), str(row["subscription_id"]))
+        for row in rows
+        if row.get("event_id") is not None and row.get("subscription_id")
+    }
+    current_by_pair = fetch_notifications_for_event_subscription_pairs(pairs)
+    for row in rows:
+        current = current_by_pair.get((int(row.get("event_id")), str(row.get("subscription_id"))))
+        row["current_notification"] = {
+            "status": current.get("status"),
+            "suppressed_by": current.get("suppressed_by"),
+            "feishu_msg_id": current.get("feishu_msg_id"),
+            "decided_payload_version": current.get("decided_payload_version"),
+        } if current else None
+    return rows
+
+
+def judge_parse_failure_count(event_id: int, subscription_id: str, payload_version: int) -> int:
+    rows = (
+        sb_admin()
+        .table("decision_logs")
+        .select("id, judge_output")
+        .eq("event_id", event_id)
+        .eq("subscription_id", subscription_id)
+        .eq("payload_version", payload_version)
+        .order("created_at", desc=True)
+        .limit(10)
+        .execute()
+        .data
+        or []
+    )
+    return sum(
+        1
+        for row in rows
+        if (row.get("judge_output") or {}).get("suppressed_by") == "judge_parse_error"
+    )

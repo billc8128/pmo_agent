@@ -57,6 +57,7 @@ class ParsedMessageEvent:
     sender_open_id: str
     sender_chat_member_id: Optional[str]  # in groups, the chat-member id
     message_id: str
+    parent_message_id: str
     text: str                 # whitespace-trimmed, @-mentions stripped
     is_at_bot: bool
 
@@ -172,6 +173,7 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
         sender_open_id=sender_open_id,
         sender_chat_member_id=msg.get("chat_member_id"),
         message_id=msg.get("message_id") or "",
+        parent_message_id=msg.get("parent_id") or "",
         text=text,
         is_at_bot=is_at_bot,
     )

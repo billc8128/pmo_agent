@@ -17,6 +17,7 @@ PatchMessage rate limit.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -25,6 +26,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from agent import decider_loop, delivery_loop
 from agent import runner as agent_runner
 from config import settings
 from db import queries as db_queries
@@ -63,10 +65,14 @@ async def lifespan(app: FastAPI):
         )
 
     gc_task = asyncio.create_task(_gc_loop())
+    decider_task = asyncio.create_task(decider_loop.run_forever())
+    delivery_task = asyncio.create_task(delivery_loop.run_forever())
     try:
         yield
     finally:
-        gc_task.cancel()
+        for task in (gc_task, decider_task, delivery_task):
+            task.cancel()
+        await asyncio.gather(gc_task, decider_task, delivery_task, return_exceptions=True)
         await agent_runner.shutdown_all()
         logger.info("pmo-bot stopped")
 
@@ -142,7 +148,14 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         # — just log and proceed without identity context.
         logger.warning("feishu_links lookup failed for %s: %s", ev.sender_open_id, e)
 
-    framed_question = _frame_question(ev.text, sender_identity)
+    parent_notification = None
+    if ev.parent_message_id:
+        try:
+            parent_notification = db_queries.lookup_notification_by_feishu_msg_id(ev.parent_message_id)
+        except Exception as e:
+            logger.warning("parent notification lookup failed for %s: %s", ev.parent_message_id, e)
+
+    framed_question = _frame_question(ev.text, sender_identity, parent_notification=parent_notification)
 
     # 1) ack with reaction (don't await — non-blocking, best-effort).
     asyncio.create_task(feishu_client.add_reaction(ev.message_id, "Get"))
@@ -161,7 +174,10 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
                     framed_question,
                     message_id=ev.message_id,
                     chat_id=ev.chat_id,
+                    chat_type=ev.chat_type,
                     sender_open_id=ev.sender_open_id,
+                    asker_user_id=(sender_identity or {}).get("user_id"),
+                    asker_handle=(sender_identity or {}).get("handle"),
                 ),
                 timeout=settings.agent_max_duration_seconds,
             )
@@ -192,7 +208,10 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
             framed_question,
             message_id=ev.message_id,
             chat_id=ev.chat_id,
+            chat_type=ev.chat_type,
             sender_open_id=ev.sender_open_id,
+            asker_user_id=(sender_identity or {}).get("user_id"),
+            asker_handle=(sender_identity or {}).get("handle"),
         ):
             if event["kind"] == "tool":
                 # Mark previous tool as done — the LLM has moved on.
@@ -241,7 +260,12 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
     await _send_answer_with_images(parent_message_id=ev.message_id, text=final_text)
 
 
-def _frame_question(text: str, sender: dict | None) -> str:
+def _frame_question(
+    text: str,
+    sender: dict | None,
+    *,
+    parent_notification: dict | None = None,
+) -> str:
     """Prepend a structured "who is asking" line to the user's text.
 
     The LLM treats this as ground truth context: when the user says
@@ -261,7 +285,33 @@ def _frame_question(text: str, sender: dict | None) -> str:
         )
     else:
         meta = "[asker] (this Feishu user has not bound their pmo_agent account yet)"
-    return f"{meta}\n\n{text}"
+    framed = f"{meta}\n\n{text}"
+    if parent_notification:
+        event_row = parent_notification.get("events") or {}
+        snapshot = {
+            "notification": {
+                "id": parent_notification.get("id"),
+                "status": parent_notification.get("status"),
+                "decided_at": parent_notification.get("decided_at"),
+                "rendered_text": parent_notification.get("rendered_text"),
+            },
+            "subscription": parent_notification.get("subscriptions"),
+            "event": {
+                "id": event_row.get("id"),
+                "source": event_row.get("source"),
+                "source_id": event_row.get("source_id"),
+                "user_id": event_row.get("user_id"),
+                "project_root": event_row.get("project_root"),
+                "occurred_at": event_row.get("occurred_at"),
+            },
+            "payload_snapshot": parent_notification.get("payload_snapshot") or event_row.get("payload"),
+        }
+        framed += "\n\n[parent_notification]\n" + json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            default=str,
+        )
+    return framed
 
 
 # Pattern: [IMAGE:img_v2_abc...] anywhere in the text. We're loose

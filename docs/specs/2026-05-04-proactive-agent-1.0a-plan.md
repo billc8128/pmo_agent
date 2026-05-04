@@ -95,9 +95,12 @@ untouched:
     - a non-null `notification` jsonb whose `id` matches the
       pending row from step 11
     - a non-null `notif_payload_snapshot` jsonb that EQUALS the
-      payload passed to upsert in step 11 (NOT a join from
-      events.payload — verify by mutating events.payload between
-      steps 11 and 12 and confirming the snapshot is the original)
+      payload passed to upsert in step 11. To prove this is NOT a
+      join from current `events.payload`, update only the `events`
+      row's `payload` JSON between steps 11 and 12 **without
+      bumping `events.payload_version`** (direct SQL against the
+      `events` row, not a `turns` update that would fire the trigger),
+      then confirm the snapshot is still the original.
     - `notif_payload_version` = 1
     - a non-null `subscription` jsonb whose `id` matches step 10
 
@@ -193,7 +196,7 @@ profile has a timezone configured).
     `sb_admin().rpc("upsert_notification_row", {...})`.
   - `claim_pending_notifications(claim_id, limit)` — RPC wrapper
     around the `claim_pending_notifications` SQL function (§2.8);
-    that's where `for update skip locked` AND the version-match
+    that's where `for update of n2 skip locked` AND the version-match
     guard live. Returns each claimed row joined with the **frozen
     payload snapshot** from decision time (NOT current
     events.payload), the version that snapshot represents, and the
@@ -280,6 +283,10 @@ Responsibilities:
 - Call the LLM (re-uses ARK Coding Plan via existing
   `ANTHROPIC_*` env), expecting JSON output
 - Parse the JSON robustly (model may wrap in code fences)
+- Cap repeated JSON parse failures: after 3 parse failures for the
+  same `(event_id, subscription_id, payload_version)`, write
+  `suppressed_by='judge_failure'` and settle that pair rather than
+  retrying indefinitely.
 - Return `Decision` dataclass
 
 Public API:
@@ -467,15 +474,25 @@ Wires §3.2 of spec. Each iteration:
    to `pending` (delivery worker probably crashed).
 2. Atomically claim up to 20 `pending` rows: pending → claimed,
    stamping `claim_id` and `claimed_at`. Use
-   `for update skip locked` so future multi-worker setups cooperate.
+   `for update of n2 skip locked` so future multi-worker setups
+   cooperate without unnecessarily locking joined `events` rows.
 3. For each claimed row: render with the renderer (§5), send via
    `send_to_user` / `send_to_chat`, then `mark_sent_if_claimed`
    (UPDATE WHERE claim_id = ours AND status = 'claimed') so the
    commit fails cleanly if the lease was somehow lost.
-4. On transient errors (5xx, network) → release the lease (status
-   back to pending, claim_id null) so next iteration retries.
-5. On permanent errors → `mark_failed_if_claimed` (same lease
-   guard).
+4. On transient errors (5xx, network, 429) → release the lease
+   (status back to pending, claim_id null) so next iteration retries.
+   Do not perform inline sleep/backoff retries inside the row loop;
+   otherwise a batch of transient failures can block the whole
+   delivery loop for minutes.
+5. On permanent errors (4xx non-rate-limit, renderer empty output,
+   renderer timeout) → `mark_failed_if_claimed` (same lease guard).
+6. On unexpected row-level exceptions (SDK parse error, malformed
+   payload) → log with `notif.id`, release the lease immediately, and
+   keep processing the remaining claimed rows.
+7. Wrap the whole iteration in an outer `try/except Exception`; on
+   DB/RPC/shape failures log, sleep 60s, and continue so the
+   background `create_task` never dies silently.
 
 The lease is what stops a stale `pending` (one that the decider
 has since rewritten on a new payload version) from being delivered:
@@ -489,9 +506,10 @@ either freezes (sent) or rewrites (back to pending).
 
 DB helpers needed in queries.py:
 - `claim_pending_notifications(claim_id, limit)` — wraps the §2.8
-  RPC that does the atomic pending → claimed transition AND joins
-  the event payload + subscription so the delivery loop has every-
-  thing for the renderer in one trip. Returns
+  RPC that does the atomic pending → claimed transition AND returns
+  the frozen `payload_snapshot` + subscription so the delivery loop
+  has everything for the renderer in one trip without reading current
+  `events.payload`. Returns
   `list[ClaimedBundle]`.
 - `release_claim(notification_id, claim_id)` — flips `claimed`
   back to `pending` and clears the lease columns
@@ -503,7 +521,10 @@ DB helpers needed in queries.py:
 delivered to the right Feishu chat within ~30 seconds. A second
 test: insert a fake stale `claimed` row with `claimed_at` 10
 minutes old; observe it reaped back to `pending` on the next
-iteration.
+iteration. A third test: make `render_notification` raise an
+unexpected `RuntimeError` for one claimed row; verify the delivery
+loop logs, releases that row back to `pending`, continues processing
+other rows, and is still alive for the next iteration.
 
 ---
 
