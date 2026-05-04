@@ -410,29 +410,46 @@ PL/pgSQL **RPC functions** in the migration. Python helpers in
 Functions:
 
 ```sql
--- Atomic pending → claimed transition for up to N rows.
--- Returns the claimed rows so the caller can render them.
+-- Atomic pending → claimed transition for up to N rows. Returns
+-- each claimed row PLUS the joined event payload and subscription
+-- so the caller's renderer doesn't have to do a second roundtrip.
+-- (Renderer API in plan §5 takes notif_row + event_payload +
+-- subscription; this returns all three.)
 create function claim_pending_notifications(
     p_claim_id uuid,
     p_limit    int
-) returns setof notifications
+) returns table (
+    notification           notifications,
+    event_payload          jsonb,
+    event_payload_version  int,
+    subscription           subscriptions
+)
 language plpgsql
 security definer
 as $$
 begin
     return query
-    update notifications n
-       set status = 'claimed',
-           claim_id = p_claim_id,
-           claimed_at = now()
-     where n.id in (
-        select id from notifications
-         where status = 'pending'
-         order by decided_at
-         limit p_limit
-         for update skip locked
-     )
-     returning n.*;
+    with claimed as (
+        update notifications n
+           set status = 'claimed',
+               claim_id = p_claim_id,
+               claimed_at = now()
+         where n.id in (
+            select id from notifications
+             where status = 'pending'
+             order by decided_at
+             limit p_limit
+             for update skip locked
+         )
+        returning n.*
+    )
+    select c.*::notifications,
+           e.payload,
+           e.payload_version,
+           s.*::subscriptions
+      from claimed c
+      join events        e on e.id = c.event_id
+      join subscriptions s on s.id = c.subscription_id;
 end $$;
 
 -- Conditional commit: only succeeds if the lease is still ours.
@@ -854,42 +871,46 @@ decider rewriting the same row.
 async def delivery_loop():
     while True:
         await asyncio.sleep(15)
+        # Reap stale claims first (worker crashed >5min ago).
+        reap_stale_claims()
         # Claim up to 20 rows atomically: pending → claimed.
         claim_id = uuid4()
-        rows = claim_pending_notifications(claim_id, limit=20)
-        for row in rows:
-            # row.claim_id == claim_id at this point
+        # Each ClaimedBundle bundles the notification + joined event
+        # payload + subscription, so the renderer has all the context
+        # it needs without a second DB roundtrip.
+        bundles = claim_pending_notifications(claim_id, limit=20)
+        for b in bundles:
+            notif = b.notification
             try:
-                text = await render_notification(row)
+                text = await render_notification(
+                    notif_row=notif,
+                    event_payload=b.event_payload,
+                    subscription=b.subscription,
+                )
 
-                # Idempotency: pass a stable uuid derived from the
-                # notification id PLUS the decided_payload_version.
-                # Same version → same uuid → Feishu dedupes (good,
-                # crash-after-send won't double-send). Different
-                # version → different uuid → Feishu treats as a
-                # fresh message (also good: a v2 rewrite is a
-                # fundamentally different notification body and
-                # SHOULD reach the user, not get suppressed by a
-                # v1 dedup hit). See deliver() spec below.
+                # Idempotency: stable uuid from (id, version) so a
+                # crash-after-send doesn't double-send AND a v2
+                # rewrite isn't silently dedupe-d into the v1
+                # message Feishu still has cached.
                 feishu_idempotency_uuid = stable_uuid_from_notif(
-                    row.id, row.decided_payload_version,
+                    notif.id, notif.decided_payload_version,
                 )
 
                 msg_id = await deliver(
-                    row, text,
+                    notif, text,
                     idempotency_uuid=feishu_idempotency_uuid,
                 )
                 # Conditional commit — only if our lease is still
                 # the one on the row.
                 ok = await mark_sent_if_claimed(
-                    row.id, claim_id, msg_id=msg_id, rendered_text=text,
+                    notif.id, claim_id, msg_id=msg_id, rendered_text=text,
                 )
                 if not ok:
-                    log.warning("notif %s claim lost; skipping", row.id)
+                    log.warning("notif %s claim lost; skipping", notif.id)
             except TransientError:
-                release_claim(row.id, claim_id)
+                release_claim(notif.id, claim_id)
             except PermanentError as e:
-                mark_failed_if_claimed(row.id, claim_id, error=str(e))
+                mark_failed_if_claimed(notif.id, claim_id, error=str(e))
 ```
 
 **Crash-safe send (at-most-once, with caveat)**:
@@ -926,29 +947,16 @@ is rare and worth a dup over silent data loss. If this becomes a
 problem in production we add a Feishu-msg-id read-back ("did we
 already send this notification?") before the second send.
 
-`claim_pending_notifications(claim_id, limit)` does:
+`claim_pending_notifications`, `mark_sent_if_claimed`,
+`mark_failed_if_claimed`, `release_claim`, and `reap_stale_claims`
+are all defined in §2.8 (Postgres SECURITY DEFINER RPCs). The
+shape of the claim function's join return — notification +
+event_payload + subscription per row — is what the delivery loop
+above destructures into `b.notification`, `b.event_payload`,
+`b.subscription` for the renderer.
 
-```sql
-update notifications
-   set status = 'claimed',
-       claim_id = $claim_id,
-       claimed_at = now()
- where id in (
-       select id from notifications
-        where status = 'pending'
-        order by decided_at
-        limit $limit
-        for update skip locked
-   )
-returning *;
-```
-
-The `for update skip locked` lets multiple workers (when we run
-more than one in 1.0c+) cooperate without blocking. Today only one
-process runs the loop, so it's mainly future-proofing.
-
-`mark_sent_if_claimed` and `mark_failed_if_claimed` use a
-conditional UPDATE:
+The conditional UPDATE pattern used by mark_sent_if_claimed /
+mark_failed_if_claimed looks like:
 
 ```sql
 update notifications

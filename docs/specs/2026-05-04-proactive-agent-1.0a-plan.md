@@ -155,13 +155,22 @@ profile has a timezone configured).
   - `upsert_notification_row(event_id, sub_id, decision,
                              decided_payload_version)` — thin
     wrapper around the `upsert_notification_row` SQL RPC defined in
-    spec §2.8. The RPC enforces the rewrite table from §2.4
-    transactionally (read existing row with `for update`, branch on
-    status + version, INSERT or UPDATE accordingly). Python helper
-    just calls `sb_admin().rpc("upsert_notification_row", {...})`.
+    spec §2.8. The RPC is a single-statement
+    `INSERT … ON CONFLICT (event_id, subscription_id) DO UPDATE
+    WHERE …` with the §2.4 rewrite predicate in the WHERE clause
+    and a CTE that returns 'inserted' / 'updated' / 'noop'. No
+    SELECT FOR UPDATE — concurrent decider workers safely race
+    through the unique constraint. Python helper just calls
+    `sb_admin().rpc("upsert_notification_row", {...})`.
   - `claim_pending_notifications(claim_id, limit)` — RPC wrapper
     around the `claim_pending_notifications` SQL function (§2.8);
-    that's where `for update skip locked` lives.
+    that's where `for update skip locked` lives. Returns each
+    claimed row joined with `event_payload`, `event_payload_version`,
+    and the full `subscription` row, so the delivery loop has every-
+    thing the renderer needs without a second roundtrip. The Python
+    wrapper deserialises each result into a `ClaimedBundle` dataclass
+    with `.notification`, `.event_payload`, `.subscription`
+    attributes.
   - `release_claim(id, claim_id)` — RPC wrapper
   - `mark_sent_if_claimed(id, claim_id, msg_id, text)` — RPC
     wrapper; the SQL function returns NULL on lost lease so the
@@ -347,9 +356,19 @@ Both call `/open-apis/im/v1/messages?receive_id_type=...` with
 `msg_type=post`. When `idempotency_uuid` is provided, also include
 `uuid=<idempotency_uuid>` as a query parameter — Feishu uses it for
 ~1h server-side dedup of (app, receive_id, uuid) tuples. The
-delivery loop (§7) sets this to a deterministic UUIDv5 derived from
-`notification.id`, so a process crash between send and DB mark
-doesn't double-send.
+delivery loop (§7) sets this via
+`stable_uuid_from_notif(notification.id, decided_payload_version)`,
+so:
+- a process crash between send and DB mark on the **same**
+  payload_version doesn't double-send (same uuid → Feishu returns
+  the original message_id);
+- a v2 rewrite of the same notification row gets a **different**
+  uuid and is delivered as a fresh message rather than getting
+  silently dedupe-d into the v1 cached message.
+
+Add a unit test that asserts
+`stable_uuid_from_notif(42, 1) != stable_uuid_from_notif(42, 2)`
+and that both are stable across calls.
 
 Returns the new `message_id` on success. Note the Feishu API may
 return the *previously-sent* message_id when an idempotent retry
@@ -401,8 +420,11 @@ the next decider iteration sees the higher payload_version and
 either freezes (sent) or rewrites (back to pending).
 
 DB helpers needed in queries.py:
-- `claim_pending_notifications(claim_id, limit)` — does the
-  conditional UPDATE described in spec §3.2
+- `claim_pending_notifications(claim_id, limit)` — wraps the §2.8
+  RPC that does the atomic pending → claimed transition AND joins
+  the event payload + subscription so the delivery loop has every-
+  thing for the renderer in one trip. Returns
+  `list[ClaimedBundle]`.
 - `release_claim(notification_id, claim_id)` — flips `claimed`
   back to `pending` and clears the lease columns
 - `mark_sent_if_claimed(notification_id, claim_id, msg_id, text)`
@@ -549,6 +571,40 @@ Concrete script:
     another similar vibelive turn within 5 minutes; verify the
     second event is suppressed `duplicate_in_window` and references
     the first notification's `decided_at` in its `reason`.
+14. **had_blocking_claim regression** (covers spec §3.1's stale
+    claimed handling): walk the system through this exact sequence
+    and assert each waypoint:
+    a. Insert a vibelive turn with `agent_summary` already filled
+       in. Wait for the decider to write a `pending` notification
+       at `decided_payload_version=1` and for the delivery loop to
+       claim it (`status='claimed'`). Pause delivery before it
+       calls Feishu (e.g. set a breakpoint, or run delivery with
+       a stub renderer that hangs).
+    b. While the row is `claimed` at v1, UPDATE the turn to change
+       its `agent_summary` to materially different content. Verify
+       `events.payload_version` advanced to 2 (per the trigger's
+       fingerprint logic).
+    c. Run one decider iteration. Assert:
+       - `had_blocking_claim` was set true for this event
+         (instrument the decider log, OR verify by checking
+         `events.processed_version` is still 1, NOT 2)
+       - The `claimed` notification row was NOT touched
+       - `events.processed_at` is NOT updated to a fresh timestamp
+         tied to v2
+    d. Release the renderer stub so delivery completes. Two
+       sub-cases:
+       - Delivery succeeds → notification becomes `sent`,
+         frozen at v1 forever (we can't unsend). Run decider again,
+         assert `events.processed_version` advances to 2 with the
+         frozen-sent row left untouched.
+       - Delivery transient-fails → notification falls back to
+         `pending` at v1. Run decider again, assert
+         `had_blocking_claim` is now FALSE (no claim), the v1
+         pending row gets rewritten via `upsert_notification_row`
+         to v2, and `events.processed_version` advances to 2.
+    Without the `had_blocking_claim` flag, sub-case (d.transient)
+    would deadlock — the row stays at v1 pending forever because
+    the event already got marked processed at v2 in step (c).
 
 If any step fails: triage in the order of decider prompt → judge
 JSON parsing → renderer prompt → delivery wiring → tool
