@@ -59,9 +59,17 @@ alter table feishu_links
     add column timezone text not null default 'Asia/Shanghai';
 ```
 
-The OAuth callback already pulls `userJson.data.timezone` if
-present; we plumb that through. Default is the most common case for
-this team (also matches user decision #4).
+The default is `Asia/Shanghai` (per user decision #4 — the most
+common case for this team). The OAuth callback today does NOT
+extract `timezone` from the Feishu user_info response (see current
+`web/app/api/feishu/oauth/callback/route.ts`); part of this slice
+is to extend that callback to also read `userJson.data.timezone`
+and include it in the `feishu_links` upsert. Plan §1.7 covers
+that change.
+
+If Feishu's user_info doesn't return a timezone for a given user
+(some accounts don't set one), the column stays at its default and
+the user can later override it via the web UI in 1.0b.
 
 ### 2.2 `events` — append-only signal stream
 
@@ -103,12 +111,25 @@ bumps `payload_version` only when fields the decider actually reads
 change (`agent_summary`, `agent_response_full`) — not on every
 trivial update.
 
-For each (event, subscription) pair, the unique constraint on
-`notifications(event_id, subscription_id)` means re-deciding is
-idempotent: if we already wrote a `pending` or `sent` row, the
-re-decision either rewrites it (still pending, hasn't gone out) or
-no-ops (already sent, can't unsend). The decider checks
-notification status before overwriting.
+**Notification rewrite rules** (enforced in `upsert_notification_row`):
+
+| Existing status | New decided version | Action |
+|-----------------|---------------------|--------|
+| (no row)        | any                 | INSERT |
+| `pending`       | > old               | UPDATE in place — decision changed but nothing has gone out yet |
+| `pending`       | ≤ old               | no-op (already evaluated this version) |
+| `suppressed`    | > old               | UPDATE in place — late summary changed our mind |
+| `suppressed`    | ≤ old               | no-op |
+| `failed`        | > old               | UPDATE in place — retry on better payload |
+| `failed`        | ≤ old               | no-op |
+| `sent`          | any                 | no-op — can't unsend, freeze the record |
+
+This is what makes the late-summary regression test (validation
+step 12) pass: the first decision writes `suppressed/mismatch`
+with `decided_payload_version=1`; when the summary arrives and
+`payload_version` becomes 2, the decider re-judges, gets a `send`
+verdict, and the upsert rewrites the row to `pending` with
+`decided_payload_version=2`.
 
 For 1.0a only one source exists: `source = 'turn'`, `source_id =
 turns.id::text`. The trigger lives in §2.5.
@@ -169,9 +190,15 @@ create table notifications (
     delivery_kind   text,                  -- 'feishu_user' | 'feishu_chat'
     delivery_target text,                  -- open_id or chat_id
     decided_at      timestamptz not null default now(),
+    -- Which payload_version of the underlying event this decision was
+    -- made on. Lets us replace stale decisions when the event payload
+    -- gets a meaningful update (e.g. agent_summary arrives late).
+    decided_payload_version int not null default 1,
     sent_at         timestamptz,
     error           text,
-    -- Idempotency guard: at most one notification per (event, subscription)
+    -- Idempotency guard: at most one notification row per
+    -- (event, subscription); re-decisions overwrite in place when
+    -- allowed by the rewrite rules below.
     constraint notif_event_sub_uniq unique (event_id, subscription_id)
 );
 
@@ -226,13 +253,17 @@ create function on_turn_to_event() returns trigger as $$
 declare
     payload_significantly_changed boolean;
 begin
-    -- Only bump payload_version when fields the decider actually reads
-    -- changed. Pure metadata updates (last_seen_at etc.) shouldn't
-    -- trigger reprocessing.
-    payload_significantly_changed :=
-        (tg_op = 'INSERT') or
-        (coalesce(old.agent_summary, '')      is distinct from coalesce(new.agent_summary, '')) or
-        (coalesce(old.agent_response_full,'') is distinct from coalesce(new.agent_response_full, ''));
+    -- Compute "did decider-relevant fields actually change?" Branch
+    -- explicitly on TG_OP so we never reference OLD on INSERT.
+    if tg_op = 'INSERT' then
+        payload_significantly_changed := true;
+    else
+        payload_significantly_changed :=
+            (coalesce(old.agent_summary, '')
+                is distinct from coalesce(new.agent_summary, ''))
+            or (coalesce(old.agent_response_full, '')
+                is distinct from coalesce(new.agent_response_full, ''));
+    end if;
 
     insert into events (source, source_id, user_id, project_root,
                         occurred_at, payload, payload_version)
@@ -256,7 +287,8 @@ begin
     on conflict (source, source_id) do update
         set payload = excluded.payload,
             payload_version = case
-                when payload_significantly_changed then events.payload_version + 1
+                when payload_significantly_changed
+                    then events.payload_version + 1
                 else events.payload_version
             end,
             ingested_at = case
@@ -315,22 +347,41 @@ async def decider_loop():
         await asyncio.sleep(30)
         # "unprocessed" = never decided OR decided on a stale payload_version
         events = fetch_events_needing_decision(limit=100)
+        if not events:
+            continue
+
+        # Pull ALL enabled subscriptions once per loop iteration —
+        # not per event, not by event scope. An event about albert's
+        # vibelive turn must reach every user / chat with a relevant
+        # subscription, regardless of where the event originated.
+        all_subs = fetch_all_enabled_subscriptions()
+        # Group by (scope_kind, scope_id) so we can give the judge
+        # the full sibling rule set per owner.
+        subs_by_scope = group_by_scope(all_subs)
+
         for ev in events:
-            for sub in fetch_enabled_subscriptions(scope=event_scope(ev)):
-                existing = get_notification(ev.id, sub.id)
-                if existing and existing.status == 'sent':
-                    # Already delivered — can't unsend, leave it
-                    continue
-                if existing and existing.status == 'pending':
-                    # We decided last round but haven't delivered yet
-                    # (payload changed between decision and render);
-                    # rewrite the row in place if the new decision
-                    # disagrees, else leave as-is
-                    pass
-                decision = await judge(ev, sub, context_for(sub))
-                write_decision_log(ev, sub, decision, model, latency)
-                upsert_notification_row(ev, sub, decision)
-            mark_event_processed(ev.id, ev.payload_version)
+            decided_version = ev.payload_version
+            for scope_key, scope_subs in subs_by_scope.items():
+                # Each sub in this group is a candidate; the rest of
+                # the group is sibling context (exclusions, quiet
+                # hours, etc).
+                for candidate in scope_subs:
+                    siblings = [s for s in scope_subs if s.id != candidate.id]
+                    existing = get_notification(ev.id, candidate.id)
+                    if existing and existing.status == 'sent':
+                        # Already delivered — can't unsend
+                        continue
+                    if existing and existing.decided_payload_version >= decided_version:
+                        # Already evaluated this exact payload version
+                        # for this (event, candidate) pair
+                        continue
+                    decision = await judge(ev, candidate, siblings,
+                                           context_for(scope_key))
+                    write_decision_log(ev, candidate, decision,
+                                       model, latency, tokens)
+                    upsert_notification_row(ev, candidate, decision,
+                                            decided_version)
+            mark_event_processed(ev.id, decided_version)
 ```
 
 `mark_event_processed(event_id, version)` does:
@@ -341,7 +392,9 @@ update events
 ```
 
 So a later UPDATE to that turn row that bumps `payload_version`
-will pull the event back into `fetch_events_needing_decision`.
+will pull the event back into `fetch_events_needing_decision`, and
+the per-(event, candidate) `decided_payload_version` guard ensures
+each candidate is re-judged exactly once per real payload change.
 
 `context_for(sub)` is the bundle the judge needs. Critically, the
 judge sees **all of the owner's preferences**, not just the
@@ -357,12 +410,22 @@ suppress matches from a *different* row. Concretely:
   newest-first. These contain exclusions ("项目 C 不要"), quiet-hours
   ("今晚别打扰我"), and other modifiers that must veto the candidate
   if applicable.
-- **Recent notifications for this scope** (last 30min, with
-  per-row `decided_at` ISO timestamps so the 5-min dedup rule can
-  actually be applied): payload + status (sent / suppressed) so the
-  judge can dedup against earlier deliveries AND avoid reasoning
-  itself in circles by re-suppressing things already suppressed for
-  the same reason.
+- **Recent notifications for this scope** (last 30min). Each
+  row carries:
+    - `decided_at` (so the 5-min dedup rule has actual timestamps)
+    - `event_id` (so the judge can ignore prior decisions about
+      *the same* event when re-judging on a new payload version —
+      otherwise a `suppressed/mismatch` row from version 1 would
+      block version 2's send)
+    - `status` (`sent` / `suppressed` / `pending` / `failed`)
+    - `subject_summary` (one line of the rendered or candidate text)
+    - `project_root`
+    - `suppressed_by` (when applicable)
+  The judge MUST ignore rows where `event_id == current_event.id`
+  when applying duplicate-window logic, and MUST NOT count
+  `suppressed/mismatch` rows as occupying the dedup slot at all
+  (they didn't actually disturb the user). This is enforced by the
+  prompt; see §4.1.
 - **Daily count** for the owner (notifications with status='sent'
   since local-midnight in the owner's timezone).
 - **Owner wall clock** in their timezone.
@@ -488,10 +551,11 @@ function. Pseudocode:
   owner_today_sent_count: {今天已**实际发出**（status='sent'）的通知数}
   owner_recent_notifications: [
     { decided_at: "2026-05-04T23:30:00+08:00",
-      status: "sent" | "suppressed",
+      event_id: 12345,
+      status: "sent" | "suppressed" | "pending" | "failed",
       subject_summary: "albert 在 vibelive 调播放器 buffer",
       project_root: "/Users/.../vibelive",
-      suppressed_by: null | "..." },
+      suppressed_by: null | "duplicate_in_window" | "quiet_hours" | ... },
     ...
   ]   # last 30 minutes; 用 decided_at 判去重时间窗
 
@@ -513,9 +577,15 @@ function. Pseudocode:
    一条会因当前事件或当前时间触发否定（"项目 X 不要"、"凌晨别打扰"、
    "周末不发"等）。命中就 send=false，suppressed_by 取最贴切的那个
    分类（"explicit_exclude" 或 "quiet_hours"）。
-2. **去重**：扫 owner_recent_notifications，看 decided_at 在 5 分钟内
-   且 subject 同主题的条目（status 不限 sent/suppressed 都算占住坑）。
-   命中 → send=false, suppressed_by="duplicate_in_window"。
+2. **去重**：扫 owner_recent_notifications，看 decided_at 在 5 分钟
+   内且 subject 同主题的条目。注意两条排除项：
+   - **跳过 event_id == 当前事件的所有旧记录**——这是同一个事件被
+     payload_version 更新后重判，不该自己挡自己。
+   - **跳过 status == 'suppressed' 且 suppressed_by == 'mismatch'
+     的记录**——那次没真正打扰用户，不占去重坑。
+   余下条目里若有 5 分钟内同主题的 → send=false,
+   suppressed_by="duplicate_in_window"，reason 必须引用被命中的那条
+   通知的 decided_at。
 3. **每日上限**：owner_today_sent_count >= 20 → send=false,
    suppressed_by="daily_cap"。除非 sibling rules 里写了"重要事件
    break through"。

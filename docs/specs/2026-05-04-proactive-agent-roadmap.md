@@ -184,9 +184,18 @@ re-design and must be reconsidered explicitly.
 
 1. **One bot, one Feishu app**. Push and pull share the same
    identity, the same conversation history.
-2. **Events are append-only**. Every signal (turn, push, future)
-   becomes a row in `events`. Sources are pluggable; consumers don't
-   know or care where an event came from.
+2. **Event identity is append-only; payload is a versioned
+   projection.** Every signal (turn, push, future) creates exactly
+   one `events` row, identified by `(source, source_id)`. That row
+   never disappears or splits. The `payload` column is a denormalised
+   projection of the source — it is allowed to be rewritten when the
+   source updates (e.g. `agent_summary` arrives 30s after the turn
+   insert), and a `payload_version` integer tracks how many such
+   rewrites have happened. The decider's per-(event, subscription)
+   record stores which payload version it judged on, so a meaningful
+   payload update is reconsidered without ever creating duplicate
+   rows. Sources are pluggable; consumers don't know or care where
+   an event came from.
 3. **Subscriptions are natural language**. We store the user's
    verbatim text in `subscriptions.description`; we never parse it
    into structured rules. Interpretation is the LLM's job, every
@@ -245,8 +254,11 @@ re-design and must be reconsidered explicitly.
 - **Subscription**: a (scope_kind, scope_id, description, enabled)
   row. The description is user's natural language; nothing else
   parses it.
-- **Event**: an append-only row representing one happened thing
-  (turn / push / …). Has a `source` and `payload`.
+- **Event**: a row representing one happened thing (turn / push /
+  …). Identified by `(source, source_id)` — that identity never
+  changes. Carries a `payload` projection of the source data and
+  a `payload_version` integer; both are allowed to mutate when the
+  source updates.
 - **Notification**: a (event_id, subscription_id, status,
   rendered_text, …) row representing one decision. May or may not
   have been delivered, depending on `status`.

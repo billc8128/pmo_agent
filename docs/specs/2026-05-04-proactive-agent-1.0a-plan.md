@@ -38,14 +38,56 @@ source of truth for **build order**.
   add `timezone` column
 
 **Apply path**: via Supabase Management API (the same pattern used
-for 0005-0006). Confirm both apply cleanly. Verify the trigger by
-manually inserting a fake turn row in a transaction and rolling
-back, observing the events row.
+for 0005-0006). Confirm both apply cleanly.
 
-**Exit criterion**: tables exist, trigger fires, RLS denies anon
+**Trigger-level smoke tests** (run before believing the migration
+is good — this is the only place we touch a hot table on the daemon
+upload path):
+
+1. INSERT a fake turn row; verify a fresh `events` row appears with
+   `payload_version = 1`. INSERT must not reference OLD; if the
+   trigger's branch logic is wrong this is where it explodes.
+2. UPDATE the same row to fill `agent_summary`; verify the events
+   row's `payload` is updated AND `payload_version` is now 2 AND
+   `ingested_at` is bumped.
+3. UPDATE only an unrelated column (e.g. `device_label`); verify
+   `payload_version` stays at 2 and `ingested_at` is unchanged.
+4. DELETE the fake turn row; verify `events` is unaffected (we
+   don't cascade — events are append-only as described in the
+   roadmap invariant, only `payload` and version are mutable).
+
+All four tests inside a single transaction, rolled back at the end,
+so production data is untouched. Run via Supabase Management API
+or psql.
+
+**Exit criterion**: all four smoke tests pass; RLS denies anon
 selects on the new tables.
 
 ---
+
+## 1.6 OAuth callback: pull timezone (~10 min)
+
+Spec §2.1 requires `feishu_links.timezone` to be populated from the
+Feishu user_info response. The current callback ignores this field.
+
+**File**: `web/app/api/feishu/oauth/callback/route.ts`
+
+Steps:
+- Add `let timezone: string | null = null;` alongside the other
+  parsed fields
+- Read `userJson.data?.timezone ?? null` after the userinfo fetch
+- Add `feishu_timezone: timezone` to the upsert payload (column
+  name aligns with `feishu_name` / `feishu_email` / `feishu_mobile`
+  conventions, BUT — per spec §2.1 the column is just `timezone`
+  not `feishu_timezone`. Match the spec, even though it's a small
+  inconsistency with the other column naming. Keep schema clean.)
+- Existing rows: `default 'Asia/Shanghai'` from the migration covers
+  them; users who re-bind (or whose row is upserted by a future
+  re-OAuth) get the real timezone.
+
+**Exit criterion**: re-bind your own Feishu account and verify the
+new column is set to a non-default value (assuming your Feishu
+profile has a timezone configured).
 
 ## 1.5 RequestContext extension (~15 min)
 
@@ -77,9 +119,14 @@ both p2p and group messages.
   - `fetch_events_needing_decision(limit)` — picks rows where
     `processed_at IS NULL` OR `processed_version < payload_version`
   - `mark_event_processed(event_id, payload_version)`
-  - `fetch_enabled_subscriptions_for_scope(scope_kind, scope_id)` —
-    returns ALL enabled rows for that scope (for sibling-rule
-    decision context)
+  - `fetch_all_enabled_subscriptions()` — every `enabled = true`
+    row across the whole DB; the decider groups by `(scope_kind,
+    scope_id)` in memory and fans out per group. **Not** filtered
+    by event scope — an event must reach every relevant subscriber
+    regardless of where the event came from.
+  - `fetch_subscriptions_for_scope(scope_kind, scope_id)` — used by
+    the subscription tools (`list_subscriptions`) and renderer; not
+    used in the decider fan-out path.
   - `get_notification(event_id, sub_id)` — for upsert-aware decider
   - `write_decision_log(... + input_tokens, output_tokens)`
   - `upsert_notification_row(...)` — overwrites pending decisions
