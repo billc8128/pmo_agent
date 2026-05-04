@@ -79,9 +79,33 @@ functions can't be invoked from the browser):
    `release_claim` — service-role can call (returns NULL on
    non-existent row), anon gets permission denied.
 
+**claim_pending_notifications shape test** — the most complex new
+RPC, directly feeds the renderer, easy to subtly break. Run as a
+single transaction and roll back at the end so production data is
+untouched:
+
+9. Insert a fake `events` row (source='turn', payload={...},
+    payload_version=1).
+10. Insert a fake `subscriptions` row (scope_kind='user', some
+    fake user_id with a profile, description='test').
+11. Call `upsert_notification_row(event_id, sub_id, status='pending',
+    decided_payload_version=1, payload_snapshot=<fake payload>)`.
+12. Call `claim_pending_notifications(uuid_v4(), 5)` and assert
+    the returned row contains:
+    - a non-null `notification` jsonb whose `id` matches the
+      pending row from step 11
+    - a non-null `notif_payload_snapshot` jsonb that EQUALS the
+      payload passed to upsert in step 11 (NOT a join from
+      events.payload — verify by mutating events.payload between
+      steps 11 and 12 and confirming the snapshot is the original)
+    - `notif_payload_version` = 1
+    - a non-null `subscription` jsonb whose `id` matches step 10
+
 **Exit criterion**: all four trigger smoke tests pass; all four
-RPC ACL smoke tests pass; RLS denies anon SELECTs on
-events/subscriptions/notifications/decision_logs.
+RPC ACL smoke tests pass; the claim shape test passes (in
+particular the snapshot-decoupled-from-events.payload assertion);
+RLS denies anon SELECTs on events/subscriptions/notifications/
+decision_logs.
 
 ---
 
@@ -153,24 +177,32 @@ profile has a timezone configured).
     short-circuit before paying for a judge call)
   - `write_decision_log(... + payload_version, input_tokens, output_tokens)`
   - `upsert_notification_row(event_id, sub_id, decision,
-                             decided_payload_version)` — thin
-    wrapper around the `upsert_notification_row` SQL RPC defined in
-    spec §2.8. The RPC is a single-statement
+                             decided_payload_version,
+                             payload_snapshot)` — thin wrapper
+    around the `upsert_notification_row` SQL RPC defined in spec
+    §2.8. The RPC is a single-statement
     `INSERT … ON CONFLICT (event_id, subscription_id) DO UPDATE
     WHERE …` with the §2.4 rewrite predicate in the WHERE clause
     and a CTE that returns 'inserted' / 'updated' / 'noop'. No
     SELECT FOR UPDATE — concurrent decider workers safely race
-    through the unique constraint. Python helper just calls
+    through the unique constraint. The decider passes
+    `payload_snapshot=ev.payload` so the renderer (running later in
+    the delivery loop) reads the SAME bytes the judge decided on,
+    not whatever events.payload has mutated to in the meantime.
+    Python helper just calls
     `sb_admin().rpc("upsert_notification_row", {...})`.
   - `claim_pending_notifications(claim_id, limit)` — RPC wrapper
     around the `claim_pending_notifications` SQL function (§2.8);
     that's where `for update skip locked` lives. Returns each
-    claimed row joined with `event_payload`, `event_payload_version`,
-    and the full `subscription` row, so the delivery loop has every-
-    thing the renderer needs without a second roundtrip. The Python
-    wrapper deserialises each result into a `ClaimedBundle` dataclass
-    with `.notification`, `.event_payload`, `.subscription`
-    attributes.
+    claimed row joined with the **frozen payload snapshot** from
+    decision time (NOT current events.payload), the version that
+    snapshot represents, and the full `subscription` row, so the
+    delivery loop has everything the renderer needs without a
+    second roundtrip AND with rendering decoupled from any
+    subsequent mutations to events. The Python wrapper deserialises
+    each result into a `ClaimedBundle` dataclass with
+    `.notification`, `.notif_payload_snapshot`,
+    `.notif_payload_version`, `.subscription` attributes.
   - `release_claim(id, claim_id)` — RPC wrapper
   - `mark_sent_if_claimed(id, claim_id, msg_id, text)` — RPC
     wrapper; the SQL function returns NULL on lost lease so the

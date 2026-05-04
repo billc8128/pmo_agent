@@ -219,6 +219,16 @@ create table notifications (
     decided_payload_version int not null default 1,
     sent_at         timestamptz,
     error           text,
+    -- Frozen snapshot of events.payload AS-OF decision time. The
+    -- renderer reads this, NOT the current events.payload, so a
+    -- v2 mutation between decision and delivery cannot inject new
+    -- content into a notification that was approved on v1. The
+    -- snapshot is rewritten alongside decided_payload_version
+    -- whenever the rewrite table (§2.4) updates the row in place.
+    -- Always populated for pending/sent rows; may be null for
+    -- suppressed rows (we don't need to keep the body of a message
+    -- we never sent).
+    payload_snapshot jsonb,
     -- Idempotency guard: at most one notification row per
     -- (event, subscription); re-decisions overwrite in place when
     -- allowed by the rewrite rules below.
@@ -411,18 +421,23 @@ Functions:
 
 ```sql
 -- Atomic pending → claimed transition for up to N rows. Returns
--- each claimed row PLUS the joined event payload and subscription
--- so the caller's renderer doesn't have to do a second roundtrip.
--- (Renderer API in plan §5 takes notif_row + event_payload +
--- subscription; this returns all three.)
+-- each claimed row PLUS the FROZEN payload snapshot taken at
+-- decision time PLUS the subscription. Renderer reads
+-- notif_payload_snapshot, NOT events.payload — that decoupling is
+-- what guarantees a v2 mutation in events between decision and
+-- delivery cannot inject new content into a v1 notification.
+--
+-- We return jsonb instead of composite row types because Postgres
+-- doesn't support `alias.*::row_type` casts cleanly, and the bot's
+-- Python deserialiser handles jsonb → dict natively via supabase-py.
 create function claim_pending_notifications(
     p_claim_id uuid,
     p_limit    int
 ) returns table (
-    notification           notifications,
-    event_payload          jsonb,
-    event_payload_version  int,
-    subscription           subscriptions
+    notification          jsonb,
+    notif_payload_snapshot jsonb,
+    notif_payload_version  int,
+    subscription           jsonb
 )
 language plpgsql
 security definer
@@ -443,12 +458,11 @@ begin
          )
         returning n.*
     )
-    select c.*::notifications,
-           e.payload,
-           e.payload_version,
-           s.*::subscriptions
+    select to_jsonb(c)              as notification,
+           c.payload_snapshot       as notif_payload_snapshot,
+           c.decided_payload_version as notif_payload_version,
+           to_jsonb(s)              as subscription
       from claimed c
-      join events        e on e.id = c.event_id
       join subscriptions s on s.id = c.subscription_id;
 end $$;
 
@@ -548,7 +562,8 @@ create function upsert_notification_row(
     p_suppressed_by   text,
     p_delivery_kind   text,
     p_delivery_target text,
-    p_decided_payload_version int
+    p_decided_payload_version int,
+    p_payload_snapshot jsonb
 ) returns text
 language plpgsql
 security definer
@@ -571,11 +586,11 @@ begin
         insert into notifications (
             event_id, subscription_id, status, suppressed_by,
             delivery_kind, delivery_target, decided_payload_version,
-            decided_at
+            decided_at, payload_snapshot
         ) values (
             p_event_id, p_subscription_id, p_status, p_suppressed_by,
             p_delivery_kind, p_delivery_target, p_decided_payload_version,
-            now()
+            now(), p_payload_snapshot
         )
         on conflict (event_id, subscription_id) do update
             set status                  = excluded.status,
@@ -584,6 +599,7 @@ begin
                 delivery_target         = excluded.delivery_target,
                 decided_payload_version = excluded.decided_payload_version,
                 decided_at              = excluded.decided_at,
+                payload_snapshot        = excluded.payload_snapshot,
                 -- Wipe the rendered/sent state on a real rewrite —
                 -- old text was for an older payload version.
                 rendered_text = null,
@@ -739,8 +755,13 @@ async def decider_loop():
                         write_decision_log(ev, candidate, decision,
                                            decided_version, model,
                                            latency, tokens)
+                        # Pass ev.payload as the snapshot so the
+                        # renderer reads the SAME bytes the judge
+                        # decided on, even if events.payload mutates
+                        # to v3 between now and delivery.
                         upsert_notification_row(ev, candidate, decision,
-                                                decided_version)
+                                                decided_version,
+                                                payload_snapshot=ev.payload)
                     except Exception as e:
                         log.exception(
                             "decider error event=%s sub=%s",
@@ -876,15 +897,18 @@ async def delivery_loop():
         # Claim up to 20 rows atomically: pending → claimed.
         claim_id = uuid4()
         # Each ClaimedBundle bundles the notification + joined event
-        # payload + subscription, so the renderer has all the context
-        # it needs without a second DB roundtrip.
+        # snapshot + subscription, so the renderer has all the
+        # context it needs without a second DB roundtrip AND its
+        # input is frozen at decision time.
         bundles = claim_pending_notifications(claim_id, limit=20)
         for b in bundles:
             notif = b.notification
             try:
                 text = await render_notification(
                     notif_row=notif,
-                    event_payload=b.event_payload,
+                    # Frozen snapshot — NOT events.payload, which
+                    # may have moved on. See spec §2.4 for why.
+                    event_payload=b.notif_payload_snapshot,
                     subscription=b.subscription,
                 )
 
@@ -950,10 +974,13 @@ already send this notification?") before the second send.
 `claim_pending_notifications`, `mark_sent_if_claimed`,
 `mark_failed_if_claimed`, `release_claim`, and `reap_stale_claims`
 are all defined in §2.8 (Postgres SECURITY DEFINER RPCs). The
-shape of the claim function's join return — notification +
-event_payload + subscription per row — is what the delivery loop
-above destructures into `b.notification`, `b.event_payload`,
-`b.subscription` for the renderer.
+shape of the claim function's return — notification +
+notif_payload_snapshot + notif_payload_version + subscription per
+row — is what the delivery loop above destructures into
+`b.notification`, `b.notif_payload_snapshot`, `b.subscription` for
+the renderer. The snapshot is the FROZEN payload from decision
+time, decoupling rendering from any subsequent mutations to
+events.payload.
 
 The conditional UPDATE pattern used by mark_sent_if_claimed /
 mark_failed_if_claimed looks like:
