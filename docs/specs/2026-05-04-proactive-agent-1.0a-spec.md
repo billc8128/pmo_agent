@@ -341,6 +341,16 @@ begin
     )
     on conflict (source, source_id) do update
         set payload = excluded.payload,
+            -- Top-level columns must follow the source-of-truth
+            -- update too, otherwise a turn row whose project_root
+            -- gets corrected later would have the new value in
+            -- payload but the stale value in the indexed top-level
+            -- column. Same for user_id (rare but possible during
+            -- handle migrations) and occurred_at (if user_message_at
+            -- gets adjusted).
+            user_id = excluded.user_id,
+            project_root = excluded.project_root,
+            occurred_at = excluded.occurred_at,
             payload_version = case
                 when payload_significantly_changed
                     then events.payload_version + 1
@@ -386,6 +396,206 @@ All four new tables get RLS enabled. Policies:
 For 1.0a all access is via the bot's service-role client. RLS
 policies for direct user access are added in 1.0b alongside the web
 UI.
+
+### 2.8 RPC functions for atomic operations
+
+The bot's DB layer uses Supabase's Python SDK, which talks to
+PostgREST and does NOT support raw SQL constructs like
+`FOR UPDATE SKIP LOCKED` or transactional updates with multiple
+conditions. To express the lease-based delivery (§3.2) and
+versioned upsert (§2.4) atomically, we ship a small set of
+PL/pgSQL **RPC functions** in the migration. Python helpers in
+`bot/db/queries.py` then just call `sb_admin().rpc(name, args)`.
+
+Functions:
+
+```sql
+-- Atomic pending → claimed transition for up to N rows.
+-- Returns the claimed rows so the caller can render them.
+create function claim_pending_notifications(
+    p_claim_id uuid,
+    p_limit    int
+) returns setof notifications
+language plpgsql
+security definer
+as $$
+begin
+    return query
+    update notifications n
+       set status = 'claimed',
+           claim_id = p_claim_id,
+           claimed_at = now()
+     where n.id in (
+        select id from notifications
+         where status = 'pending'
+         order by decided_at
+         limit p_limit
+         for update skip locked
+     )
+     returning n.*;
+end $$;
+
+-- Conditional commit: only succeeds if the lease is still ours.
+-- Returns the row id on success, NULL on lost lease.
+create function mark_sent_if_claimed(
+    p_id            bigint,
+    p_claim_id      uuid,
+    p_msg_id        text,
+    p_rendered_text text
+) returns bigint
+language sql
+security definer
+as $$
+    update notifications
+       set status = 'sent',
+           sent_at = now(),
+           feishu_msg_id = p_msg_id,
+           rendered_text = p_rendered_text,
+           claim_id = null,
+           claimed_at = null
+     where id = p_id
+       and claim_id = p_claim_id
+       and status = 'claimed'
+    returning id;
+$$;
+
+create function mark_failed_if_claimed(
+    p_id        bigint,
+    p_claim_id  uuid,
+    p_error     text
+) returns bigint
+language sql
+security definer
+as $$
+    update notifications
+       set status = 'failed',
+           error = p_error,
+           claim_id = null,
+           claimed_at = null
+     where id = p_id
+       and claim_id = p_claim_id
+       and status = 'claimed'
+    returning id;
+$$;
+
+-- Release the lease back to pending (used on transient errors).
+create function release_claim(
+    p_id        bigint,
+    p_claim_id  uuid
+) returns bigint
+language sql
+security definer
+as $$
+    update notifications
+       set status = 'pending',
+           claim_id = null,
+           claimed_at = null
+     where id = p_id
+       and claim_id = p_claim_id
+       and status = 'claimed'
+    returning id;
+$$;
+
+-- Reap stale claims (delivery worker crashed mid-render).
+-- Returns the number of rows reaped.
+create function reap_stale_claims(
+    p_stale_after_minutes int default 5
+) returns int
+language plpgsql
+security definer
+as $$
+declare
+    n int;
+begin
+    update notifications
+       set status = 'pending',
+           claim_id = null,
+           claimed_at = null
+     where status = 'claimed'
+       and claimed_at < now() - make_interval(mins => p_stale_after_minutes);
+    get diagnostics n = row_count;
+    return n;
+end $$;
+
+-- Atomic upsert implementing the §2.4 rewrite table.
+-- Returns 'inserted' / 'updated' / 'noop' so the caller can log.
+create function upsert_notification_row(
+    p_event_id        bigint,
+    p_subscription_id uuid,
+    p_status          text,
+    p_suppressed_by   text,
+    p_delivery_kind   text,
+    p_delivery_target text,
+    p_decided_payload_version int
+) returns text
+language plpgsql
+security definer
+as $$
+declare
+    existing record;
+begin
+    select status, decided_payload_version
+      into existing
+      from notifications
+     where event_id = p_event_id
+       and subscription_id = p_subscription_id
+     for update;
+
+    if not found then
+        insert into notifications (
+            event_id, subscription_id, status, suppressed_by,
+            delivery_kind, delivery_target, decided_payload_version
+        ) values (
+            p_event_id, p_subscription_id, p_status, p_suppressed_by,
+            p_delivery_kind, p_delivery_target, p_decided_payload_version
+        );
+        return 'inserted';
+    end if;
+
+    -- Frozen states (per §2.4 rewrite table)
+    if existing.status in ('sent', 'claimed') then
+        return 'noop';
+    end if;
+
+    -- Same or older version → no-op
+    if p_decided_payload_version <= existing.decided_payload_version then
+        return 'noop';
+    end if;
+
+    -- Newer version on pending/suppressed/failed → rewrite in place
+    update notifications
+       set status = p_status,
+           suppressed_by = p_suppressed_by,
+           delivery_kind = p_delivery_kind,
+           delivery_target = p_delivery_target,
+           decided_payload_version = p_decided_payload_version,
+           decided_at = now(),
+           rendered_text = null,    -- stale, will be regenerated
+           feishu_msg_id = null,
+           sent_at = null,
+           error = null
+     where event_id = p_event_id
+       and subscription_id = p_subscription_id;
+    return 'updated';
+end $$;
+```
+
+All five functions are `security definer` so they can be called
+via the anon-key Supabase client AS WELL AS the service-role
+client. (Bot uses service-role; this is future-proofing for the
+1.0b web UI, where some tools may need to invoke RPCs in the
+authenticated user's context.)
+
+The Python helpers in `bot/db/queries.py` (plan §2) are one-line
+wrappers:
+
+```python
+def claim_pending_notifications(claim_id: str, limit: int) -> list[dict]:
+    res = sb_admin().rpc("claim_pending_notifications", {
+        "p_claim_id": claim_id, "p_limit": limit,
+    }).execute()
+    return res.data or []
+```
 
 ---
 
@@ -493,14 +703,19 @@ suppress matches from a *different* row. Concretely:
       *the same* event when re-judging on a new payload version —
       otherwise a `suppressed/mismatch` row from version 1 would
       block version 2's send)
-    - `status` (`sent` / `suppressed` / `pending` / `failed`)
+    - `status` — one of `sent`, `claimed`, `pending`, `suppressed`,
+      `failed`. **`claimed` is included** because a notification
+      that's mid-render-or-send hasn't reached the user yet, but
+      will any second now; another similar event arriving in that
+      window must dedup against it.
     - `subject_summary` (one line of the rendered or candidate text)
     - `project_root`
     - `suppressed_by` (when applicable)
   The judge MUST ignore rows where `event_id == current_event.id`
   when applying duplicate-window logic, and MUST NOT count
   `suppressed/mismatch` rows as occupying the dedup slot at all
-  (they didn't actually disturb the user). This is enforced by the
+  (they didn't actually disturb the user). `sent` / `claimed` /
+  `pending` all DO occupy the slot. This is enforced by the
   prompt; see §4.1.
 - **Daily count** for the owner (notifications with status='sent'
   since local-midnight in the owner's timezone).
@@ -716,7 +931,7 @@ function. Pseudocode:
   owner_recent_notifications: [
     { decided_at: "2026-05-04T23:30:00+08:00",
       event_id: 12345,
-      status: "sent" | "suppressed" | "pending" | "failed",
+      status: "sent" | "claimed" | "pending" | "suppressed" | "failed",
       subject_summary: "albert 在 vibelive 调播放器 buffer",
       project_root: "/Users/.../vibelive",
       suppressed_by: null | "duplicate_in_window" | "quiet_hours" | ... },
@@ -745,14 +960,20 @@ function. Pseudocode:
    "周末不发"等）。命中就 send=false，suppressed_by 取最贴切的那个
    分类（"explicit_exclude" 或 "quiet_hours"）。
 2. **去重**：扫 owner_recent_notifications，看 decided_at 在 5 分钟
-   内且 subject 同主题的条目。注意两条排除项：
-   - **跳过 event_id == 当前事件的所有旧记录**——这是同一个事件被
+   内且 subject 同主题的条目。占用 dedup slot 的判定：
+   - **status 为 `sent` / `claimed` / `pending`**：占用——已经发出、
+     正在发送、或即将发送，用户都会被打扰。
+   - **status 为 `suppressed` 且 suppressed_by == 'mismatch'**：不
+     占用——那次没真正打扰用户。
+   - **status 为 `suppressed` 且 suppressed_by 为其他值**：不占用
+     ——也是没打扰用户。
+   - **status 为 `failed`**：不占用——发送失败，用户没收到。
+   - **event_id == 当前事件**：永远忽略，不论 status——同一事件被
      payload_version 更新后重判，不该自己挡自己。
-   - **跳过 status == 'suppressed' 且 suppressed_by == 'mismatch'
-     的记录**——那次没真正打扰用户，不占去重坑。
    余下条目里若有 5 分钟内同主题的 → send=false,
    suppressed_by="duplicate_in_window"，reason 必须引用被命中的那条
-   通知的 decided_at。
+   通知的 decided_at 和 status（"5min 内已 sent 同主题 ..." 或
+   "正在 claimed 中的同主题 ..."）。
 3. **每日上限**：owner_today_sent_count >= 20 → send=false,
    suppressed_by="daily_cap"。除非 sibling rules 里写了"重要事件
    break through"。
@@ -879,8 +1100,12 @@ async def add_subscription(args: dict) -> dict:
 
 The tool uses `RequestContext` (already populated in 1.0a's
 `_handle_message`) to read `chat_type`, `chat_id`, and the asker's
-`user_id`. The owner profile must have a `feishu_links` row — if
-not, return an error explaining the user must bind first.
+`user_id`. The asker must have a profile + `feishu_links` row to
+create ANY subscription, including chat-scoped ones — even when
+creating a group subscription on behalf of a chat, the creator's
+identity is recorded in `subscriptions.created_by` and we don't
+allow anonymous proxy creation. If the asker is unbound, return an
+error pointing them to `/me` to bind first.
 
 ### 5.2 `list_subscriptions`
 

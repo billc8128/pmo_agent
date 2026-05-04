@@ -33,7 +33,12 @@ source of truth for **build order**.
 **Files**:
 - `backend/supabase/migrations/0013_active_notifications.sql` —
   events, subscriptions, notifications, decision_logs, turn trigger,
-  RLS
+  RLS, **and the six PL/pgSQL RPC functions from spec §2.8**
+  (`claim_pending_notifications`, `mark_sent_if_claimed`,
+  `mark_failed_if_claimed`, `release_claim`, `reap_stale_claims`,
+  `upsert_notification_row`). These are how Python expresses
+  `for update skip locked` and lease-conditional UPDATEs through
+  PostgREST — Supabase's table API alone can't do that.
 - `backend/supabase/migrations/0014_feishu_links_timezone.sql` —
   add `timezone` column
 
@@ -127,27 +132,28 @@ profile has a timezone configured).
   - `fetch_subscriptions_for_scope(scope_kind, scope_id)` — used by
     the subscription tools (`list_subscriptions`) and renderer; not
     used in the decider fan-out path.
-  - `get_notification(event_id, sub_id)` — for upsert-aware decider
+  - `get_notification(event_id, sub_id)` — for read-side checks
+    (the upsert itself happens via RPC, so this is just for the
+    decider's "skip if version already covered / sent / claimed"
+    short-circuit before paying for a judge call)
   - `write_decision_log(... + payload_version, input_tokens, output_tokens)`
   - `upsert_notification_row(event_id, sub_id, decision,
-                             decided_payload_version)` —
-    implements the full rewrite table from spec §2.4:
-    no row → INSERT;
-    `pending`/`suppressed`/`failed` with new version > old → UPDATE in place;
-    same version or older → no-op;
-    `sent` → no-op (frozen, never modified).
-    The function must read existing.status + existing.decided_payload_version
-    in the same transaction (or use a conditional UPDATE clause) to
-    avoid races with the delivery loop.
-  - `claim_pending_notifications(claim_id, limit)` — atomic
-    pending → claimed transition; see spec §3.2 for the SQL
-  - `release_claim(id, claim_id, reset_to)` — used on transient
-    errors to flip claimed → pending
-  - `mark_sent_if_claimed(id, claim_id, msg_id, text)` — conditional
-    UPDATE that requires the lease to still be ours
-  - `mark_failed_if_claimed(id, claim_id, error)`
-  - `reap_stale_claims(stale_after_minutes=5)` — recovery for
-    crashed delivery workers
+                             decided_payload_version)` — thin
+    wrapper around the `upsert_notification_row` SQL RPC defined in
+    spec §2.8. The RPC enforces the rewrite table from §2.4
+    transactionally (read existing row with `for update`, branch on
+    status + version, INSERT or UPDATE accordingly). Python helper
+    just calls `sb_admin().rpc("upsert_notification_row", {...})`.
+  - `claim_pending_notifications(claim_id, limit)` — RPC wrapper
+    around the `claim_pending_notifications` SQL function (§2.8);
+    that's where `for update skip locked` lives.
+  - `release_claim(id, claim_id)` — RPC wrapper
+  - `mark_sent_if_claimed(id, claim_id, msg_id, text)` — RPC
+    wrapper; the SQL function returns NULL on lost lease so the
+    Python helper can detect and warn.
+  - `mark_failed_if_claimed(id, claim_id, error)` — RPC wrapper
+  - `reap_stale_claims(stale_after_minutes=5)` — RPC wrapper,
+    returns count reaped
   - `recent_notifications_for_scope(scope_kind, scope_id,
     since_minutes)` — returns rows with `decided_at` so judge can
     do real timestamp math
@@ -380,10 +386,17 @@ iteration.
 today — confirm which file holds `today_iso` etc) — add four tools.
 
 Each tool reads `RequestContext` to determine scope. Validations:
-- `add_subscription` rejects if asker has no `feishu_links` row and
-  scope_kind would be `'user'`
-- `update_subscription` and `remove_subscription` verify scope
-  ownership before acting
+- `add_subscription` rejects if `ctx.asker_user_id` is None or the
+  asker has no `feishu_links` row, **regardless of scope_kind**.
+  Per roadmap invariant + spec §5.0, you must be a bound pmo_agent
+  user to subscribe at all — even when creating a chat-scoped
+  subscription on behalf of a group, you (the creator) need an
+  identity for `created_by`. If asker is unbound: tool returns an
+  error message pointing them at `/me` to bind.
+- `update_subscription` and `remove_subscription` verify the
+  subscription's `(scope_kind, scope_id)` matches the current
+  conversation scope before acting (you can't edit your DM subs
+  from a group, or vice versa). Asker still must be bound.
 
 **Exit criterion**: from a private chat, "vibelive 进展告诉我" gets
 a row written and "我都订了什么" lists it. From a group,
@@ -400,12 +413,28 @@ Implementation:
   subscriptions
 - Fuzzy-match `query` (Chinese substring search on
   `judge_input.event.payload.user_message` and `agent_summary`)
-- Return up to 5 matched (event, decision) pairs with
-  `suppressed_by` and `reason`
+- For each matched event, group decision_logs by
+  `(event_id, subscription_id)` and order by `created_at` ascending
+  — surfacing the version timeline so a (v1 mismatch, v2 send)
+  sequence shows up as one timeline rather than two unrelated
+  results
+- Return up to 5 (event, subscription) groups, each with:
+    - the event's payload summary
+    - the subscription's description
+    - the timeline:
+      `[{payload_version, created_at, send, suppressed_by, reason,
+         judge_output}, …]`
+    - the *current* notifications row status (sent / suppressed /
+      claimed / pending / failed) so the agent knows whether the
+      eventual outcome was delivery
+- Do NOT return token-heavy fields (`judge_input.event.payload`,
+  `judge_input.candidate.full_text`) — the timeline is for the
+  agent to summarise, not for the user to see verbatim.
 
 **Exit criterion**: ask "为什么没告诉我 albert 的播放器修改" — agent
-calls the tool, gets a structured answer, surfaces it in human
-language.
+calls the tool, gets a structured timeline, summarises it in
+human language: "v1 时 summary 还没生成，被判 mismatch；v2 时 summary
+到了但你的'凌晨别打扰'触发了 quiet_hours，所以最终没发。"
 
 ---
 
