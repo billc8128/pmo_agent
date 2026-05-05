@@ -7,6 +7,7 @@
 //   3. PAT management.
 
 import { redirect } from 'next/navigation';
+import Link from 'next/link';
 import { serverComponentClient } from '@/lib/supabase-server';
 import { OnboardingForm } from './onboarding-form';
 import { ProfileEditor } from './profile-editor';
@@ -144,6 +145,24 @@ export default async function MePage(props: PageProps<'/me'>) {
           Feishu
         </h2>
         <FeishuLink link={feishuLink ?? null} />
+      </section>
+
+      <section className="mb-10">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+          Notifications
+        </h2>
+        <div className="rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
+          <p className="text-sm text-zinc-600 dark:text-zinc-400">
+            Add and manage proactive PMO watch rules from the public rules
+            panel.
+          </p>
+          <Link
+            href="/notifications/rules"
+            className="mt-3 inline-flex rounded bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
+          >
+            Open rules panel
+          </Link>
+        </div>
       </section>
 
       <section>

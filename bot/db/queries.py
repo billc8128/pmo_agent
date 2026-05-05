@@ -923,6 +923,7 @@ def fetch_all_enabled_subscriptions() -> list[dict[str, Any]]:
         .table("subscriptions")
         .select("*")
         .eq("enabled", True)
+        .is_("archived_at", "null")
         .order("created_at", desc=True)
         .execute()
         .data
@@ -938,6 +939,7 @@ def fetch_subscriptions_for_scope(scope_kind: str, scope_id: str) -> list[dict[s
         .eq("scope_kind", scope_kind)
         .eq("scope_id", scope_id)
         .eq("enabled", True)
+        .is_("archived_at", "null")
         .order("created_at", desc=True)
         .execute()
         .data
@@ -1256,7 +1258,7 @@ def update_subscription(
     payload = {
         k: v
         for k, v in fields_to_update.items()
-        if k in {"description", "enabled"} and v is not None
+        if k in {"description", "enabled", "archived_at"} and v is not None
     }
     if not payload:
         return get_subscription_in_scope(subscription_id, scope_kind, scope_id)
@@ -1291,7 +1293,13 @@ def get_subscription_in_scope(
 
 
 def remove_subscription(subscription_id: str, scope_kind: str, scope_id: str) -> Optional[dict[str, Any]]:
-    return update_subscription(subscription_id, scope_kind, scope_id, enabled=False)
+    return update_subscription(
+        subscription_id,
+        scope_kind,
+        scope_id,
+        enabled=False,
+        archived_at=_utc_now_iso(),
+    )
 
 
 def feishu_link_for_user_id(user_id: str) -> Optional[dict[str, Any]]:

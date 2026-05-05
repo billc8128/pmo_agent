@@ -110,25 +110,30 @@ LLM judge produces useful decisions.
 
 **Estimate**: ~5h end-to-end.
 
-### 1.0b — Web UI panel
+### 1.0b — Public rules panel
 
-**Goal**: Visualise what 1.0a built. No new logic, just surfaces.
+**Goal**: Visualise the rules 1.0a built. No notification-decision
+logic changes, just surfaces and management.
 
 ✅ added
-- `/me` gets a "Notifications" section
-  - Active subscriptions list with enable/disable + delete
-  - Add subscription form (free text)
-  - Link to notification history
-- `/me/notifications` shows the last 50 notifications, grouped by
-  status (sent / suppressed / failed) with the decision reason
-- `/me` gets a "Notification preferences" mini-card with
-  - Quiet hours range
-  - Daily cap
-  - Timezone (auto-detected from feishu_links, editable)
-- `/chats/<chat_id>/subscriptions` (only visible to chat members) —
-  manage group subscriptions in web
+- `/notifications/rules` is a public rules directory:
+  - everyone can see active user-scope notification rules from all
+    users
+  - only safe fields are exposed: rule text, owner handle/display
+    name, enabled status, and timestamps
+  - raw `scope_id`, `created_by`, `chat_id`, Feishu IDs, and delivery
+    targets never reach the browser
+- Signed-in users can add a user-scope rule from the public page
+- Signed-in users can pause/resume, edit, or archive their own rules
+- `/me` links to the public rules panel
+- `subscriptions.archived_at` separates archived/deleted rules from
+  paused rules; existing disabled rows migrate to archived because
+  there was no pause feature before 1.0b
 
 ❌ still out
+- `/me/notifications` notification history
+- Quiet-hour / daily-cap preference tables
+- Group/chat rule management
 - GitHub webhook (1.0c)
 - Card buttons (1.0c)
 - Per-team notifications (2.0)

@@ -115,6 +115,7 @@ def test_fetch_subscriptions_for_scope_only_lists_enabled(monkeypatch):
     from db import queries
 
     eq_calls: list[tuple[str, object]] = []
+    is_calls: list[tuple[str, object]] = []
 
     class _Table:
         def table(self, name):
@@ -127,6 +128,10 @@ def test_fetch_subscriptions_for_scope_only_lists_enabled(monkeypatch):
             eq_calls.append((name, value))
             return self
 
+        def is_(self, name, value):
+            is_calls.append((name, value))
+            return self
+
         def order(self, *args, **kwargs):
             return self
 
@@ -137,6 +142,7 @@ def test_fetch_subscriptions_for_scope_only_lists_enabled(monkeypatch):
 
     assert queries.fetch_subscriptions_for_scope("user", "22222222-2222-2222-2222-222222222222") == []
     assert ("enabled", True) in eq_calls
+    assert ("archived_at", "null") in is_calls
 
 
 def test_judge_prompt_states_self_events_send_by_default():
