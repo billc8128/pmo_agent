@@ -37,25 +37,52 @@ Creates:
 - Indexes: open jobs by subscription, recent open jobs.
 - `notifications.investigation_job_id` column + index.
 - `decision_logs.investigation_job_id` column.
+- `subscriptions.metadata jsonb` column (default `{}`) for the
+  project-name lockout (spec §4.1.1).
 - New RPC functions:
   - `append_to_or_open_investigation_job(p_subscription_id,
     p_event_id, p_initial_focus, p_decider_reason)`:
-    finds an open job in the 30-min aggregation window for this
-    subscription; if found, appends event id to seed_event_ids
-    (deduplicating); if not, opens a new job with this event as
-    the only seed. Returns job id.
+    **Concurrency-safe** version. Steps inside one transaction:
+    1. Acquire a transaction-level advisory lock keyed by
+       hashtext('inv_job:' || p_subscription_id::text). This
+       serialises append/open per subscription across decider
+       workers without blocking other subscriptions.
+    2. SELECT the most recent open job for this subscription with
+       `opened_at >= now() - interval '30 minutes'` AND
+       `status='open'` (NOT 'investigating' — once an investigator
+       has claimed the job, new events open a fresh job).
+    3. If found: UPDATE that job, appending p_event_id to
+       seed_event_ids if not already present, bumping updated_at.
+       Returns existing job id.
+    4. If not found: INSERT a new job with seed_event_ids=[p_event_id].
+       Returns new job id.
+    The advisory lock releases at transaction end.
   - `claim_investigatable_jobs(p_claim_id, p_limit)`:
-    lease-based pickup, like `claim_pending_notifications`.
-    Eligible: status='open' AND (5+ seed events OR opened_at <
-    now() - 30 min). Flips to status='investigating', stamps
-    claim_id + claimed_at. Returns rows joined with subscription
-    description and array of event payloads.
-  - `mark_job_notified_if_claimed(p_id, p_claim_id, p_brief,
-    p_notification_id)`: lease-conditional UPDATE.
-  - `mark_job_suppressed_if_claimed(p_id, p_claim_id, p_brief)`.
-  - `release_job_claim(p_id, p_claim_id)`.
-  - `mark_job_failed_if_claimed(p_id, p_claim_id, p_error)`.
-  - `reap_stale_job_claims(p_stale_after_minutes default 10)`.
+    lease-based pickup using `FOR UPDATE SKIP LOCKED`, like
+    `claim_pending_notifications`. Eligible:
+    `status='open' AND (array_length(seed_event_ids, 1) >= 5
+    OR opened_at < now() - interval '30 minutes')`. Flips to
+    status='investigating', stamps claim_id + claimed_at. Returns
+    rows joined with subscription jsonb and an event_payloads
+    jsonb array (each element is `{id, payload, payload_version,
+    occurred_at, project_root}` for one seed event, in
+    seed_event_ids order).
+  - `create_notification_for_investigation_job(...)` — single
+    atomic RPC that writes the notification row AND flips the job
+    to 'notified'. Re-checks lease (`claim_id == p_claim_id AND
+    status='investigating'`) inside the transaction, so a lost
+    lease returns null instead of producing a notification.
+    Replaces the previous draft's compose-two-operations approach.
+    Full SQL in spec §4.3.
+  - `mark_job_suppressed_if_claimed(p_id, p_claim_id, p_brief)`:
+    lease-conditional UPDATE; flips status to 'suppressed', stores
+    brief, clears claim columns.
+  - `release_job_claim(p_id, p_claim_id)`: lease-conditional;
+    flips 'investigating' → 'open' so next iteration can re-claim.
+  - `mark_job_failed_if_claimed(p_id, p_claim_id, p_error)`:
+    terminal; status → 'failed'.
+  - `reap_stale_job_claims(p_stale_after_minutes default 10)`:
+    flips any 'investigating' row stuck >10min back to 'open'.
 - ACL block: revoke from public/anon/authenticated, grant to
   service_role only. Set search_path on every new function.
   Mirror the pattern from 1.0a's 0013.
@@ -65,20 +92,68 @@ Creates:
 
 **Smoke tests** (in transaction, ROLLBACK at end):
 
-1. Insert fake subscription. Call `append_to_or_open_…` with fake
-   event 1 → expect new job, seed_event_ids=[1].
-2. Call again with event 2 → expect same job, seed_event_ids=[1,2].
-3. Wait-skip 31 min (mock by setting opened_at backwards) → call
-   again with event 3 → expect new job, seed_event_ids=[3].
-4. Call `claim_investigatable_jobs` on first job (which now has 2
-   seeds, opened 31 min ago) → expect it returned, status flipped
-   to 'investigating'.
-5. Call `mark_job_suppressed_if_claimed` with right claim_id →
-   row updated to 'suppressed'. Call again with wrong claim_id →
-   no-op.
-6. ACL: with anon key, call any of these RPCs → permission denied.
+Setup: insert real `events` rows (not just synthetic ids) so
+`claim_investigatable_jobs`'s join can return real payloads.
+Insert a fake profile + subscription as well.
 
-**Exit criterion**: all 6 smoke tests pass; ROLLBACK leaves DB
+```sql
+-- Setup
+insert into profiles (id, handle) values ('aaa...', 'fake_user');
+insert into events (source, source_id, user_id, project_root,
+                    occurred_at, payload)
+values
+  ('turn', 'fake-1', 'aaa...', '/Users/.../vibelive',
+   now(), '{"agent_summary": "first"}'::jsonb),
+  ('turn', 'fake-2', 'aaa...', '/Users/.../vibelive',
+   now(), '{"agent_summary": "second"}'::jsonb),
+  ('turn', 'fake-3', 'aaa...', '/Users/.../vibelive',
+   now(), '{"agent_summary": "third"}'::jsonb)
+returning id;  -- capture e1, e2, e3
+insert into subscriptions (...) values (...) returning id;  -- s
+```
+
+1. Call `append_to_or_open_…(s, e1, ...)` → expect new job J1
+   with `seed_event_ids=[e1]`, status='open'.
+2. Call same with `e2` → expect same job J1 with
+   `seed_event_ids=[e1, e2]` (no duplicate).
+3. Call again with `e1` (same event) → expect seed_event_ids
+   unchanged (dedup).
+4. Mock 31 min elapsed (`update investigation_jobs set
+   opened_at = now() - interval '31 min' where id=J1`).
+5. Call `append_to_or_open_…(s, e3)` → expect a NEW job J2
+   (window expired) with `seed_event_ids=[e3]`. J1 still 'open'.
+6. Call `claim_investigatable_jobs(uuid_v4(), 5)` → assert two
+   rows returned (both J1 with 2 events meets the 30-min rule, J2
+   with 1 event also meets the rule because its window check
+   reads `array_length(seed_event_ids,1) >= 5 OR opened_at <
+   now()-30min`; need to verify our test moves J2 also past 30min
+   to make this pass).
+   Assert each returned row has:
+   - `notification` jsonb (the job row)
+   - `subscription` jsonb
+   - `event_payloads` jsonb array — for J1, length 2 with e1+e2's
+     payload jsonb in seed_event_ids order
+   - status flipped to 'investigating' in DB
+7. Call `mark_job_suppressed_if_claimed(J1, right_claim_id,
+   '{"notify": false, "reason": "test"}')` → 1 row affected,
+   J1.status='suppressed'.
+8. Call same with wrong claim_id → 0 rows, J1 unchanged.
+9. Call `create_notification_for_investigation_job(J2, claim_id,
+   e3, s, version, brief, kind, target)` while J2 is
+   'investigating' → returns notif_id; J2 flipped to 'notified',
+   notifications row exists with `investigation_job_id=J2`,
+   `payload_snapshot=brief`.
+10. Call same after J2 is already notified → returns null (lease
+    re-check fails).
+11. **Concurrency stress** (skip if hard to set up in single
+    txn): two parallel transactions both call `append_to_or_open_…
+    (s, eX, ...)` for a fresh subscription with no open jobs.
+    Expect exactly ONE new job created (advisory lock serialises),
+    second call appends to the first.
+12. ACL: with anon key, call any of these RPCs → permission
+    denied.
+
+**Exit criterion**: all 12 smoke tests pass; ROLLBACK leaves DB
 clean.
 
 ---
@@ -149,11 +224,44 @@ verify shapes match dataclasses.
 `_GATEKEEPER_PROMPT`. Reuse the JSON parsing helper from 1.0a (it
 already handles fenced/unfenced JSON).
 
-**Exit criterion**: tests in
-`bot/tests/test_proactive_1_0c.py::test_decider_opens_job` —
-inject a mock LLM that returns `{"investigate": true}`, run
-`process_event` against a fake event + sub, assert one
-`investigation_jobs` row exists with the event in seed_event_ids.
+**Exit criteria** (all must pass in
+`bot/tests/test_proactive_1_0c.py`):
+
+1. `test_decider_opens_job`: mock LLM returns `investigate=true`,
+   `process_event` opens one investigation_jobs row containing the
+   event id in seed_event_ids; one decision_log row with
+   `investigation_job_id` set; `events.processed_at` IS set with
+   matching processed_version.
+
+2. `test_decider_skips_on_lockout`: subscription has
+   `metadata.matched_projects=["vibelive"]`; event has
+   `project_root='/Users/.../oneship'`; assert no LLM call was
+   made (`decision_logs.input_tokens IS NULL`); no
+   investigation_jobs row created; one decision_log with
+   `judge_output.reason='project_root_lockout'`; events row IS
+   marked processed (this is a settled pair, not a retry).
+
+3. `test_decider_handles_investigate_false`: mock LLM returns
+   `investigate=false`; assert decision_log written but no
+   investigation_jobs row; events processed.
+
+4. `test_decider_handles_parse_failure_budget`: mock LLM returns
+   garbage 3 times for the same (event, sub, version); assert
+   first 2 failures DO NOT mark event processed (so retry can
+   happen); third failure DOES settle the pair as
+   `gatekeeper_parse_error`; assert no infinite retry loop.
+
+5. `test_decider_idempotent_on_existing_job`: pre-create an
+   investigation_job for this subscription with seed_event_ids=
+   [event_id]; run `process_event` for the same event; assert
+   the job's seed_event_ids is unchanged (not duplicated); no new
+   job opened.
+
+6. `test_decider_partial_failure_leaves_event_unprocessed`:
+   subscription A's LLM call succeeds, subscription B's LLM call
+   raises; assert events.processed_at IS NULL (whole event left
+   for next iteration); assert A still got its
+   investigation_jobs row (we don't roll back successful pairs).
 
 ---
 
@@ -186,16 +294,45 @@ async def process_once(limit: int = 5) -> int:
         try:
             brief = await investigate(bundle)  # §5.2 prompt
             if brief.get("notify"):
-                notif_id = create_notification_for_job(bundle, brief)
-                queries.mark_job_notified_if_claimed(
-                    bundle.job.id, claim_id, brief, notif_id,
+                # ONE atomic RPC writes the notification AND flips
+                # the job to 'notified' inside one txn. Returns the
+                # new notif id, or None if the lease was lost.
+                notif_id = queries.create_notification_for_investigation_job(
+                    job_id=bundle.job.id,
+                    claim_id=claim_id,
+                    event_id=most_recent_seed_id(bundle),
+                    subscription_id=bundle.job.subscription_id,
+                    decided_payload_version=most_recent_seed_version(bundle),
+                    payload_snapshot=brief,
+                    delivery_kind=delivery_kind,
+                    delivery_target=delivery_target,
                 )
+                if notif_id is None:
+                    logger.warning("investigator lost claim job=%s", bundle.job.id)
             else:
                 queries.mark_job_suppressed_if_claimed(
                     bundle.job.id, claim_id, brief,
                 )
         except asyncio.CancelledError:
             raise
+        except DecisionParseError:
+            # Track parse failures via investigation_jobs.error +
+            # decision_logs entries. After 3 consecutive parse
+            # failures across investigator runs of the same job,
+            # mark the job suppressed with notify=false,
+            # reason='investigator_parse_error' and settle.
+            queries.bump_investigation_parse_failure(bundle.job.id, claim_id)
+            failures = queries.investigation_parse_failure_count(bundle.job.id)
+            if failures >= 3:
+                queries.mark_job_suppressed_if_claimed(
+                    bundle.job.id, claim_id,
+                    {"notify": False,
+                     "suppressed_by": "investigator_parse_error",
+                     "reason": "investigator output parse failed 3 times"},
+                )
+            else:
+                # Release back to open so a fresh claim retries.
+                queries.release_job_claim(bundle.job.id, claim_id)
         except TransientInvestigatorError:
             queries.release_job_claim(bundle.job.id, claim_id)
         except Exception as e:
@@ -215,35 +352,34 @@ renderer's one-shot agent (see `bot/agent/renderer.py` for pattern):
 - max_turns = 6 (enough for 2-3 tool round-trips + final JSON)
 - Hard timeout via `asyncio.wait_for(
   settings.investigator_max_duration_seconds=90)`
-- Output parsing: same JSON extractor as decider; if parse fails
-  3 times for the same job (track via `investigator_decision`
-  shape on suppressed-with-error rows), suppress with
-  `notify=false, reason="judge_parse_error"`.
+- Output parsing: same JSON extractor as 1.0a's decider, raises
+  `DecisionParseError` on bad JSON. The loop catches this and
+  uses the parse-failure budget logic above.
 
-`create_notification_for_job(bundle, brief)` writes a notifications
-row directly via `upsert_notification_row` (existing 1.0a RPC) with:
-- event_id = max(bundle.events.id) — the most recent seed
-- subscription_id = bundle.job.subscription_id
-- decision shape: `{send: True, suppressed_by: None}` (status will
-  be 'pending')
-- payload_snapshot = brief jsonb (this is what renderer reads)
-- delivery_kind/target = derived from bundle.subscription
-  (call existing `_delivery_for_subscription`)
-- decided_payload_version = corresponding event's payload_version
+**Tracking parse failures**: 0017 adds two columns to
+`investigation_jobs`:
+- `attempt_count int not null default 0`
+- `last_error text`
+- `last_error_at timestamptz`
 
-Important: also need to set `notifications.investigation_job_id`.
-Either extend `upsert_notification_row` RPC to take it (preferred,
-matches 1.0a pattern) OR follow up with an UPDATE in the same
-transaction. The cleanest is to extend the RPC.
+`bump_investigation_parse_failure(job_id, claim_id)` is a small
+RPC that increments `attempt_count` and stores the latest parse
+error. `investigation_parse_failure_count(job_id)` reads
+`attempt_count`. Both lease-checked.
+
+This replaces the "track via investigator_decision shape" hand-wave
+in the previous draft, which was unimplementable because
+`investigator_decision` is only set on close.
 
 **Files touched in this chunk**:
 - `bot/agent/investigator_loop.py` (new)
 - `bot/agent/investigator.py` (new) — the `investigate(bundle)`
   function and dataclass
 - `bot/agent/decider_loop.py` — already touched in §3
-- `bot/db/queries.py` — extend `upsert_notification_row` to accept
-  `investigation_job_id`; pass through to RPC; minor schema bump
-  for the SQL function in 0017
+- `bot/db/queries.py` — wrappers for the 3 new RPCs (
+  `create_notification_for_investigation_job`,
+  `bump_investigation_parse_failure`,
+  `investigation_parse_failure_count`)
 - `bot/config.py` — add `investigator_loop_interval_seconds: int =
   20`, `investigator_max_duration_seconds: int = 90`,
   `investigator_max_turns: int = 6`,

@@ -172,16 +172,26 @@ The decider in 1.0c writes one decision_log row per (event, sub)
 pair as before, but now also stamps which job the event was added
 to (or "no job opened" if it didn't open one).
 
-### 3.4 No changes
+### 3.4 Carry-forward (no schema change beyond what's listed above)
 
 - `events` schema unchanged. Trigger unchanged.
-- `subscriptions` schema unchanged. Description still natural
-  language.
+- `subscriptions` carries forward 1.0b's `archived_at` column
+  (added in 0016). 1.0c adds **one** column to subscriptions:
+  `metadata jsonb` (§4.1.1) for the project-name lockout. No
+  other subscription column changes.
 - `feishu_links` unchanged.
-- All RLS policies and security-definer functions from 1.0a.
-- All RPC functions from 1.0a (claim_pending_notifications,
-  mark_sent_if_claimed, etc.) — they operate on `notifications`
-  which still works the same way at the delivery layer.
+- All RLS policies and security-definer functions from 1.0a/1.0b
+  remain valid.
+- All RPC functions from 1.0a remain (claim_pending_notifications,
+  mark_sent_if_claimed, etc.). They still operate on
+  `notifications` and run unchanged in the delivery layer.
+  `upsert_notification_row` is **not used by 1.0c's investigator
+  path** — that path uses the new
+  `create_notification_for_investigation_job` RPC instead.
+  `upsert_notification_row` is kept for any straggler 1.0a-shape
+  notifications that might get re-decided during the rollover
+  window; it can be deleted in a 1.0d cleanup migration once we
+  confirm no caller exists.
 
 ---
 
@@ -198,6 +208,24 @@ For each (event, candidate subscription) pair:
    - Subscription is enabled and not archived (already in 1.0a).
    - `event.occurred_at >= subscription.created_at` (forward-only,
      already in 1.0a per `1223082`).
+   - **Project-name lockout (deterministic, code-level)**: if the
+     subscription description contains any project token from
+     `subscription.metadata.matched_projects` (populated at
+     subscription create time — see §4.1.1), AND the event's
+     `project_root` does NOT contain any of those tokens as a path
+     component (case-insensitive substring on the last 2 path
+     segments), skip with `investigate=false,
+     reason="project_root_lockout"`. This is a code check, NOT a
+     prompt — exactly because LLMs cannot be trusted to enforce
+     literal-string lookups about themselves.
+
+     The "subscription mentions a project" detection runs once at
+     `add_subscription` time using a small extraction LLM call,
+     and the resulting list of project tokens is cached on
+     `subscriptions.metadata` jsonb. See §4.1.1 for the index step.
+     If the extraction yields an empty list (subscription doesn't
+     mention any specific project), this lockout doesn't fire and
+     the event passes through to the gatekeeper LLM normally.
 2. **LLM gatekeeper call**: prompt §5.1. Output:
    ```json
    {
@@ -214,9 +242,52 @@ For each (event, candidate subscription) pair:
    none exists in the aggregation window (see §4.2).
 4. **If `investigate=false`**: write decision_log row only, do
    nothing else. No notification row.
+5. **If LLM output won't parse as JSON** (3rd consecutive failure
+   for the same `(event_id, subscription_id, payload_version)`):
+   write decision_log with `judge_output =
+   {"investigate": false, "suppressed_by": "gatekeeper_parse_error",
+   "reason": "gatekeeper output parse failed 3 times"}` and
+   settle the pair (mark event processed for this version, just
+   like a successful `investigate=false`). First two failures: log
+   the parse error in decision_logs but leave the pair unprocessed
+   so the next loop iteration retries. This mirrors 1.0a's parse
+   failure budget pattern and prevents the 1.0a-class infinite
+   retry / API-cost-burn bug from coming back.
 
 The decider does NOT write a `notifications` row in 1.0c. That's
 the investigator's job.
+
+### 4.1.1 Subscription metadata indexing
+
+To make the project-name lockout deterministic, every subscription
+gets a one-time LLM extraction at create time:
+
+```sql
+alter table public.subscriptions
+    add column if not exists metadata jsonb not null default '{}';
+```
+
+When `add_subscription` runs (either via web rules panel or via
+chat tool), after the row is inserted, an async post-insert step
+calls a tiny LLM with this prompt:
+
+```
+从这条订阅描述里抽出明确指名的项目（一般是英文项目名，比如
+vibelive / oneship / pmo_agent）。如果没明确指名某个项目就返回空数组。
+
+输入: "{description}"
+输出 JSON: {"matched_projects": [string]}
+```
+
+Result is stored on `subscriptions.metadata = {"matched_projects":
+[...], "indexed_at": "..."}`. Used by §4.1 step 1's project-name
+lockout.
+
+If the extraction call fails, leave metadata empty — the lockout
+won't fire, gatekeeper LLM does the matching as a fallback. The
+indexing is best-effort optimisation, not correctness-critical.
+A nightly maintenance task can re-index any subscription with
+`metadata = {}`.
 
 ### 4.2 Aggregation window — when to share a job
 
@@ -242,6 +313,29 @@ Rules:
   pick up, or by simply letting the investigator loop's claim
   query enforce the 30-min OR 5-events condition.
 
+**Concurrency**: `append_to_or_open_investigation_job` is the
+only place that opens jobs, and it must be safe under multiple
+decider workers running in parallel. The RPC does:
+
+1. `pg_advisory_xact_lock(hashtext('inv_job:' || subscription_id))`
+   — serialises this RPC's body per subscription, but doesn't
+   block other subscriptions or other RPCs. Released at txn end.
+2. SELECT the most recent open job for this subscription within
+   the 30-min window. With the advisory lock held, this read +
+   subsequent UPDATE/INSERT is a serialisable critical section
+   for this one subscription.
+3. UPDATE (append to seed_event_ids, dedupe) OR INSERT new job.
+
+The investigator's `claim_investigatable_jobs` uses
+`FOR UPDATE SKIP LOCKED` so it doesn't block decider appends; if
+an append RPC and a claim RPC race, one of them sees the row
+locked and either skips (claim) or waits briefly (append, until
+claim's UPDATE commits). The append RPC also re-checks
+`status = 'open'` before its UPDATE — once a claim has flipped
+the row to 'investigating', the append falls through to opening
+a NEW job for the next batch, which is the desired behavior
+(events arriving DURING an investigation form the next batch).
+
 We do **NOT** aggregate across subscriptions. Each subscription has
 its own independent job stream. (Cross-subscription dedup is a
 1.0d concern.)
@@ -264,8 +358,20 @@ async def investigator_loop():
             try:
                 brief = await investigate(job)  # LLM agent call, §5.2
                 if brief["notify"]:
-                    notif = create_notification_for_job(job, brief)
-                    mark_job_notified_if_claimed(job.id, claim_id, notif.id, brief)
+                    # Single atomic RPC: writes notification AND
+                    # flips job to 'notified' in one transaction.
+                    # Returns notif_id, or null if lease lost.
+                    notif_id = create_notification_for_investigation_job(
+                        job_id=job.id, claim_id=claim_id,
+                        event_id=most_recent_seed(job),
+                        subscription_id=job.subscription_id,
+                        decided_payload_version=event_version_at_claim,
+                        payload_snapshot=brief,
+                        delivery_kind=delivery_kind,
+                        delivery_target=delivery_target,
+                    )
+                    if notif_id is None:
+                        log.warning("investigator lost claim on job %s", job.id)
                 else:
                     mark_job_suppressed_if_claimed(job.id, claim_id, brief)
             except TransientError:
@@ -288,16 +394,88 @@ AND (
 Once claimed, status flips to `'investigating'`, claim_id +
 claimed_at stamped. Stale claims (>10 min) reaped each iteration.
 
-**`create_notification_for_job`** writes a `notifications` row at
-status='pending' with:
+**`create_notification_for_investigation_job`** is a new
+single-transaction RPC defined in 0017. Both the notification
+INSERT and the job state transition (`investigating → notified`)
+happen atomically with a lease re-check at the top:
+
+```sql
+create function create_notification_for_investigation_job(
+    p_job_id          bigint,
+    p_claim_id        uuid,
+    p_event_id        bigint,
+    p_subscription_id uuid,
+    p_decided_payload_version int,
+    p_payload_snapshot jsonb,    -- the investigator brief
+    p_delivery_kind   text,
+    p_delivery_target text
+) returns bigint
+language plpgsql
+security definer
+as $$
+declare
+    new_notif_id bigint;
+begin
+    -- Lease re-check: if another investigator already finished
+    -- this job (notified/suppressed/failed), abort cleanly.
+    if not exists (
+        select 1 from public.investigation_jobs
+         where id = p_job_id
+           and claim_id = p_claim_id
+           and status = 'investigating'
+    ) then
+        return null;
+    end if;
+
+    insert into public.notifications (
+        event_id, subscription_id, status,
+        delivery_kind, delivery_target,
+        decided_payload_version, decided_at,
+        payload_snapshot, investigation_job_id
+    ) values (
+        p_event_id, p_subscription_id, 'pending',
+        p_delivery_kind, p_delivery_target,
+        p_decided_payload_version, now(),
+        p_payload_snapshot, p_job_id
+    )
+    on conflict (event_id, subscription_id) do update
+        set status = excluded.status,
+            delivery_kind = excluded.delivery_kind,
+            delivery_target = excluded.delivery_target,
+            decided_payload_version = excluded.decided_payload_version,
+            decided_at = excluded.decided_at,
+            payload_snapshot = excluded.payload_snapshot,
+            investigation_job_id = excluded.investigation_job_id,
+            rendered_text = null, feishu_msg_id = null,
+            sent_at = null, error = null,
+            claim_id = null, claimed_at = null
+        where public.notifications.status not in ('sent', 'claimed')
+    returning id into new_notif_id;
+
+    update public.investigation_jobs
+       set status = 'notified',
+           investigator_decision = p_payload_snapshot,
+           notification_id = new_notif_id,
+           closed_at = now(),
+           updated_at = now(),
+           claimed_by = null,
+           claimed_at = null
+     where id = p_job_id
+       and claim_id = p_claim_id;
+
+    return new_notif_id;
+end $$;
+```
+
+Field semantics:
 - `event_id` = the **most recent** seed_event_id (so existing
-  decided_payload_version logic still works for the rare case
-  where the event payload mutates after job is closed)
-- `subscription_id` = job.subscription_id
-- `investigation_job_id` = job.id
-- `payload_snapshot` = brief (the structured investigator decision)
-- `delivery_kind/target` = derived from subscription scope at
-  notification creation time (same logic as 1.0a)
+  delivery-loop dedupe semantics still work)
+- `payload_snapshot` = the brief jsonb
+- `investigation_job_id` is the new column on `notifications` that
+  links back to the job for audit / why_no_notification
+
+`mark_job_suppressed_if_claimed` is similar but only updates the
+job; no notifications row is written.
 
 The existing 1.0a delivery loop then claims this row, calls the
 renderer, sends to Feishu. **No changes to the delivery layer.**
@@ -479,21 +657,49 @@ treated as legacy.
 
 ### 7.1 Wrong-project firing regression
 
+This is the test that proves the project-name lockout (§4.1) works
+**without** depending on LLM behavior. The whole point is that a
+prompt-based check is what 1.0a had and it was insufficient.
+
 Setup:
-1. User bcc subscribes: "vibelive 项目有进展告诉我".
+1. User bcc subscribes: "vibelive 项目有进展告诉我". Wait for
+   `subscriptions.metadata.matched_projects` to be populated
+   (should equal `["vibelive"]` after indexing).
 2. albert pushes a turn with `project_root='/Users/.../oneship'`,
    `agent_summary='调整 OneShip workspace 选择器'`.
 
 Assertion:
 - One `decision_logs` row exists with
-  `judge_output.investigate=false, reason="project_root mismatch"`.
+  `judge_output.investigate=false,
+   reason="project_root_lockout"`.
+- The decider did NOT call the LLM gatekeeper for this pair (we
+  can verify by asserting `decision_logs.input_tokens IS NULL`,
+  since the lockout short-circuits before any LLM call).
 - No `investigation_jobs` row created.
 - No `notifications` row created.
 - bcc's Feishu DM has no new bot message.
 
-This regression test must be in `bot/tests/test_proactive_1_0c.py`
-as a unit test against a mocked judge (the LLM, mocked to return
-"investigate=false") OR run as integration with a sandboxed Supabase.
+**This test MUST run end-to-end against a real LLM-backed
+deployment**. A unit test with a mocked LLM does NOT prove the
+fix, because the bug class is "LLM ignores instructions about
+literal project name matching" — mocking the LLM out of the test
+defeats the test's purpose. The test goes in
+`bot/tests/test_proactive_1_0c_e2e.py` and runs against a sandbox
+Supabase + the real ARK Coding Plan LLM, OR it's a manual check
+in the §8 deploy validation script.
+
+Two unit tests are still useful as a faster signal:
+- `test_lockout_fires_when_metadata_has_project` — given a
+  subscription row with `metadata.matched_projects=["vibelive"]`
+  and an event with `project_root='/Users/.../oneship'`, the
+  decider's precondition function returns `(skip=True,
+  reason="project_root_lockout")` without making any LLM call.
+- `test_lockout_does_not_fire_when_metadata_empty` — given
+  `metadata.matched_projects=[]`, precondition function lets the
+  event through to the gatekeeper (which is then mocked).
+
+These unit tests prove the code path; the e2e test proves the
+indexing actually populates `matched_projects` correctly.
 
 ### 7.2 Narrative subscription positive path
 
