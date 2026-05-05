@@ -33,7 +33,8 @@ of truth for behaviour. This document is the source of truth for
 Creates:
 
 - `investigation_jobs` table per spec §3.1, with status enum,
-  seed_event_ids array, lease columns (claimed_by/claimed_at).
+  seed_event_ids array, lease columns (claim_id/claimed_at — same
+  shape as notifications.claim_id/claimed_at).
 - Indexes: open jobs by subscription, recent open jobs.
 - `notifications.investigation_job_id` column + index.
 - `decision_logs.investigation_job_id` column.
@@ -74,9 +75,10 @@ Creates:
     lease returns null instead of producing a notification.
     Replaces the previous draft's compose-two-operations approach.
     Full SQL in spec §4.3.
-  - `mark_job_suppressed_if_claimed(p_id, p_claim_id, p_brief)`:
+  - `mark_job_suppressed_if_claimed(p_id, p_claim_id, p_brief,
+    p_input_tokens default null, p_output_tokens default null)`:
     lease-conditional UPDATE; flips status to 'suppressed', stores
-    brief, clears claim columns.
+    brief, captures usage tokens on the row, clears claim columns.
   - `release_job_claim(p_id, p_claim_id)`: lease-conditional;
     flips 'investigating' → 'open' so next iteration can re-claim.
   - `mark_job_failed_if_claimed(p_id, p_claim_id, p_error)`:
@@ -121,17 +123,18 @@ insert into subscriptions (...) values (...) returning id;  -- s
 4. Mock 31 min elapsed (`update investigation_jobs set
    opened_at = now() - interval '31 min' where id=J1`).
 5. Call `append_to_or_open_…(s, e3)` → expect a NEW job J2
-   (window expired) with `seed_event_ids=[e3]`. J1 still 'open'.
-6. Call `claim_investigatable_jobs(uuid_v4(), 5)` → assert two
-   rows returned (both J1 with 2 events meets the 30-min rule, J2
-   with 1 event also meets the rule because its window check
-   reads `array_length(seed_event_ids,1) >= 5 OR opened_at <
-   now()-30min`; need to verify our test moves J2 also past 30min
-   to make this pass).
-   Assert each returned row has:
-   - `notification` jsonb (the job row)
+   (window expired) with `seed_event_ids=[e3]`, opened_at=now().
+   J1 still 'open' but stale.
+6. Call `claim_investigatable_jobs(uuid_v4(), 5)` → assert
+   **exactly one** row returned, J1 (its 2-event count + 31-min
+   age both satisfy the eligibility predicate). J2 is NOT
+   returned because J2 has only 1 event AND opened_at=now() <
+   now()-30min. Verify J2.status is still 'open' afterwards.
+   Assert the J1 returned row has:
+   - `notification` jsonb (the job row, with status now
+     'investigating' and claim_id set)
    - `subscription` jsonb
-   - `event_payloads` jsonb array — for J1, length 2 with e1+e2's
+   - `event_payloads` jsonb array — length 2 with e1+e2's
      payload jsonb in seed_event_ids order
    - status flipped to 'investigating' in DB
 7. Call `mark_job_suppressed_if_claimed(J1, right_claim_id,
@@ -215,7 +218,7 @@ verify shapes match dataclasses.
     change.
   - Hard preconditions BEFORE the LLM call:
     - subscription enabled+not archived (already in 1.0a)
-    - `event.occurred_at >= subscription.created_at` (1.0a forward
+    - `event.ingested_at >= subscription.created_at` (1.0a forward
       semantics)
   - Remove all references to `upsert_notification_row` from the
     decider's call path.
@@ -292,11 +295,18 @@ async def process_once(limit: int = 5) -> int:
     bundles = queries.claim_investigatable_jobs(claim_id, limit)
     for bundle in bundles:
         try:
-            brief = await investigate(bundle)  # §5.2 prompt
+            # investigate() returns (brief, usage) where usage is
+            # {input_tokens, output_tokens} captured from the SDK's
+            # ResultMessage. Token capture is wrapper-side, NOT in
+            # the LLM's brief output.
+            brief, usage = await investigate(bundle)
             if brief.get("notify"):
                 # ONE atomic RPC writes the notification AND flips
                 # the job to 'notified' inside one txn. Returns the
-                # new notif id, or None if the lease was lost.
+                # new notif id, or None if the lease was lost OR
+                # the (event, sub) pair already had a frozen
+                # sent/claimed notification (in which case the RPC
+                # marks the job suppressed/delivery_dedup itself).
                 notif_id = queries.create_notification_for_investigation_job(
                     job_id=bundle.job.id,
                     claim_id=claim_id,
@@ -306,12 +316,16 @@ async def process_once(limit: int = 5) -> int:
                     payload_snapshot=brief,
                     delivery_kind=delivery_kind,
                     delivery_target=delivery_target,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
                 )
                 if notif_id is None:
                     logger.warning("investigator lost claim job=%s", bundle.job.id)
             else:
                 queries.mark_job_suppressed_if_claimed(
                     bundle.job.id, claim_id, brief,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
                 )
         except asyncio.CancelledError:
             raise
