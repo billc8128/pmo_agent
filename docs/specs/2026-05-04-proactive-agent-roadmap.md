@@ -62,7 +62,7 @@ for how this is operationalised.
 ```
 1.0a  ──────────►  1.0b  ──────────►  1.0c  ──────────►  2.0
 skeleton           UI panel           more sources        team-level
-                                      + interactions      + planning
+                                      + investigator      + planning
 ```
 
 Each stage builds on the previous. **We commit only to 1.0a now.**
@@ -135,22 +135,149 @@ LLM judge produces useful decisions.
 
 **Estimate**: ~3h.
 
-### 1.0c — Productionised
+### 1.0c — Investigation-driven proactive PMO
 
-**Goal**: Close the obvious gaps from real-world use.
+**Goal**: Stop treating a single event as the notification decision.
+The 1.0a decider is useful as a skeleton, but real subscriptions are
+often "watch this topic and tell me when it matters", not "judge this
+one turn in isolation". 1.0c changes the architecture so the first
+LLM call decides whether an event is worth investigation, and a PMO
+investigator agent reads enough context before deciding whether to
+notify the user.
 
-✅ added
-- GitHub + Gitea webhooks ingested as events
-- Notification cards get interactive buttons:
+**New mental model**
+
+```
+turn / push event
+  -> decider: is this worth PMO investigation for this subscription?
+  -> investigation_job
+  -> PMO investigator: read enough context, decide notify/suppress
+  -> renderer
+  -> Feishu
+```
+
+The decider becomes a lightweight gatekeeper. It no longer answers
+"should we notify the user?" It answers "should the PMO agent spend
+time looking into this for this subscription?" False positives are
+acceptable because the investigator can suppress after reading more
+context. False negatives are the main risk, so the decider prompt
+should prefer "investigate" when the event plausibly relates to the
+subscription.
+
+**Added**
+
+- `investigation_jobs` table:
+  - `subscription_id`
+  - `status = open | investigating | notified | suppressed | failed`
+  - `seed_event_ids`
+  - `initial_focus`
+  - `decider_reason`
+  - `flush_after`
+  - `opened_at`, `updated_at`, `closed_at`
+  - `investigator_decision`
+- Decider loop writes / appends investigation jobs instead of writing
+  notification decisions directly. The first 1.0c cut should still
+  aggregate: for a given subscription, keep one open job per window
+  (default 30 minutes). New plausible events append to that job's
+  `seed_event_ids` until the job flushes. Flush when the window
+  expires, when the job reaches a small event threshold (e.g. 3
+  seeds), or when the seed event is explicitly conclusive ("完成",
+  "上线", "决定", "阻塞解除"). After a job closes, the next plausible
+  event opens a new job, and the investigator receives the last
+  closed job outcome as dedup context.
+- PMO investigator loop:
+  - loads the subscription's original natural-language description
+  - reads seed event turns
+  - reads same-project recent turns
+  - reads same-session nearby turns
+  - checks recent notifications / decision history
+  - stays within a fixed context budget: all seed turns up to a cap,
+    at most 20 same-project recent turns, at most 5 same-session
+    neighbouring turns per seed, and at most 10 recent notifications
+    / decisions. If more context exists, the investigator should
+    sample by recency and topic relevance instead of dumping the
+    whole project history.
+  - decides `notify=true|false`, with evidence event ids and a
+    structured notification brief
+- Investigator output is the authority for the notification decision:
+
+  ```json
+  {
+    "notify": true,
+    "reason": "why this is worth telling the user",
+    "evidence_event_ids": [57, 61, 64],
+    "brief": {
+      "recommended_topic": "vibelive 播放器稳定性方案",
+      "key_facts": [
+        "buffer 从 2MB 调到 5MB",
+        "新增卡顿重试日志",
+        "补了丢帧监控"
+      ],
+      "risk_or_next_step": "继续观察 iOS 首帧延迟"
+    },
+    "dedupe_key": "vibelive-player-stability"
+  }
+  ```
+
+  The renderer may choose wording, but it may not change
+  `notify`, swap evidence ids, add facts not present in `key_facts`,
+  or rename the project/topic.
+- Renderer only turns the investigator's brief into Feishu markdown.
+  It must not re-decide project/topic matching or invent a different
+  project than the evidence supports.
+- GitHub + Gitea webhooks can be added as more event sources once the
+  investigation path is in place; they should feed the same
+  `events -> investigation_jobs` path as turns.
+- Notification cards can then add interaction buttons:
   - "Mute 1h" / "Don't tell me about this kind"
   - "Open full timeline"
-- Batching: events arriving within 30s on the same subject merge
-  into one notification
-- Daily cap is soft — overflow queues until next quiet-hours-end as
-  a "what you missed" digest
-- Notification cards visually flag the source event (turn vs push)
 
-**Estimate**: ~4h.
+**Not the 1.0c goal**
+
+- No separate rule/score engine in front of the decider. If we need
+  cheap indexing later, add it after observing real cost and recall
+  problems. The first 1.0c cut keeps one LLM gatekeeper plus one PMO
+  investigator, not a stack of policy layers.
+- No automatic write actions. The investigator may recommend or
+  explain, but it still only notifies.
+
+**1.0a → 1.0c migration path**
+
+- Keep `events`, `subscriptions`, `notifications`, delivery, and the
+  Feishu follow-up linkage.
+- Add `investigation_jobs`.
+- Add nullable `investigation_job_id` columns to `decision_logs` and
+  `notifications`. Existing 1.0a rows keep `NULL` and remain readable
+  history.
+- Change the decider loop from "write notification pending" to "open
+  / append investigation job". 1.0a's direct notification path is
+  disabled once the investigator loop is deployed.
+- Write two audit records when a job runs:
+  - decider gate log: why the event opened / appended to a job
+  - investigator decision log: final `notify/suppress`, evidence, and
+    brief
+- Delivery still claims `notifications.pending`; only the writer of
+  pending rows changes from the single-event decider to the
+  investigator.
+
+**Validation script**
+
+1. Create a subscription: "监控 vibelive 播放器方案进展".
+2. Insert 5 vibelive turns in one 30-minute window: 3 about player /
+   buffer / stutter, 2 unrelated housekeeping turns.
+3. Insert 1 oneship turn mentioning unrelated UI work.
+4. Wait for the job flush.
+5. Assert exactly one investigation job closes as `notified`.
+6. Assert the resulting notification references the 3 related
+   vibelive evidence event ids, mentions "播放器" or "播放链路", and
+   does not include the 2 unrelated vibelive turns or the oneship
+   event as evidence.
+7. Reply under the notification and verify the bot uses the
+   investigation brief / evidence context.
+
+**Estimate**: ~1 day for the first rewrite over the existing 1.0a
+delivery/renderer tables; more if GitHub/Gitea sources are included
+in the same cut.
 
 ### 2.0 — Team-level coordinator
 
@@ -196,21 +323,22 @@ re-design and must be reconsidered explicitly.
    payload update is reconsidered without ever creating duplicate
    rows. Sources are pluggable; consumers don't know or care where
    an event came from.
-3. **Subscriptions are natural language**. We store the user's
-   verbatim text in `subscriptions.description`; we never parse it
-   into structured rules. Interpretation is the LLM's job, every
-   time. This is what lets a single mechanism handle "vibelive 进展",
-   "凌晨别打扰", "项目 C 不要", and arbitrary future preferences
-   without schema migrations.
-4. **The LLM judge is the only place rules live**. Quiet hours,
-   dedup windows, daily caps, exclusion preferences — all expressed
-   to the judge as context, all enforced via the judge's `send`
-   verdict. We do **not** build a separate rules engine.
-5. **Generation reuses the existing agent runner**. Writing a
-   notification is an agent invocation with a different system
-   prompt; it has access to the same tools (`get_recent_turns`,
-   `get_project_overview`, future `fetch_pr_details`). We do not
-   fork the agent loop.
+3. **Subscriptions stay natural language at the product boundary**.
+   `subscriptions.description` remains the source of truth. Future
+   systems may index or summarise a subscription for routing, but
+   those derived fields are hints, not the user's contract. Any
+   investigation must still have access to the original text.
+4. **Decision authority is explicit per stage**. In 1.0a, the decider
+   returns `send/suppress` for one event. In 1.0c, the decider opens
+   investigation jobs and the PMO investigator makes the final
+   `notify/suppress` decision after reading context. The investigator
+   must output a structured brief with evidence ids and key facts. We
+   do not hide extra notification decisions inside the renderer.
+5. **Agent work reuses the existing PMO tool surface**. Rendering and
+   investigation are agent invocations with different system prompts;
+   they use the same read tools (`get_recent_turns`,
+   `get_project_overview`, future `fetch_pr_details`) instead of
+   building a parallel data access layer.
 6. **Subscriptions can be owned by users or chats** from day one.
    The data model supports both even though 1.0a's UX is mostly
    user-centric — adding chat-level later is a UX change, not a
@@ -226,12 +354,12 @@ re-design and must be reconsidered explicitly.
 
 | Risk | Tested in | Failure mode |
 |------|-----------|--------------|
-| LLM judge is too noisy / too quiet | 1.0a | Re-tune prompt; add structured pre-filter only if prompt iteration plateaus |
-| Notification spam from rebase storms | 1.0a (5min dedup) → 1.0c (batching) | Users disable subscriptions |
+| LLM judge is too noisy / too quiet | 1.0a → 1.0c | Move final notification decision from single-event decider to PMO investigator |
+| Notification spam from rebase storms | 1.0a (5min dedup) → 1.0c (investigation jobs) | Users disable subscriptions |
 | Decision latency too high | 1.0a (30s loop) | Acceptable for MVP; revisit if >2min in real use |
-| Cost per event scales badly | 1.0a (logged), 1.0c (pre-filter) | Add coarse rule-based pre-filter before LLM judge |
+| Cost per event scales badly | 1.0a (logged), 1.0c (job suppression) | Open one investigation job per plausible thread, not one notification per event |
 | Users can't find their subscriptions | 1.0a (chat list) → 1.0b (web list) | Make UI primary if chat-only is friction |
-| Group notifications get noisy in busy channels | 1.0c | Per-chat rate limits; downgrade to digest |
+| Group notifications get noisy in busy channels | 1.0c | PMO investigator suppresses low-value jobs; later downgrade to digest |
 
 ---
 
@@ -252,20 +380,28 @@ re-design and must be reconsidered explicitly.
 ## 6. Glossary
 
 - **Subscription**: a (scope_kind, scope_id, description, enabled)
-  row. The description is user's natural language; nothing else
-  parses it.
+  row. The description is the user's natural language and remains
+  the source of truth even if future stages add derived indexes.
 - **Event**: a row representing one happened thing (turn / push /
   …). Identified by `(source, source_id)` — that identity never
   changes. Carries a `payload` projection of the source data and
   a `payload_version` integer; both are allowed to mutate when the
   source updates.
-- **Notification**: a (event_id, subscription_id, status,
-  rendered_text, …) row representing one decision. May or may not
-  have been delivered, depending on `status`.
+- **Investigation job**: a 1.0c row representing "the PMO should look
+  into these seed events for this subscription". It is not a
+  notification; it may close as suppressed.
+- **Notification**: a delivered-or-deliverable row created only after
+  a decider/investigator decision says the user should be told. May
+  or may not have been delivered, depending on `status`.
 - **Decision log**: the LLM judge's full input/output for one
   (event, subscription) pair. Always written, even when nothing is
   delivered.
-- **Judge / Decider**: the LLM call that, for one (event,
-  subscription) pair, returns `{send: bool, reason, …}`.
-- **Renderer**: the LLM call that, for one approved (event,
-  subscription), produces the human-facing text.
+- **Judge / Decider**: in 1.0a, the LLM call that returns
+  `{send: bool, reason, …}` for one (event, subscription) pair. In
+  1.0c, the lightweight LLM gatekeeper that decides whether to open
+  an investigation job.
+- **PMO investigator**: the 1.0c agent invocation that reads enough
+  project/session/topic context for an investigation job and makes
+  the final `notify/suppress` decision.
+- **Renderer**: the LLM call that, for one approved notification
+  brief, produces the human-facing text.
