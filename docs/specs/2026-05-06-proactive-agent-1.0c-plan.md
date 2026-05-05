@@ -32,9 +32,18 @@ of truth for behaviour. This document is the source of truth for
 
 Creates:
 
-- `investigation_jobs` table per spec §3.1, with status enum,
-  seed_event_ids array, lease columns (claim_id/claimed_at — same
-  shape as notifications.claim_id/claimed_at).
+- `investigation_jobs` table per spec §3.1, with the full column
+  set (no later alters needed):
+  - `id`, `subscription_id`, `status`, `seed_event_ids` array
+  - `initial_focus`, `decider_reason`, `investigator_decision`
+  - `notification_id`, `claim_id`, `claimed_at`
+  - **`attempt_count int default 0`, `last_error text`,
+    `last_error_at timestamptz`** — parse-failure budget per
+    spec §4.3 / plan §4
+  - **`input_tokens int`, `output_tokens int`** — LLM usage
+    captured from SDK `ResultMessage.usage`, written by the
+    success-path RPC and `mark_job_suppressed_if_claimed`
+  - `opened_at`, `updated_at`, `closed_at`, `error`
 - Indexes: open jobs by subscription, recent open jobs.
 - `notifications.investigation_job_id` column + index.
 - `decision_logs.investigation_job_id` column.
@@ -42,32 +51,37 @@ Creates:
   project-name lockout (spec §4.1.1).
 - New RPC functions:
   - `append_to_or_open_investigation_job(p_subscription_id,
-    p_event_id, p_initial_focus, p_decider_reason)`:
+    p_event_id, p_initial_focus, p_decider_reason,
+    p_window_minutes int default 30)`:
     **Concurrency-safe** version. Steps inside one transaction:
     1. Acquire a transaction-level advisory lock keyed by
        hashtext('inv_job:' || p_subscription_id::text). This
        serialises append/open per subscription across decider
        workers without blocking other subscriptions.
     2. SELECT the most recent open job for this subscription with
-       `opened_at >= now() - interval '30 minutes'` AND
-       `status='open'` (NOT 'investigating' — once an investigator
-       has claimed the job, new events open a fresh job).
+       `opened_at >= now() - make_interval(mins => p_window_minutes)`
+       AND `status='open'` (NOT 'investigating' — once an
+       investigator has claimed the job, new events open a fresh
+       job).
     3. If found: UPDATE that job, appending p_event_id to
        seed_event_ids if not already present, bumping updated_at.
        Returns existing job id.
     4. If not found: INSERT a new job with seed_event_ids=[p_event_id].
        Returns new job id.
     The advisory lock releases at transaction end.
-  - `claim_investigatable_jobs(p_claim_id, p_limit)`:
+    Python wrapper passes `settings.aggregation_window_minutes`.
+  - `claim_investigatable_jobs(p_claim_id, p_limit,
+    p_window_minutes int default 30)`:
     lease-based pickup using `FOR UPDATE SKIP LOCKED`, like
     `claim_pending_notifications`. Eligible:
     `status='open' AND (array_length(seed_event_ids, 1) >= 5
-    OR opened_at < now() - interval '30 minutes')`. Flips to
-    status='investigating', stamps claim_id + claimed_at. Returns
-    rows joined with subscription jsonb and an event_payloads
+    OR opened_at < now() - make_interval(mins => p_window_minutes))`.
+    Flips to status='investigating', stamps claim_id + claimed_at.
+    Returns rows joined with subscription jsonb and an event_payloads
     jsonb array (each element is `{id, payload, payload_version,
     occurred_at, project_root}` for one seed event, in
-    seed_event_ids order).
+    seed_event_ids order). Python wrapper passes
+    `settings.aggregation_window_minutes`.
   - `create_notification_for_investigation_job(...)` — single
     atomic RPC that writes the notification row AND flips the job
     to 'notified'. Re-checks lease (`claim_id == p_claim_id AND
@@ -165,16 +179,37 @@ clean.
 
 **File**: `bot/db/queries.py`
 
-Add wrappers for the 6 new RPCs (one-line `sb_admin().rpc(...)`):
+Add wrappers for the new RPCs (one-line `sb_admin().rpc(...)` each):
 
-- `append_to_or_open_investigation_job(...)` returns int job_id
-- `claim_investigatable_jobs(claim_id, limit)` returns
+Decider-side:
+- `append_to_or_open_investigation_job(subscription_id, event_id,
+  initial_focus, decider_reason)` → returns int job_id
+
+Investigator-side:
+- `claim_investigatable_jobs(claim_id, limit)` →
   `list[InvestigatableJobBundle]`
-- `mark_job_notified_if_claimed(...)` returns bool (lease ok)
-- `mark_job_suppressed_if_claimed(...)` returns bool
-- `release_job_claim(...)` returns bool
-- `mark_job_failed_if_claimed(...)` returns bool
-- `reap_stale_job_claims()` returns int
+- `create_notification_for_investigation_job(job_id, claim_id,
+  event_id, subscription_id, decided_payload_version,
+  payload_snapshot, delivery_kind, delivery_target, input_tokens,
+  output_tokens)` → returns int notif_id or None (lost lease /
+  delivery_dedup; the RPC marks the job suppressed in that case)
+- `mark_job_suppressed_if_claimed(id, claim_id, brief,
+  input_tokens, output_tokens)` → returns bool
+- `mark_job_failed_if_claimed(id, claim_id, error)` → returns bool
+- `release_job_claim(id, claim_id)` → returns bool
+
+Parse-failure budget:
+- `bump_investigation_parse_failure(id, claim_id, error)` →
+  returns int new_attempt_count
+- `investigation_parse_failure_count(id)` → returns int
+  (read of `investigation_jobs.attempt_count`)
+
+Maintenance:
+- `reap_stale_job_claims(stale_after_minutes default 10)` →
+  returns int reaped_count
+
+Total: 9 wrappers, all thin `.rpc()` calls that match SQL functions
+defined in 0017.
 
 New dataclass `InvestigatableJobBundle`:
 
@@ -370,16 +405,17 @@ renderer's one-shot agent (see `bot/agent/renderer.py` for pattern):
   `DecisionParseError` on bad JSON. The loop catches this and
   uses the parse-failure budget logic above.
 
-**Tracking parse failures**: 0017 adds two columns to
-`investigation_jobs`:
-- `attempt_count int not null default 0`
-- `last_error text`
-- `last_error_at timestamptz`
+**Tracking parse failures**: the `attempt_count`, `last_error`,
+`last_error_at` columns on `investigation_jobs` (defined in the
+§3.1 create table, listed above in plan §1's column set) hold the
+budget state.
 
 `bump_investigation_parse_failure(job_id, claim_id)` is a small
-RPC that increments `attempt_count` and stores the latest parse
-error. `investigation_parse_failure_count(job_id)` reads
-`attempt_count`. Both lease-checked.
+RPC that increments `attempt_count`, stores the latest parse
+error in `last_error` / `last_error_at`. Lease-checked (only fires
+if `claim_id = p_claim_id AND status = 'investigating'`).
+`investigation_parse_failure_count(job_id)` is a plain read of
+`attempt_count`.
 
 This replaces the "track via investigator_decision shape" hand-wave
 in the previous draft, which was unimplementable because
@@ -390,14 +426,23 @@ in the previous draft, which was unimplementable because
 - `bot/agent/investigator.py` (new) — the `investigate(bundle)`
   function and dataclass
 - `bot/agent/decider_loop.py` — already touched in §3
-- `bot/db/queries.py` — wrappers for the 3 new RPCs (
+- `bot/db/queries.py` — wrappers added in §2's list, used here for
   `create_notification_for_investigation_job`,
-  `bump_investigation_parse_failure`,
-  `investigation_parse_failure_count`)
-- `bot/config.py` — add `investigator_loop_interval_seconds: int =
-  20`, `investigator_max_duration_seconds: int = 90`,
-  `investigator_max_turns: int = 6`,
-  `investigator_max_turns_context: int = 30`
+  `mark_job_suppressed_if_claimed`, `release_job_claim`,
+  `mark_job_failed_if_claimed`, `bump_investigation_parse_failure`,
+  `investigation_parse_failure_count`
+- `bot/config.py` — add:
+  - `investigator_loop_interval_seconds: int = 20`
+  - `investigator_max_duration_seconds: int = 90`
+  - `investigator_max_turns: int = 6`
+  - `investigator_max_turns_context: int = 30`
+  - `aggregation_window_minutes: int = 30` — read by
+    `append_to_or_open_investigation_job`'s "open job within
+    window" predicate AND `claim_investigatable_jobs`'s
+    "opened_at + window" eligibility predicate. Both Python wrapper
+    and the SQL functions take this as a parameter so the value
+    lives in one place. Risk-table item §11.1 plans to tune this
+    after a week of real usage.
 
 **Exit criterion**:
 - `pytest bot/tests/test_proactive_1_0c.py::test_investigator_writes_notification`

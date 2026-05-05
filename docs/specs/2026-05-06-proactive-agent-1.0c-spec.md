@@ -98,6 +98,19 @@ create table public.investigation_jobs (
     notification_id bigint references public.notifications(id) on delete set null,
     claim_id        uuid,                          -- investigator lease, mirrors notifications.claim_id
     claimed_at      timestamptz,
+    -- Per-job parse-failure budget (mirrors 1.0a's per-pair pattern;
+    -- see plan §4 / spec §4.3 for the bump-then-settle logic).
+    -- Incremented by `bump_investigation_parse_failure` on each
+    -- DecisionParseError. Settles to 'suppressed' at attempt_count=3.
+    attempt_count   int  not null default 0,
+    last_error      text,
+    last_error_at   timestamptz,
+    -- LLM cost tracked at the job level (the brief jsonb does NOT
+    -- carry usage — it's wrapper-side capture from ResultMessage).
+    -- Populated by create_notification_for_investigation_job and
+    -- mark_job_suppressed_if_claimed via p_input_tokens / p_output_tokens.
+    input_tokens    int,
+    output_tokens   int,
     opened_at       timestamptz not null default now(),
     updated_at      timestamptz not null default now(),
     closed_at       timestamptz,
@@ -229,6 +242,15 @@ For each (event, candidate subscription) pair:
      `investigate=false, reason="project_root_lockout"`. No LLM
      call is made for this pair.
 
+     **decision_logs row written for the lockout** uses the
+     sentinel `model='deterministic_project_lockout'` (NOT a real
+     model name) with `input_tokens=null, output_tokens=null,
+     latency_ms=0`. `decision_logs.model` is `NOT NULL` per 1.0a
+     schema, so the sentinel is required to make the insert
+     succeed. The sentinel is also what the why_no_notification
+     tool uses to render "this was filtered by the project lockout,
+     no LLM was consulted" in the timeline.
+
      If `M_sub` is empty (subscription doesn't mention any known
      project), the event passes through to the gatekeeper LLM
      normally — this is the "albert 在干嘛" case, where matching
@@ -288,51 +310,68 @@ alter table public.subscriptions
 
 ```python
 # bot/agent/lockout.py (sketch)
-def known_project_tokens() -> set[str]:
-    """Cache of distinct events.project_root last-segments,
-    lowercased. TTL 60s. Cheap query, but cached so the decider
-    loop doesn't re-issue it for every (event, sub) pair in the
-    iteration.
+def known_project_tokens() -> tuple[set[str], str]:
+    """Returns (K, k_hash). K is the set of distinct
+    events.project_root last-segments, lowercased. k_hash is a
+    stable digest of sorted(K) — when K changes, k_hash changes.
+    TTL 60s. Cheap query, but cached so the decider loop doesn't
+    re-issue it for every (event, sub) pair in the iteration.
     """
     if _cache_age() < 60:
-        return _cache
-    _cache = {seg.lower() for r in distinct_project_roots()
-              for seg in [last_segment(r)]}
-    return _cache
+        return _cache_K, _cache_hash
+    _cache_K = {seg.lower() for r in distinct_project_roots()
+                for seg in [last_segment(r)]}
+    _cache_hash = sha256("|".join(sorted(_cache_K)).encode()).hexdigest()[:16]
+    return _cache_K, _cache_hash
 
 def matched_projects_for(description: str, K: set[str]) -> list[str]:
     desc_lower = description.lower()
     return sorted(t for t in K if t in desc_lower)
 
-def is_project_mismatch(event, sub, K) -> bool:
-    matched = sub.metadata.get("matched_projects")
-    if matched is None:
-        # Cache miss — compute now.
+def is_project_mismatch(event, sub) -> bool:
+    K, k_hash = known_project_tokens()
+    cached = sub.metadata.get("matched_projects")
+    cached_hash = sub.metadata.get("project_tokens_hash")
+    # Recompute when:
+    #  - metadata never written (cached is None)
+    #  - K has changed since metadata was written (hash mismatch)
+    # The second case is what lets a subscription with stale
+    # matched_projects=[] pick up a new project token after it
+    # appears in events.
+    if cached is None or cached_hash != k_hash:
         matched = matched_projects_for(sub.description, K)
-        write_metadata_async(sub.id, {"matched_projects": matched})
-    if not matched:
+        write_metadata_async(sub.id, {
+            "matched_projects": matched,
+            "project_tokens_hash": k_hash,
+            "indexed_at": now_iso(),
+        })
+        cached = matched
+    if not cached:
         return False
-    return last_segment(event.project_root).lower() not in set(matched)
+    return last_segment(event.project_root).lower() not in set(cached)
 ```
 
 `add_subscription` (web rules panel + chat tools) populates
-`metadata.matched_projects` synchronously by calling
+`metadata.matched_projects` AND `metadata.project_tokens_hash`
+synchronously by calling
 `matched_projects_for(description, known_project_tokens())` before
 inserting. If the K cache is empty (e.g. fresh deployment with
-zero events), `matched_projects` will be empty and lockout doesn't
-fire — but in that state there are no events to misfire against
-either, so the safety property holds vacuously.
+zero events), `matched_projects=[]` and `project_tokens_hash` is
+the empty-set hash; lockout doesn't fire — but in that state
+there are no events to misfire against either, so the safety
+property holds vacuously.
 
 **Subscription is fully active the moment it's inserted**. No
-"async indexing window" during which lockout doesn't apply. This
-fixes the original concern that newly-added subscriptions could
-walk through the gatekeeper LLM without lockout protection.
+"async indexing window" during which lockout doesn't apply.
 
-When the events universe grows (new project_root appears), the
-60s K cache expires and the lockout starts using the new token.
-A subscription whose description contains the new token will have
-its metadata recomputed lazily on the first decider iteration
-that sees it after expiry.
+**Stale-cache handling**: when a new `project_root` first appears
+in events, the 60s K cache expires, K's hash changes, and every
+subscription's metadata becomes "stale" (hash mismatch). On the
+next decider iteration that sees each subscription, the lockout
+re-runs `matched_projects_for(description, K)` against the new K
+and writes back the fresh hash. Subscriptions whose description
+contains the new token gain lockout protection within at most
+one decider iteration of the new project_root showing up.
 
 ### 4.2 Aggregation window — when to share a job
 
@@ -496,17 +535,27 @@ begin
             rendered_text = null, feishu_msg_id = null,
             sent_at = null, error = null,
             claim_id = null, claimed_at = null
+        -- Same predicate as 1.0a's upsert_notification_row: never
+        -- overwrite a frozen sent/claimed row, AND never let an
+        -- older payload_version's investigator decision overwrite
+        -- a newer one (could happen if a slow investigation_v1
+        -- finishes after a fresher investigation_v2 has already
+        -- written a pending notification).
         where public.notifications.status not in ('sent', 'claimed')
+          and excluded.decided_payload_version
+              > public.notifications.decided_payload_version
     returning id into new_notif_id;
 
-    -- ON CONFLICT ... WHERE may filter the update entirely (existing
-    -- row is sent/claimed). RETURNING then yields zero rows and
-    -- new_notif_id is null. We must NOT close the job as 'notified'
-    -- in that case — there's no notification to render. Instead we
-    -- mark the job suppressed with reason='delivery_dedup' so the
-    -- audit trail shows the investigator decided to send but the
-    -- delivery layer already had a frozen notification for this
-    -- (event, subscription) pair.
+    -- ON CONFLICT ... WHERE may filter the update entirely. Reasons:
+    --   (a) existing row is sent/claimed (frozen)
+    --   (b) existing row's decided_payload_version >= ours (stale
+    --       investigator decision lost the race against a newer one)
+    -- In both cases RETURNING yields zero rows and new_notif_id is
+    -- null. We must NOT close the job as 'notified' — there's no
+    -- notification we own. Instead mark the job suppressed with
+    -- reason='delivery_dedup'; the audit trail shows the investigator
+    -- decided to send but a frozen-or-newer notification was already
+    -- in place.
     if new_notif_id is null then
         update public.investigation_jobs
            set status = 'suppressed',
@@ -517,9 +566,9 @@ begin
                    ) ||
                    jsonb_build_object(
                        'reason',
-                       'investigator decided notify=true but a frozen ' ||
-                       'sent/claimed notification already exists for ' ||
-                       'this (event, subscription) pair'
+                       'investigator decided notify=true but the ' ||
+                       'notification slot was either frozen ' ||
+                       '(sent/claimed) or held a newer version'
                    ),
                input_tokens = p_input_tokens,
                output_tokens = p_output_tokens,
@@ -872,18 +921,14 @@ plan caps. Cost actively logged in:
 - `decision_logs.input_tokens` / `decision_logs.output_tokens` for
   every decider call (already exists in 1.0a schema, populated by
   the gatekeeper code).
-- New columns on `investigation_jobs`:
-  ```sql
-  alter table public.investigation_jobs
-      add column if not exists input_tokens int,
-      add column if not exists output_tokens int;
-  ```
-  Populated by the investigator code from the SDK's
-  `ResultMessage.usage` (mirroring what 1.0a's
-  `_usage_from_result_message` does in `bot/agent/decider.py`).
-  These are NOT part of the LLM's brief output — the LLM never
-  sees or writes a `usage` field; the wrapper code captures usage
-  from the SDK transport layer and the create-notification RPC
+- `investigation_jobs.input_tokens` / `output_tokens` columns
+  defined in §3.1's create table (not separate alter). Populated
+  by the investigator code from the SDK's `ResultMessage.usage`
+  (mirroring what 1.0a's `_usage_from_result_message` does in
+  `bot/agent/decider.py`). These are NOT part of the LLM's brief
+  output — the LLM never sees or writes a `usage` field; the
+  wrapper code captures usage from the SDK transport layer and
+  the create-notification RPC
   takes them as separate parameters.
 
 The brief schema in §3.1 stays usage-free. Cost lives on the job
