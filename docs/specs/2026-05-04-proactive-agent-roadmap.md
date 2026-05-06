@@ -284,28 +284,117 @@ subscription.
 delivery/renderer tables; more if GitHub/Gitea sources are included
 in the same cut.
 
-### 2.0 — Team-level coordinator
+### 2.0 — From notification system to PMO presence
 
-This is where the bot crosses over from "personal feed" to actual
-PMO behaviour. Each item below is roughly a week's work; we'd pick
-the highest-value first based on real 1.0a/b/c usage.
+2.0 is not a feature list. It is a coherent expansion of 1.0c
+along **three orthogonal axes**, each extending a different
+piece of the
+`events × subscriptions → (notify? topic? to whom?) → Feishu`
+function. Detail in
+[2.0 Strategy](2026-05-06-proactive-agent-2.0-strategy.md).
 
-- **Group subscriptions get richer**: scoped to specific channels
-  with team-level rituals (weekly digest, sprint kickoff brief)
-- **Scheduled briefs**: cron-triggered weekly / daily summaries of
-  who-did-what
-- **Cross-person awareness**: detect "two people working in the same
-  file" and suggest a sync
-- **Stall / blocker detection**: "C 项目 5 天没活动，bcc 你说月底要
-  ship，要查查吗?" — needs project metadata (deadlines, owners)
-- **PR / Linear / meeting linking**: turns mentioning PR #123 auto
-  fetch; notifications include PR diff summary; bot can schedule
-  code review meetings
-- **Multi-team / org**: subscription scope expands to teams, with
-  bridges between them
+The three axes:
 
-We don't commit to any of this until 1.0a/b/c usage shows what
-matters. The roadmap is a memory aid, not a contract.
+#### 2.0a — External event sources (Axis 1: events broaden)
+
+Today `events.source = 'turn'` is the only path. Real teams
+collaborate through GitHub / Gitea / Linear / Feishu Calendar —
+most "watchable" things happen there, not in turns alone. 2.0a
+adds webhook ingestion (GitHub + Gitea first), an
+`external_identities` mapping, repo↔project mapping so 1.0c's
+project lockout still works, and renderer enrichment so
+investigator briefs can read PR diffs / spec / plan files.
+
+Unlocks: "vibelive merge → send spec+plan to albert", "PR review
+pings", "release tag → changelog to project chat", etc.
+
+Reuses 1.0c gatekeeper / investigator / renderer / delivery
+unchanged — just a new event source feeding the same pipeline.
+
+**Estimate**: 5-8 days. Lowest risk per unlocked value among
+the three axes.
+
+#### 2.0b — Output routing (Axis 2: delivery broaden)
+
+1.0c subscriptions couple "who set this up" with "where the
+notification lands." 2.0b decomposes this into two independent
+concepts:
+
+- **owner**: who can edit/disable the rule (user OR chat — same
+  as 1.0a/b)
+- **target**: where delivery actually lands
+  (`user_dm | chat | mention_in_chat`, optionally with a specific
+  user to @ inside a chat)
+
+Plus permission gates so a third party can't weaponise the bot to
+DM-spam someone — "tell albert in DM about a rule I set in this
+group" requires mutual binding + shared chat.
+
+Unlocks: chat-mediated rule creation, mention-in-chat as a
+delivery target, third-party rules where owner ≠ target.
+
+**Estimate**: 4-6 days. Risk is ACL design — get permissions
+right or the bot becomes a stalker channel.
+
+#### 2.0c — Judgment-driven proactive (Axis 3: trigger broaden)
+
+1.0c investigators are rule-bound: they only run when a
+subscription matched a candidate event. A real PMO doesn't wait
+for a rule — they look at team state and decide on their own when
+to speak, in which room, to whom. 2.0c adds an **observer** loop
+that runs every ~30 minutes, reads a curated team state snapshot,
+and emits zero or many "speech acts" without any pre-existing
+subscription. Each speech act becomes a synthetic
+investigation_job through the existing pipeline.
+
+This is the qualitative jump from "notification system" to "PMO
+presence" — but it's also product-fatal if done wrong. A single
+overeager observer mis-DM ("albert seems to be slacking" sent to
+the wrong person) can erase trust faster than missed
+notifications.
+
+The only survival mechanism is **user-controlled silence**: hard
+daily cap, "this was useless" feedback per delivered speech act,
+per-user per-category confidence learned from feedback.
+
+**Estimate**: 10-15 days. By far the riskiest. Do not build
+first.
+
+#### Coupling and sequence
+
+The three axes are mostly orthogonal but two coupling points
+matter:
+
+- **Axis 1 strengthens Axis 3**. The observer is much more useful
+  when it can read GitHub state, not just turns. Without external
+  sources, the observer is half-blind.
+- **Axis 2 enables Axis 3 to land well**. Once observer can speak
+  unprompted, "where to deliver" becomes critical — observer
+  deciding "tell albert in #vibelive when…" needs the routing
+  flexibility of Axis 2. Without Axis 2, observer-driven speech
+  can only land in the asker's DM, which is the wrong room half
+  the time.
+
+Natural sequence: **2.0a → 2.0b → 2.0c**. Skipping ahead to 2.0c
+is risky. Doing 2.0a first is the safest first step.
+
+We don't commit to any specific 2.0 work until 1.0a/b/c usage
+shows what matters. The roadmap is a memory aid, not a contract.
+But if work must start before that signal arrives, 2.0a is the
+default pick — failure mode is bounded (webhook arrives, no
+subscription matches, suppressed silently, same as a turn that
+matches nothing).
+
+#### Out of scope across all 2.0 axes
+
+- Voice / phone notifications — Feishu only
+- Multi-org pmo_agent — separate product
+- Replacing existing tools (Linear, GitHub, calendars) — bot is
+  glue, not source of truth
+- Native code execution / PR creation by bot
+- Pricing / billing / usage caps — until paid users
+- Bot-initiated DMs to users without bound feishu_links — would
+  fail at delivery anyway
 
 ---
 
