@@ -107,6 +107,9 @@ Creates:
     flips 'investigating' → 'open' so next iteration can re-claim.
   - `mark_job_failed_if_claimed(p_id, p_claim_id, p_error)`:
     terminal; status → 'failed'.
+  - `bump_investigation_parse_failure(p_id, p_claim_id, p_error)`:
+    lease-conditional; increments `attempt_count`, stores
+    `last_error` / `last_error_at`, returns the new attempt count.
   - `reap_stale_job_claims(p_stale_after_minutes default 10)`:
     flips any 'investigating' row stuck >10min back to 'open'.
   - `index_subscription_metadata(p_subscription_id uuid)`:
@@ -117,9 +120,10 @@ Creates:
     description-touching mutation (add / update) AND on lazy
     recompute when K's hash shifts.
 - ACL block: revoke from public/anon/authenticated, grant to
-  service_role only — applies to ALL 7 new functions including
-  `index_subscription_metadata`. Set search_path on every new
-  function. Mirror the pattern from 1.0a's 0013.
+  service_role only — applies to every new RPC listed above. Set
+  search_path on every new function. Mirror the pattern from
+  1.0a's 0013. `investigation_parse_failure_count` is a Python
+  read helper, not an RPC.
 
 **Apply path**: via Supabase Management API (same pattern as
 0005-0016).
@@ -194,7 +198,7 @@ insert into subscriptions (...) values (...) returning id;  -- s
     (s, eX, ...)` for a fresh subscription with no open jobs.
     Expect exactly ONE new job created (advisory lock serialises),
     second call appends to the first.
-13. ACL: with anon key, call each of these 7 RPCs → permission
+13. ACL: with anon key, call each new RPC → permission
     denied for every one:
     `append_to_or_open_investigation_job`,
     `claim_investigatable_jobs`,
@@ -203,10 +207,10 @@ insert into subscriptions (...) values (...) returning id;  -- s
     `mark_job_failed_if_claimed`,
     `release_job_claim`,
     `reap_stale_job_claims`,
-    `index_subscription_metadata`.
-    Plus the parse-budget pair if implemented as RPCs:
     `bump_investigation_parse_failure`,
-    `investigation_parse_failure_count`.
+    `index_subscription_metadata`.
+    `investigation_parse_failure_count` is a Python read helper,
+    not an RPC.
 
 **Exit criterion**: all 13 smoke tests pass; ROLLBACK leaves DB
 clean.
@@ -488,13 +492,18 @@ begin
     -- array_to_string returns null and digest(null) is null.
     -- Empty K → consistent empty-K hash, NOT null.
     k_hash := substr(
-        encode(digest(coalesce(array_to_string(
+        encode(extensions.digest(coalesce(array_to_string(
             (select array_agg(t order by t) from unnest(k_array) t),
             '|'
         ), ''), 'sha256'), 'hex'),
         1, 16
     );
 
+    -- Before matching, remove explicit negative/exclusion clauses
+    -- from the text used for project-scope extraction. A description
+    -- like "只通知 vibelive ... 不要通知其他项目（如 oneship 等）"
+    -- must cache ["vibelive"], not ["oneship","vibelive"].
+    --
     -- Match: long tokens via word boundary, short tokens via
     -- explicit project-context patterns (project X / 项目 X / `X` /
     -- /X/ / "X"). Each token is regex-escaped before composition;
@@ -510,8 +519,8 @@ begin
             -- * + ( ) [ ] { }. The \\\\ is intentional — we're
             -- inside SQL string literal that becomes the regex source.
             tok_re := regexp_replace(tok,
-                '([\\\^\$\.\|\?\*\+\(\)\[\]\{\}])',
-                '\\\1', 'g');
+                '([\\^$.|?*+(){}\[\]])',
+                E'\\\\\\1', 'g');
             if length(tok) >= 4 then
                 -- \m and \M are POSIX word-start / word-end anchors.
                 if desc_lower ~ ('\m' || tok_re || '\M') then
@@ -573,7 +582,9 @@ test harness, since the matching is now SQL-only):
   K={"c"}, sub "bcc 在做啥" → `matched_projects=[]`. Critical
   regression: a real user handle must not get hard-skipped.
 - `test_index_subscription_metadata_idempotent` — calling the SQL
-  function twice yields the same metadata.
+  function twice yields the same `matched_projects` and
+  `project_tokens_hash`. `indexed_at` may refresh and is not part
+  of this equality assertion.
 - `test_index_subscription_metadata_no_events` — when events
   table is empty: `matched_projects=[]` (JSON array, NOT null),
   `project_tokens_hash` is a real 16-char hex string (NOT null).
@@ -585,6 +596,11 @@ test harness, since the matching is now SQL-only):
   `c++.proj 进展告诉我` should match; subscription `cxx-proj
   进展` should NOT match. Without the regex escape, `+` and `.`
   would corrupt the regex and either raise or misfire.
+- `test_negative_project_examples_do_not_expand_scope` — K contains
+  `vibelive` and `oneship`; subscription
+  `只通知 vibelive 项目的进展，不要通知其他项目（如 oneship 等）`
+  should cache `matched_projects=["vibelive"]`. `oneship` is an
+  exclusion example, not an allowed project.
 - `test_description_update_reindexes` — create sub with
   description "vibelive 进展", verify metadata has
   `matched_projects=["vibelive"]`. Update description to
@@ -601,6 +617,11 @@ test harness, since the matching is now SQL-only):
   returns False even when `sub.metadata.matched_projects` is
   non-empty. The event passes through to the gatekeeper LLM
   rather than being hard-skipped.
+- `test_payload_project_path_leaf_counts_as_project_token` —
+  event has `project_root='/Users/.../vibe'` but payload
+  `project_path='/Users/.../vibe/vibelive'`; subscription
+  metadata has `matched_projects=["vibelive"]`; lockout must not
+  skip. This protects repos whose canonical root is a parent folder.
 - `test_python_sql_hash_equivalence` — call
   `lockout.known_project_tokens()` and the SQL function on the
   same data; assert k_hash byte-equals between Python and SQL.

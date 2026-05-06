@@ -274,7 +274,11 @@ async def test_decider_caps_repeated_parse_failures(monkeypatch):
     monkeypatch.setattr(decider_loop.queries, "get_notification", lambda event_id, sub_id: None)
     monkeypatch.setattr(decider_loop.queries, "judge_parse_failure_count", lambda event_id, sub_id, version: 2)
     monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: logs.append(kwargs))
-    monkeypatch.setattr(decider_loop.queries, "upsert_notification_row", lambda **kwargs: upserts.append(kwargs) or "inserted")
+    monkeypatch.setattr(
+        decider_loop.queries,
+        "upsert_notification_row",
+        lambda **kwargs: upserts.append(kwargs) or "inserted",
+    )
     monkeypatch.setattr(
         decider_loop.queries,
         "mark_event_processed",
@@ -300,8 +304,9 @@ async def test_decider_caps_repeated_parse_failures(monkeypatch):
         },
     )
 
-    assert logs[-1]["judge_output"]["suppressed_by"] == "judge_parse_error"
-    assert upserts[0]["decision"]["suppressed_by"] == "judge_failure"
+    assert logs[0]["judge_output"]["suppressed_by"] == "gatekeeper_parse_error"
+    assert logs[-1]["judge_output"]["suppressed_by"] == "gatekeeper_failure"
+    assert upserts == []
     assert marked == [(9, 1)]
 
 

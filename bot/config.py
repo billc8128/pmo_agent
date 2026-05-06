@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     decider_loop_interval_seconds: int = 30
     delivery_loop_interval_seconds: int = 15
     notification_render_max_seconds: int = 60
+    investigator_loop_interval_seconds: int = 20
+    investigator_max_duration_seconds: int = 90
+    investigator_max_turns: int = 6
+    investigator_max_turns_context: int = 30
+    aggregation_window_minutes: int = 30
 
     @property
     def cors_origins(self) -> List[str]:

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-from dataclasses import asdict, is_dataclass
+import time
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     tool,
 )
 
+from agent import decider
 from agent.request_context import RequestContext
 from agent.tool_utils import err, ok
 from config import settings
@@ -27,38 +28,44 @@ from db import queries
 logger = logging.getLogger(__name__)
 
 
-class RenderError(Exception):
+class TransientInvestigatorError(Exception):
     pass
 
 
-_RENDERER_PROMPT = """你是 pmo_agent 的主动通知渲染器。你的任务是把一条已批准的通知写成飞书里可读的中文 markdown。
+@dataclass
+class Usage:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
-约束：
-- 输出 200-400 字符，直接说结论，不要解释你调用了什么工具。
-- 必须围绕 event_payload 和订阅 description 写，不要编造不存在的事实。
-- 如果是群通知，优先用 resolve_subject_mention 得到 open_id，并可用 `<at user_id="ou_xxx"></at>` 提及事件主体；解析不到就用 @handle 或 display_name。
-- 可以调用只读工具补充背景，但不要拉太多 raw turns。
-- 不要输出 JSON，不要包含内部 id/token。
+
+_INVESTIGATOR_PROMPT = """你是 pmo_agent 的 PMO 调查员。一条订阅触发了一组事件需要你判断和撰写。
+你有完整的只读 PMO 工具集，可以读 turn 详情、项目概览、最近活动统计、最近通知历史等。
+
+输入：
+- subscription.description: 订阅的原始自然语言
+- subscription.created_at: 订阅创建时间（早于此的事件不要算证据）
+- seed_events: 触发这次调查的事件列表（已经 plausibly 相关）
+- recent_notifications_for_subscription: 这条订阅最近已经通知过什么
+
+你的任务：
+1. 读 enough context，判断是否真的值得通知。
+2. 如果不值得，输出 notify=false，并给出 suppressed_by/reason。
+3. 如果值得，输出一个结构化 brief。brief 是事实边界，renderer 只能按它组词，不能加入新事实。
+
+不要因为 seed event 存在就默认通知。只有当这些事件对 subscription.description 代表实质进展、风险、完成、阻塞、重要变更时才通知。
+不要重复通知 recent_notifications_for_subscription 已经覆盖过的同一事实。
+
+输出严格 JSON：
+{
+  "notify": true | false,
+  "headline": "要通知时的一句话标题；不通知可为空",
+  "key_facts": ["事实1", "事实2"],
+  "evidence_event_ids": [123, 456],
+  "subject_user_ids": ["pmo_agent profile uuid"],
+  "suppressed_by": null | "not_enough_signal" | "duplicate" | "mismatch",
+  "reason": "一句话 audit 理由"
+}
 """
-
-
-_RENDERER_1_0C_PROMPT = """你是 pmo_agent 的主动通知渲染器。你收到的是 investigator brief，你的任务是把 brief 写成飞书里可读的中文 markdown。
-
-约束：
-- 输出 200-400 字符，直接说结论。
-- 必须严格依据 investigator brief 的 headline、key_facts、evidence_event_ids、subject_user_ids。
-- 不能加入新事实，不能重新判断是否该通知，不能扩大 evidence。
-- 如果有 subject_user_ids，可调用 resolve_subject_mention 转成 `<at user_id="ou_xxx"></at>`；解析不到就不要硬编。
-- 不要输出 JSON，不要包含内部 token。
-"""
-
-
-def _is_1_0c_brief(payload: dict[str, Any]) -> bool:
-    return isinstance(payload.get("headline"), str) and isinstance(payload.get("key_facts"), list)
-
-
-def _prompt_for_payload(payload: dict[str, Any]) -> str:
-    return _RENDERER_1_0C_PROMPT if _is_1_0c_brief(payload) else _RENDERER_PROMPT
 
 
 def _inject_anthropic_env() -> None:
@@ -78,7 +85,7 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def _renderer_mcp(ctx: RequestContext):
+def _investigator_mcp(ctx: RequestContext):
     @tool("list_users", "List all known users.", {})
     async def list_users(args: dict) -> dict[str, Any]:
         try:
@@ -106,7 +113,7 @@ def _renderer_mcp(ctx: RequestContext):
                 since_iso=args.get("since") or None,
                 until_iso=args.get("until") or None,
                 project_root=args.get("project_root") or None,
-                limit=min(int(args.get("limit") or 20), 50),
+                limit=min(int(args.get("limit") or 20), settings.investigator_max_turns_context),
             )
             return ok({"turns": rows, "count": len(rows)})
         except Exception as e:
@@ -146,15 +153,8 @@ def _renderer_mcp(ctx: RequestContext):
             }
         )
 
-    @tool("resolve_subject_mention", "Resolve a pmo_agent user_id to a Feishu open_id.", {"user_id": str})
-    async def resolve_subject_mention(args: dict) -> dict[str, Any]:
-        try:
-            return ok(queries.resolve_subject_open_id(args.get("user_id") or ""))
-        except Exception as e:
-            return err(str(e))
-
     return create_sdk_mcp_server(
-        name="pmo_renderer",
+        name="pmo_investigator",
         version="0.1.0",
         tools=[
             list_users,
@@ -163,42 +163,39 @@ def _renderer_mcp(ctx: RequestContext):
             get_project_overview,
             get_activity_stats,
             today_iso,
-            resolve_subject_mention,
         ],
     )
 
 
-async def _render_inner(
-    notif_row: Any,
-    event_payload: dict[str, Any],
-    subscription: Any,
-) -> str:
+async def investigate(bundle: Any) -> tuple[dict[str, Any], Usage]:
     _inject_anthropic_env()
-    ctx = RequestContext(conversation_key=f"notification:{getattr(notif_row, 'id', '')}")
+    ctx = RequestContext(conversation_key=f"investigation:{getattr(bundle.job, 'id', '')}")
     options = ClaudeAgentOptions(
-        system_prompt=_prompt_for_payload(event_payload),
+        system_prompt=_INVESTIGATOR_PROMPT,
         allowed_tools=[
-            "mcp__pmo_renderer__list_users",
-            "mcp__pmo_renderer__lookup_user",
-            "mcp__pmo_renderer__get_recent_turns",
-            "mcp__pmo_renderer__get_project_overview",
-            "mcp__pmo_renderer__get_activity_stats",
-            "mcp__pmo_renderer__today_iso",
-            "mcp__pmo_renderer__resolve_subject_mention",
+            "mcp__pmo_investigator__list_users",
+            "mcp__pmo_investigator__lookup_user",
+            "mcp__pmo_investigator__get_recent_turns",
+            "mcp__pmo_investigator__get_project_overview",
+            "mcp__pmo_investigator__get_activity_stats",
+            "mcp__pmo_investigator__today_iso",
         ],
-        mcp_servers={"pmo_renderer": _renderer_mcp(ctx)},
+        mcp_servers={"pmo_investigator": _investigator_mcp(ctx)},
         disallowed_tools=[
             "Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Task", "TodoWrite",
         ],
-        max_turns=4,
+        max_turns=settings.investigator_max_turns,
     )
     message = {
-        "notification": _plain(notif_row),
-        "event_payload": event_payload,
-        "subscription": _plain(subscription),
+        "investigation_job": _plain(bundle.job),
+        "subscription": _plain(bundle.subscription),
+        "seed_events": bundle.events,
+        "recent_notifications_for_subscription": bundle.recent_notifications_for_subscription,
     }
     client = ClaudeSDKClient(options=options)
+    started = time.monotonic()
     chunks: list[str] = []
+    usage = Usage()
     try:
         await client.connect()
         await client.query(json.dumps(message, ensure_ascii=False, default=str))
@@ -208,24 +205,30 @@ async def _render_inner(
                     if isinstance(block, TextBlock):
                         chunks.append(block.text)
             elif isinstance(msg, ResultMessage):
+                usage.input_tokens, usage.output_tokens = decider._usage_from_result_message(msg)
                 break
     finally:
         await client.disconnect()
-    return "\n".join(chunks).strip()
 
-
-async def render_notification(
-    notif_row: Any,
-    event_payload: dict[str, Any],
-    subscription: Any,
-) -> str:
+    raw_text = "\n".join(chunks)
     try:
-        text = await asyncio.wait_for(
-            _render_inner(notif_row, event_payload, subscription),
-            timeout=settings.notification_render_max_seconds,
+        brief = decider.parse_decision_json(raw_text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise decider.DecisionParseError(
+            str(e),
+            raw_text=raw_text,
+            raw_input=message,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+        ) from e
+    if not isinstance(brief.get("notify"), bool):
+        raise decider.DecisionParseError(
+            "investigator output missing boolean notify",
+            raw_text=raw_text,
+            raw_input=message,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
         )
-    except asyncio.TimeoutError as e:
-        raise RenderError("renderer timed out") from e
-    if not text:
-        raise RenderError("renderer returned empty text")
-    return text
+    return brief, usage

@@ -13,17 +13,28 @@ export async function createNotificationRule(formData: FormData) {
   );
   const user = await requireUser();
 
-  const { error } = await adminClient().from('subscriptions').insert({
-    scope_kind: 'user',
-    scope_id: user.id,
-    description,
-    enabled: true,
-    created_by: user.id,
-    chat_id: null,
-    archived_at: null,
-  });
+  const admin = adminClient();
+  const { data, error } = await admin
+    .from('subscriptions')
+    .insert({
+      scope_kind: 'user',
+      scope_id: user.id,
+      description,
+      enabled: true,
+      created_by: user.id,
+      chat_id: null,
+      archived_at: null,
+    })
+    .select('id')
+    .single();
   if (error) {
     throw new Error(`failed to create rule: ${error.message}`);
+  }
+  const { error: indexError } = await admin.rpc('index_subscription_metadata', {
+    p_subscription_id: data.id,
+  });
+  if (indexError) {
+    throw new Error(`failed to index rule metadata: ${indexError.message}`);
   }
 
   revalidateRules();
@@ -36,7 +47,8 @@ export async function updateNotificationRule(formData: FormData) {
   );
   const user = await requireUser();
 
-  const { data, error } = await adminClient()
+  const admin = adminClient();
+  const { data, error } = await admin
     .from('subscriptions')
     .update({
       description,
@@ -54,6 +66,12 @@ export async function updateNotificationRule(formData: FormData) {
   }
   if (!data) {
     throw new Error('rule not found or not owned by you');
+  }
+  const { error: indexError } = await admin.rpc('index_subscription_metadata', {
+    p_subscription_id: data.id,
+  });
+  if (indexError) {
+    throw new Error(`failed to index rule metadata: ${indexError.message}`);
   }
 
   revalidateRules();

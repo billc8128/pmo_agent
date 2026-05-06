@@ -7,7 +7,7 @@ turns them into tool error messages the LLM can react to.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 import re
@@ -33,6 +33,7 @@ class Notification:
     sent_at: str | None = None
     error: str | None = None
     payload_snapshot: dict[str, Any] | None = None
+    investigation_job_id: int | None = None
 
 
 @dataclass
@@ -46,6 +47,31 @@ class Subscription:
     chat_id: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    archived_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class InvestigationJob:
+    id: int
+    subscription_id: str
+    status: str
+    seed_event_ids: list[int] = field(default_factory=list)
+    initial_focus: str | None = None
+    decider_reason: str | None = None
+    investigator_decision: dict[str, Any] | None = None
+    notification_id: int | None = None
+    claim_id: str | None = None
+    claimed_at: str | None = None
+    attempt_count: int = 0
+    last_error: str | None = None
+    last_error_at: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    opened_at: str | None = None
+    updated_at: str | None = None
+    closed_at: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -54,6 +80,14 @@ class ClaimedBundle:
     notif_payload_snapshot: dict[str, Any]
     notif_payload_version: int
     subscription: Subscription
+
+
+@dataclass
+class InvestigatableJobBundle:
+    job: InvestigationJob
+    subscription: Subscription
+    events: list[dict[str, Any]]
+    recent_notifications_for_subscription: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _dataclass_from_row(cls, row: dict[str, Any]):
@@ -77,6 +111,17 @@ def _rpc_returned_id(data: Any) -> bool:
     if isinstance(data, list):
         return bool(data)
     return bool(data)
+
+
+def _rpc_scalar(data: Any) -> Any:
+    if isinstance(data, list):
+        if not data:
+            return None
+        first = data[0]
+        if isinstance(first, dict) and len(first) == 1:
+            return next(iter(first.values()))
+        return first
+    return data
 
 
 def lookup_profile(handle: str) -> Optional[dict[str, Any]]:
@@ -931,6 +976,50 @@ def fetch_all_enabled_subscriptions() -> list[dict[str, Any]]:
     )
 
 
+def _project_last_segment(project_root: str | None) -> str:
+    if not project_root:
+        return ""
+    root = project_root.strip()
+    if not root or root.endswith("/"):
+        return ""
+    return root.rsplit("/", 1)[-1].lower()
+
+
+def _project_tokens_for_event_row(row: dict[str, Any]) -> set[str]:
+    payload = row.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        token
+        for token in [
+            _project_last_segment(row.get("project_root")),
+            _project_last_segment(payload.get("project_path")),
+            _project_last_segment(payload.get("project_root")),
+        ]
+        if token
+    }
+
+
+def distinct_project_root_tokens() -> list[str]:
+    rows = (
+        sb_admin()
+        .table("events")
+        .select("project_root,payload")
+        .limit(10000)
+        .execute()
+        .data
+        or []
+    )
+    return sorted(
+        {
+            token
+            for row in rows
+            for token in _project_tokens_for_event_row(row)
+            if token
+        }
+    )
+
+
 def fetch_subscriptions_for_scope(scope_kind: str, scope_id: str) -> list[dict[str, Any]]:
     return (
         sb_admin()
@@ -944,6 +1033,25 @@ def fetch_subscriptions_for_scope(scope_kind: str, scope_id: str) -> list[dict[s
         .execute()
         .data
         or []
+    )
+
+
+def get_subscription(subscription_id: str) -> Optional[Subscription]:
+    row = _execute_data(
+        sb_admin()
+        .table("subscriptions")
+        .select("*")
+        .eq("id", subscription_id)
+        .maybe_single()
+    )
+    return _dataclass_from_row(Subscription, row) if row else None
+
+
+def index_subscription_metadata(subscription_id: str) -> None:
+    (
+        sb_admin()
+        .rpc("index_subscription_metadata", {"p_subscription_id": subscription_id})
+        .execute()
     )
 
 
@@ -976,6 +1084,7 @@ def write_decision_log(
     latency_ms: int | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    investigation_job_id: int | None = None,
 ) -> dict[str, Any] | None:
     res = (
         sb_admin()
@@ -991,6 +1100,7 @@ def write_decision_log(
                 "latency_ms": latency_ms,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "investigation_job_id": investigation_job_id,
             }
         )
         .execute()
@@ -1061,6 +1171,180 @@ def claim_pending_notifications(claim_id: str, limit: int = 20) -> list[ClaimedB
             )
         )
     return bundles
+
+
+def append_to_or_open_investigation_job(
+    subscription_id: str,
+    event_id: int,
+    initial_focus: str,
+    decider_reason: str,
+    *,
+    window_minutes: int = 30,
+) -> int | None:
+    data = (
+        sb_admin()
+        .rpc(
+            "append_to_or_open_investigation_job",
+            {
+                "p_subscription_id": subscription_id,
+                "p_event_id": event_id,
+                "p_initial_focus": initial_focus,
+                "p_decider_reason": decider_reason,
+                "p_window_minutes": window_minutes,
+            },
+        )
+        .execute()
+        .data
+    )
+    value = _rpc_scalar(data)
+    return int(value) if value is not None else None
+
+
+def claim_investigatable_jobs(
+    claim_id: str,
+    limit: int = 5,
+    *,
+    window_minutes: int = 30,
+) -> list[InvestigatableJobBundle]:
+    rows = (
+        sb_admin()
+        .rpc(
+            "claim_investigatable_jobs",
+            {
+                "p_claim_id": claim_id,
+                "p_limit": limit,
+                "p_window_minutes": window_minutes,
+            },
+        )
+        .execute()
+        .data
+        or []
+    )
+    bundles: list[InvestigatableJobBundle] = []
+    for row in rows:
+        job = _dataclass_from_row(InvestigationJob, _jsonb_row(row.get("investigation_job")))
+        subscription = _dataclass_from_row(Subscription, _jsonb_row(row.get("subscription")))
+        events = row.get("event_payloads") or []
+        if isinstance(events, str):
+            events = json.loads(events)
+        bundles.append(
+            InvestigatableJobBundle(
+                job=job,
+                subscription=subscription,
+                events=list(events),
+                recent_notifications_for_subscription=recent_notifications_for_subscription(subscription.id),
+            )
+        )
+    return bundles
+
+
+def create_notification_for_investigation_job(
+    *,
+    job_id: int,
+    claim_id: str,
+    event_id: int,
+    subscription_id: str,
+    decided_payload_version: int,
+    payload_snapshot: dict[str, Any],
+    delivery_kind: str | None,
+    delivery_target: str | None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> int | None:
+    data = (
+        sb_admin()
+        .rpc(
+            "create_notification_for_investigation_job",
+            {
+                "p_job_id": job_id,
+                "p_claim_id": claim_id,
+                "p_event_id": event_id,
+                "p_subscription_id": subscription_id,
+                "p_decided_payload_version": decided_payload_version,
+                "p_payload_snapshot": payload_snapshot,
+                "p_delivery_kind": delivery_kind,
+                "p_delivery_target": delivery_target,
+                "p_input_tokens": input_tokens,
+                "p_output_tokens": output_tokens,
+            },
+        )
+        .execute()
+        .data
+    )
+    value = _rpc_scalar(data)
+    return int(value) if value is not None else None
+
+
+def mark_job_suppressed_if_claimed(
+    job_id: int,
+    claim_id: str,
+    brief: dict[str, Any],
+    *,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> bool:
+    data = (
+        sb_admin()
+        .rpc(
+            "mark_job_suppressed_if_claimed",
+            {
+                "p_id": job_id,
+                "p_claim_id": claim_id,
+                "p_brief": brief,
+                "p_input_tokens": input_tokens,
+                "p_output_tokens": output_tokens,
+            },
+        )
+        .execute()
+        .data
+    )
+    return _rpc_returned_id(data)
+
+
+def mark_job_failed_if_claimed(job_id: int, claim_id: str, error: str) -> bool:
+    data = (
+        sb_admin()
+        .rpc(
+            "mark_job_failed_if_claimed",
+            {"p_id": job_id, "p_claim_id": claim_id, "p_error": error[:2000]},
+        )
+        .execute()
+        .data
+    )
+    return _rpc_returned_id(data)
+
+
+def release_job_claim(job_id: int, claim_id: str) -> bool:
+    data = (
+        sb_admin()
+        .rpc("release_job_claim", {"p_id": job_id, "p_claim_id": claim_id})
+        .execute()
+        .data
+    )
+    return _rpc_returned_id(data)
+
+
+def reap_stale_job_claims(stale_after_minutes: int = 10) -> int:
+    data = (
+        sb_admin()
+        .rpc("reap_stale_job_claims", {"p_stale_after_minutes": stale_after_minutes})
+        .execute()
+        .data
+    )
+    return int(_rpc_scalar(data) or 0)
+
+
+def bump_investigation_parse_failure(job_id: int, claim_id: str, error: str) -> int:
+    data = (
+        sb_admin()
+        .rpc(
+            "bump_investigation_parse_failure",
+            {"p_id": job_id, "p_claim_id": claim_id, "p_error": error[:500]},
+        )
+        .execute()
+        .data
+    )
+    return int(_rpc_scalar(data) or 0)
 
 
 def release_claim(notification_id: int, claim_id: str) -> bool:
@@ -1166,6 +1450,28 @@ def recent_notifications_for_scope(
     return out
 
 
+def recent_notifications_for_subscription(
+    subscription_id: str,
+    *,
+    since_hours: int = 72,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    rows = (
+        sb_admin()
+        .table("notifications")
+        .select("id, event_id, status, suppressed_by, rendered_text, decided_at, sent_at, payload_snapshot")
+        .eq("subscription_id", subscription_id)
+        .gte("decided_at", since.isoformat())
+        .order("decided_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    return rows
+
+
 def daily_sent_count_for_scope(scope_kind: str, scope_id: str, since_local_midnight: str) -> int:
     rows = (
         sb_admin()
@@ -1220,6 +1526,25 @@ def fetch_notifications_for_event_subscription_pairs(
     }
 
 
+def fetch_investigation_jobs_by_ids(job_ids: set[int]) -> dict[int, dict[str, Any]]:
+    if not job_ids:
+        return {}
+    rows = (
+        sb_admin()
+        .table("investigation_jobs")
+        .select(
+            "id, subscription_id, status, seed_event_ids, initial_focus, decider_reason, "
+            "investigator_decision, notification_id, attempt_count, last_error, "
+            "opened_at, updated_at, closed_at, error"
+        )
+        .in_("id", sorted(job_ids))
+        .execute()
+        .data
+        or []
+    )
+    return {int(row["id"]): row for row in rows}
+
+
 def add_subscription(
     *,
     scope_kind: str,
@@ -1242,7 +1567,10 @@ def add_subscription(
         )
         .execute()
     )
-    return res.data[0] if res and res.data else {}
+    row = res.data[0] if res and res.data else {}
+    if row.get("id"):
+        index_subscription_metadata(str(row["id"]))
+    return row
 
 
 def list_subscriptions(scope_kind: str, scope_id: str) -> list[dict[str, Any]]:
@@ -1272,7 +1600,10 @@ def update_subscription(
         .eq("scope_id", scope_id)
         .execute()
     )
-    return res.data[0] if res and res.data else None
+    row = res.data[0] if res and res.data else None
+    if row and "description" in payload:
+        index_subscription_metadata(str(row["id"]))
+    return row
 
 
 def get_subscription_in_scope(
@@ -1368,6 +1699,9 @@ def recent_decision_logs_for_scope(
         if row.get("event_id") is not None and row.get("subscription_id")
     }
     current_by_pair = fetch_notifications_for_event_subscription_pairs(pairs)
+    jobs_by_id = fetch_investigation_jobs_by_ids(
+        {int(row["investigation_job_id"]) for row in rows if row.get("investigation_job_id") is not None}
+    )
     for row in rows:
         current = current_by_pair.get((int(row.get("event_id")), str(row.get("subscription_id"))))
         row["current_notification"] = {
@@ -1376,6 +1710,8 @@ def recent_decision_logs_for_scope(
             "feishu_msg_id": current.get("feishu_msg_id"),
             "decided_payload_version": current.get("decided_payload_version"),
         } if current else None
+        job_id = row.get("investigation_job_id")
+        row["current_investigation_job"] = jobs_by_id.get(int(job_id)) if job_id is not None else None
     return rows
 
 
@@ -1396,5 +1732,17 @@ def judge_parse_failure_count(event_id: int, subscription_id: str, payload_versi
     return sum(
         1
         for row in rows
-        if (row.get("judge_output") or {}).get("suppressed_by") == "judge_parse_error"
+        if (row.get("judge_output") or {}).get("suppressed_by")
+        in {"judge_parse_error", "gatekeeper_parse_error"}
     )
+
+
+def investigation_parse_failure_count(job_id: int) -> int:
+    row = _execute_data(
+        sb_admin()
+        .table("investigation_jobs")
+        .select("attempt_count")
+        .eq("id", job_id)
+        .maybe_single()
+    )
+    return int((row or {}).get("attempt_count") or 0)

@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from agent import decider_loop, delivery_loop
+from agent import decider_loop, delivery_loop, investigator_loop
 from agent import runner as agent_runner
 from config import settings
 from db import queries as db_queries
@@ -66,13 +66,14 @@ async def lifespan(app: FastAPI):
 
     gc_task = asyncio.create_task(_gc_loop())
     decider_task = asyncio.create_task(decider_loop.run_forever())
+    investigator_task = asyncio.create_task(investigator_loop.run_forever())
     delivery_task = asyncio.create_task(delivery_loop.run_forever())
     try:
         yield
     finally:
-        for task in (gc_task, decider_task, delivery_task):
+        for task in (gc_task, decider_task, investigator_task, delivery_task):
             task.cancel()
-        await asyncio.gather(gc_task, decider_task, delivery_task, return_exceptions=True)
+        await asyncio.gather(gc_task, decider_task, investigator_task, delivery_task, return_exceptions=True)
         await agent_runner.shutdown_all()
         logger.info("pmo-bot stopped")
 
@@ -203,40 +204,55 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         )
 
     try:
-        async for event in agent_runner.answer_streaming(
-            conversation_key,
-            framed_question,
-            message_id=ev.message_id,
-            chat_id=ev.chat_id,
-            chat_type=ev.chat_type,
-            sender_open_id=ev.sender_open_id,
-            asker_user_id=(sender_identity or {}).get("user_id"),
-            asker_handle=(sender_identity or {}).get("handle"),
-        ):
-            if event["kind"] == "tool":
-                # Mark previous tool as done — the LLM has moved on.
-                if steps and not steps[-1].get("done"):
-                    steps[-1]["done"] = True
-                steps.append({
-                    "tool": event["name"],
-                    "args_hint": event.get("args_hint", ""),
-                    "done": False,
-                })
-                await maybe_patch()
-            elif event["kind"] == "final":
-                # Mark the trailing tool as done now that the agent is
-                # writing its answer.
-                if steps and not steps[-1].get("done"):
-                    steps[-1]["done"] = True
-                answer_text = event["text"]
-            elif event["kind"] == "error":
-                await feishu_client.patch_card(
-                    card_message_id,
-                    cards.error_card(question=ev.text, error=event["message"]),
-                )
-                return
+        async with asyncio.timeout(settings.agent_max_duration_seconds):
+            async for event in agent_runner.answer_streaming(
+                conversation_key,
+                framed_question,
+                message_id=ev.message_id,
+                chat_id=ev.chat_id,
+                chat_type=ev.chat_type,
+                sender_open_id=ev.sender_open_id,
+                asker_user_id=(sender_identity or {}).get("user_id"),
+                asker_handle=(sender_identity or {}).get("handle"),
+            ):
+                if event["kind"] == "tool":
+                    # Mark previous tool as done — the LLM has moved on.
+                    if steps and not steps[-1].get("done"):
+                        steps[-1]["done"] = True
+                    steps.append({
+                        "tool": event["name"],
+                        "args_hint": event.get("args_hint", ""),
+                        "done": False,
+                    })
+                    await maybe_patch()
+                elif event["kind"] == "final":
+                    # Mark the trailing tool as done now that the agent is
+                    # writing its answer.
+                    if steps and not steps[-1].get("done"):
+                        steps[-1]["done"] = True
+                    answer_text = event["text"]
+                elif event["kind"] == "error":
+                    await feishu_client.patch_card(
+                        card_message_id,
+                        cards.error_card(question=ev.text, error=event["message"]),
+                    )
+                    return
     except asyncio.CancelledError:
         raise
+    except TimeoutError:
+        logger.warning(
+            "agent loop timed out for %s after %ss",
+            conversation_key,
+            settings.agent_max_duration_seconds,
+        )
+        await feishu_client.patch_card(
+            card_message_id,
+            cards.error_card(
+                question=ev.text,
+                error=f"查询超时（超过 {settings.agent_max_duration_seconds} 秒）",
+            ),
+        )
+        return
     except Exception as e:
         logger.exception("agent loop failed for %s", conversation_key)
         await feishu_client.patch_card(

@@ -36,6 +36,19 @@ class Decision:
     output_tokens: int | None = None
 
 
+@dataclass
+class GatekeeperDecision:
+    investigate: bool
+    initial_focus: str
+    reason: str
+    raw_input: dict[str, Any]
+    raw_output: dict[str, Any]
+    latency_ms: int
+    model: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
 class DecisionParseError(Exception):
     def __init__(
         self,
@@ -44,11 +57,15 @@ class DecisionParseError(Exception):
         raw_text: str,
         raw_input: dict[str, Any],
         latency_ms: int = 0,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
     ) -> None:
         super().__init__(message)
         self.raw_text = raw_text
         self.raw_input = raw_input
         self.latency_ms = latency_ms
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 @dataclass
@@ -125,6 +142,33 @@ _JUDGE_SYSTEM_PROMPT = """你是 pmo_agent 的通知决策器。你只输出 JSO
 """
 
 
+_GATEKEEPER_PROMPT = """你是 pmo_agent 的事件分流器。给你一条事件、一条候选订阅和它的所有 sibling rules（同 owner 的其他订阅）。
+
+你的任务：判断这条事件是否值得 PMO 助理花时间调查这条订阅。
+
+你不是在判断"是否通知用户"。最终决定权在 investigator 那一步。
+你只回答："这件事 plausibly 跟订阅相关吗？"
+
+宁可 false positive 也不要 false negative。如果有合理可能相关，
+就 investigate=true，让 investigator 读完更多 context 后自己决定。
+
+但是有几条硬约束必须 false：
+1. 订阅 description 里明确写了项目名（vibelive / oneship 等），
+   而 event.project_root 完全不沾边 → investigate=false,
+   reason="project_root mismatch"。
+   注意：如果订阅没写项目名（"albert 在干嘛"），不适用此规则。
+2. sibling rules 里有"项目 X 不要"或"凌晨别打扰"且当前命中
+   → investigate=false。
+
+输出 JSON：
+{
+  "investigate": true | false,
+  "initial_focus": "建议 investigator 关注什么；不投资就空字符串",
+  "reason": "一句话 audit 理由"
+}
+"""
+
+
 def _build_raw_input(
     event: dict[str, Any],
     candidate: dict[str, Any],
@@ -185,11 +229,11 @@ async def decide(
     candidate: dict[str, Any],
     siblings: list[dict[str, Any]],
     scope_ctx: ScopeContext,
-) -> Decision:
+) -> GatekeeperDecision:
     _inject_anthropic_env()
     raw_input = _build_raw_input(event, candidate, siblings, scope_ctx)
     options = ClaudeAgentOptions(
-        system_prompt=_JUDGE_SYSTEM_PROMPT,
+        system_prompt=_GATEKEEPER_PROMPT,
         allowed_tools=[],
         mcp_servers={},
         disallowed_tools=[
@@ -226,19 +270,19 @@ async def decide(
             raw_text=raw_text,
             raw_input=raw_input,
             latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         ) from e
-    send = bool(raw_output.get("send"))
-    suppressed_by = raw_output.get("suppressed_by")
-    if send:
-        suppressed_by = None
-    elif not suppressed_by:
-        suppressed_by = "mismatch"
-    raw_output = {**raw_output, "send": send, "suppressed_by": suppressed_by}
-    return Decision(
-        send=send,
-        matched_aspect=str(raw_output.get("matched_aspect") or ""),
-        preview_hint=raw_output.get("preview_hint"),
-        suppressed_by=suppressed_by,
+    investigate = bool(raw_output.get("investigate"))
+    raw_output = {
+        **raw_output,
+        "investigate": investigate,
+        "initial_focus": str(raw_output.get("initial_focus") or "") if investigate else "",
+        "reason": str(raw_output.get("reason") or ""),
+    }
+    return GatekeeperDecision(
+        investigate=investigate,
+        initial_focus=raw_output["initial_focus"],
         reason=str(raw_output.get("reason") or ""),
         raw_input=raw_input,
         raw_output=raw_output,

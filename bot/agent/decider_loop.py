@@ -7,7 +7,7 @@ from datetime import datetime, time as dt_time, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from agent import decider
+from agent import decider, lockout
 from config import settings
 from db import queries
 
@@ -81,22 +81,10 @@ def build_scope_context(scope_kind: str, scope_id: str) -> decider.ScopeContext:
     )
 
 
-def _delivery_for_subscription(sub: dict[str, Any]) -> tuple[str | None, str | None]:
-    scope_kind = sub.get("scope_kind")
-    scope_id = sub.get("scope_id")
-    if scope_kind == "chat":
-        return "feishu_chat", scope_id
-    if scope_kind == "user":
-        linked = queries.feishu_link_for_user_id(scope_id)
-        if linked and linked.get("open_id"):
-            return "feishu_user", linked["open_id"]
-    return None, None
-
-
 def _parse_failure_output(exc: decider.DecisionParseError, previous_failures: int) -> dict[str, Any]:
     return {
-        "send": False,
-        "suppressed_by": "judge_parse_error",
+        "investigate": False,
+        "suppressed_by": "gatekeeper_parse_error",
         "reason": str(exc),
         "raw_text": exc.raw_text[:2000],
         "consecutive_failure_count": previous_failures + 1,
@@ -136,24 +124,48 @@ async def process_event(
                 continue
 
             try:
+                if lockout.is_project_mismatch(event, candidate):
+                    queries.write_decision_log(
+                        event_id=event_id,
+                        subscription_id=sub_id,
+                        payload_version=decided_version,
+                        judge_input={
+                            "event": {
+                                "id": event_id,
+                                "project_root": event.get("project_root"),
+                                "payload_version": decided_version,
+                            },
+                            "candidate": {
+                                "id": sub_id,
+                                "description": candidate.get("description"),
+                                "metadata": candidate.get("metadata"),
+                            },
+                        },
+                        judge_output={
+                            "investigate": False,
+                            "initial_focus": "",
+                            "reason": "project_root_lockout",
+                        },
+                        model="deterministic_project_lockout",
+                        latency_ms=0,
+                        input_tokens=None,
+                        output_tokens=None,
+                        investigation_job_id=None,
+                    )
+                    continue
                 if scope_key not in context_cache:
                     context_cache[scope_key] = build_scope_context(scope_kind, scope_id)
                 siblings = [s for s in scope_subs if s.get("id") != sub_id]
                 decision = await decider.decide(event, candidate, siblings, context_cache[scope_key])
-                delivery_kind, delivery_target = None, None
-                if decision.send:
-                    delivery_kind, delivery_target = _delivery_for_subscription(candidate)
-                    if not delivery_target:
-                        decision.send = False
-                        decision.suppressed_by = "no_delivery_target"
-                        decision.reason = "订阅 owner 当前没有可用的飞书投递目标"
-                        decision.raw_output = {
-                            **decision.raw_output,
-                            "send": False,
-                            "suppressed_by": "no_delivery_target",
-                            "reason": decision.reason,
-                        }
-                        delivery_kind, delivery_target = None, None
+                investigation_job_id = None
+                if decision.investigate:
+                    investigation_job_id = queries.append_to_or_open_investigation_job(
+                        sub_id,
+                        event_id,
+                        decision.initial_focus,
+                        decision.reason,
+                        window_minutes=settings.aggregation_window_minutes,
+                    )
                 queries.write_decision_log(
                     event_id=event_id,
                     subscription_id=sub_id,
@@ -164,15 +176,7 @@ async def process_event(
                     latency_ms=decision.latency_ms,
                     input_tokens=decision.input_tokens,
                     output_tokens=decision.output_tokens,
-                )
-                queries.upsert_notification_row(
-                    event_id=event_id,
-                    subscription_id=sub_id,
-                    decision=decision,
-                    decided_payload_version=decided_version,
-                    payload_snapshot=event.get("payload") or {},
-                    delivery_kind=delivery_kind,
-                    delivery_target=delivery_target,
+                    investigation_job_id=investigation_job_id,
                 )
             except asyncio.CancelledError:
                 raise
@@ -187,20 +191,26 @@ async def process_event(
                     judge_output=judge_output,
                     model=settings.anthropic_model,
                     latency_ms=e.latency_ms,
+                    input_tokens=e.input_tokens,
+                    output_tokens=e.output_tokens,
+                    investigation_job_id=None,
                 )
                 if previous_failures >= 2:
-                    queries.upsert_notification_row(
+                    queries.write_decision_log(
                         event_id=event_id,
                         subscription_id=sub_id,
-                        decision={
-                            "send": False,
-                            "suppressed_by": "judge_failure",
-                            "reason": "judge output parse failed 3 consecutive times",
+                        payload_version=decided_version,
+                        judge_input=e.raw_input,
+                        judge_output={
+                            "investigate": False,
+                            "suppressed_by": "gatekeeper_failure",
+                            "reason": "gatekeeper output parse failed 3 consecutive times",
                         },
-                        decided_payload_version=decided_version,
-                        payload_snapshot=event.get("payload") or {},
-                        delivery_kind=None,
-                        delivery_target=None,
+                        model=settings.anthropic_model,
+                        latency_ms=e.latency_ms,
+                        input_tokens=e.input_tokens,
+                        output_tokens=e.output_tokens,
+                        investigation_job_id=None,
                     )
                     continue
                 had_unhandled_error = True

@@ -235,16 +235,24 @@ For each (event, candidate subscription) pair:
      produce a hit before lockout fires:
 
      1. The set of "known project tokens" K, derived from
-        `events.project_root` (rightmost path segment of every
-        distinct project_root in the events table, lowercased,
-        cached in memory for 60s). This is the universe of real
-        project names this deployment has actually seen.
+        both `events.project_root` and the turn payload's
+        `project_path` / `project_root` (rightmost path segment,
+        lowercased, cached in memory for 60s). `events.project_root`
+        is the canonical grouping root and can be a parent directory
+        like `/Users/.../vibe`; payload `project_path` may be the
+        user-visible project leaf like `/Users/.../vibe/vibelive`.
+        K is the universe of real project names this deployment has
+        actually seen.
      2. For each subscription, the set of "mentioned tokens" M_sub
         = `K ∩ {tokens that the description names as a project}`.
         "Names as a project" is NOT a naive substring match —
         short tokens (≤3 chars like `c`, `go`, `ai`) would
         otherwise misfire inside words like `bcc`, `again`,
-        `campaign`. The matching rules:
+        `campaign`. Tokens inside explicit negative/exclusion
+        clauses are not positive project scope; e.g.
+        `只通知 vibelive ... 不要通知其他项目（如 oneship 等）`
+        yields `M_sub={vibelive}`, not `{vibelive, oneship}`.
+        The matching rules:
 
         - **Long tokens (≥4 chars, e.g. `vibelive`, `oneship`,
           `pmo_agent`, `feishu`)**: word-boundary match
@@ -261,8 +269,9 @@ For each (event, candidate subscription) pair:
         of truth, called from both bot and web
         below. Cached on `subscriptions.metadata.matched_projects`.
 
-     Lockout rule: if `M_sub` is non-empty AND
-     `event.project_root.last_segment.lower() ∉ M_sub`, skip with
+     Lockout rule: if `M_sub` is non-empty AND none of the event's
+     own project tokens (`event.project_root`, payload
+     `project_path`, payload `project_root`) is in `M_sub`, skip with
      `investigate=false, reason="project_root_lockout"`. No LLM
      call is made for this pair.
 
@@ -362,8 +371,10 @@ def last_segment(project_root: str | None) -> str:
     """
     if not project_root:
         return ""
-    parts = [p for p in project_root.strip().split("/") if p]
-    return parts[-1].lower() if parts else ""
+    root = project_root.strip()
+    if not root or root.endswith("/"):
+        return ""
+    return root.rsplit("/", 1)[-1].lower()
 
 
 def is_project_mismatch(event, sub) -> bool:

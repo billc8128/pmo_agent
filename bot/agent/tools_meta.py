@@ -370,12 +370,13 @@ def build_meta_tools(ctx: RequestContext):
                 )
                 if query and query not in searchable:
                     continue
-                key = (row.get("event_id"), row.get("subscription_id"))
+                key = row.get("investigation_job_id") or (row.get("event_id"), row.get("subscription_id"))
                 group = groups.setdefault(
                     key,
                     {
                         "event_id": row.get("event_id"),
                         "subscription_id": row.get("subscription_id"),
+                        "investigation_job_id": row.get("investigation_job_id"),
                         "subscription_description": (row.get("subscriptions") or {}).get("description"),
                         "event_summary": {
                             "user_message": (payload.get("user_message") or "")[:180],
@@ -383,6 +384,7 @@ def build_meta_tools(ctx: RequestContext):
                             "project_root": payload.get("project_root"),
                         },
                         "current_notification": row.get("current_notification"),
+                        "current_investigation_job": row.get("current_investigation_job"),
                         "timeline": [],
                     },
                 )
@@ -392,12 +394,22 @@ def build_meta_tools(ctx: RequestContext):
                         "payload_version": row.get("payload_version"),
                         "created_at": row.get("created_at"),
                         "send": judge_output.get("send"),
+                        "investigate": judge_output.get("investigate"),
                         "suppressed_by": judge_output.get("suppressed_by"),
                         "reason": judge_output.get("reason"),
                         "judge_output": {
                             k: v
                             for k, v in judge_output.items()
-                            if k in {"send", "matched_aspect", "suppressed_by", "reason", "preview_hint"}
+                            if k
+                            in {
+                                "send",
+                                "investigate",
+                                "matched_aspect",
+                                "initial_focus",
+                                "suppressed_by",
+                                "reason",
+                                "preview_hint",
+                            }
                         },
                     }
                 )
