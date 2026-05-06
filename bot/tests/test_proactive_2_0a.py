@@ -571,6 +571,51 @@ def test_ingest_logs_archive_only_reason(monkeypatch, caplog):
     assert any("webhook.archive_ignored" in msg and "unsupported_event_type" in msg for msg in messages)
 
 
+def test_ingest_marks_archive_ignored_on_processing_exception(monkeypatch, caplog):
+    from external import ingest
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            calls.append(("archive", kwargs))
+            return 7
+
+        @staticmethod
+        def mark_archive_ignored(*args):
+            calls.append(("ignored", args))
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            calls.append(("upsert", kwargs))
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            calls.append(("link", args))
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+    monkeypatch.setattr(ingest, "normalize_github", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with caplog.at_level(logging.ERROR, logger="external.ingest"):
+        asyncio.run(
+            ingest.ingest_external_event(
+                provider="github",
+                event_type="pull_request",
+                delivery_id="delivery-processing-error",
+                payload=_github_pr_payload(),
+                raw_bytes=b"{}",
+                headers={},
+            )
+        )
+
+    assert calls[0][0] == "archive"
+    assert calls[1] == ("ignored", (7, "ingest_error"))
+    assert [call[0] for call in calls] == ["archive", "ignored"]
+    assert any("webhook.archive_ignored" in record.getMessage() and "ingest_error" in record.getMessage() for record in caplog.records)
+
+
 def test_ingest_logs_sanitize_attacker_controlled_identifiers(monkeypatch, caplog):
     from external import ingest
 
@@ -645,6 +690,32 @@ def test_source_id_for_external_events_uses_resource_identity_not_delivery():
         )
         == "issue_comment:billc8128/vibelive:98765"
     )
+
+
+def test_source_id_for_external_events_rejects_non_integer_resource_ids():
+    from external.ingest import source_id_for_event
+
+    assert source_id_for_event(
+        {
+            "event_type": "pull_request",
+            "repo": {"full_name": "billc8128/vibelive"},
+            "pr": {"number": "42/../../meta"},
+        }
+    ) is None
+    assert source_id_for_event(
+        {
+            "event_type": "issue_comment",
+            "repo": {"full_name": "billc8128/vibelive"},
+            "comment": {"id": "98765\nforged"},
+        }
+    ) is None
+    assert source_id_for_event(
+        {
+            "event_type": "pull_request",
+            "repo": {"full_name": "billc8128/vibelive"},
+            "pr": {"number": "42"},
+        }
+    ) == "pull_request:billc8128/vibelive:42"
 
 
 def test_stable_payload_fingerprint_ignores_delivery_and_lookup_fields():
@@ -994,6 +1065,33 @@ def test_webhook_logs_sanitize_attacker_controlled_headers(monkeypatch, caplog):
         assert "\x1b" not in message
 
 
+def test_webhook_catches_unexpected_ingest_exceptions(monkeypatch, caplog):
+    from external import webhooks
+
+    async def fake_ingest(**kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(webhooks.settings, "github_webhook_secret", "secret")
+    monkeypatch.setattr(webhooks, "ingest_external_event", fake_ingest)
+    body = json.dumps(_github_pr_payload()).encode("utf-8")
+    signature = "sha256=" + hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+    request = _FakeRequest(
+        {
+            "content-length": str(len(body)),
+            "x-hub-signature-256": signature,
+            "x-github-event": "pull_request",
+            "x-github-delivery": "delivery-ingest-fail",
+        },
+        body,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="external.webhooks"):
+        response = asyncio.run(webhooks._handle_webhook(request, "github"))
+
+    assert response.status_code == 500
+    assert any("webhook.ingest_failed" in record.getMessage() for record in caplog.records)
+
+
 def test_webhook_rejects_invalid_content_length_as_bad_request(monkeypatch):
     from external import webhooks
 
@@ -1298,6 +1396,8 @@ def test_migration_0021_uses_repo_identifier_project_tokens():
     sql = Path("backend/supabase/migrations/0021_webhook_event_semantics.sql").read_text()
 
     assert "github:owner/repo" in sql
+    assert "set user_id = null" in sql
+    assert "where source in ('github', 'gitea')" in sql
     assert "lower(source || ':' || (payload #>> '{repo,full_name}'))" in sql
     assert "position(token in desc_lower) > 0" in sql
     assert "set search_path = public, pg_temp" in sql

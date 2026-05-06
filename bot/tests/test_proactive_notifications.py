@@ -145,6 +145,44 @@ def test_fetch_subscriptions_for_scope_only_lists_enabled(monkeypatch):
     assert ("archived_at", "null") in is_calls
 
 
+def test_daily_sent_count_uses_exact_count_instead_of_limited_rows(monkeypatch):
+    from db import queries
+
+    select_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    filters: list[tuple[str, object]] = []
+
+    class _Table:
+        def table(self, name):
+            assert name == "notifications"
+            return self
+
+        def select(self, *args, **kwargs):
+            select_calls.append((args, kwargs))
+            return self
+
+        def eq(self, name, value):
+            filters.append((name, value))
+            return self
+
+        def gte(self, name, value):
+            filters.append((name, value))
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[], count=12345)
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: _Table())
+
+    count = queries.daily_sent_count_for_scope("user", "profile-1", "2026-05-07T00:00:00+08:00")
+
+    assert count == 12345
+    assert select_calls[0][1]["count"] == "exact"
+    assert ("subscriptions.scope_kind", "user") in filters
+    assert ("subscriptions.scope_id", "profile-1") in filters
+    assert ("status", "sent") in filters
+    assert ("sent_at", "2026-05-07T00:00:00+08:00") in filters
+
+
 def test_judge_prompt_states_self_events_send_by_default():
     from agent import decider
 

@@ -1800,20 +1800,19 @@ def recent_notifications_for_subscription(
 
 
 def daily_sent_count_for_scope(scope_kind: str, scope_id: str, since_local_midnight: str) -> int:
-    rows = (
+    result = (
         sb_admin()
         .table("notifications")
-        .select("id, subscriptions!inner(scope_kind, scope_id)")
+        .select("id, subscriptions!inner(scope_kind, scope_id)", count="exact")
         .eq("subscriptions.scope_kind", scope_kind)
         .eq("subscriptions.scope_id", scope_id)
         .eq("status", "sent")
         .gte("sent_at", since_local_midnight)
-        .limit(10000)
         .execute()
-        .data
-        or []
     )
-    return len(rows)
+    if getattr(result, "count", None) is not None:
+        return int(result.count or 0)
+    return len(result.data or [])
 
 
 def lookup_notification_by_feishu_msg_id(msg_id: str) -> Optional[dict[str, Any]]:

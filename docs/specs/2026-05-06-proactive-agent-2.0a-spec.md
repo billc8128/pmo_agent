@@ -318,7 +318,12 @@ The `event_id` column is linked later by
 `link_archive_to_event`, and ignored archive-only deliveries are
 marked by `mark_archive_ignored(archive_id, reason)` with safe
 reason values such as `unsupported_event_type`, `bot_actor`, and
-`missing_source_identity`.
+`missing_source_identity`. If archive succeeds but later
+normalisation / event upsert raises unexpectedly, ingest marks
+the archive with `ignored_reason='ingest_error'` and logs the
+exception. If archive itself fails, the webhook route returns 500
+so the provider can retry rather than silently losing an
+unarchived delivery.
 
 `link_archive_to_event(archive_id, event_id)` is a thin
 `UPDATE external_webhook_deliveries SET event_id = $event_id
@@ -859,12 +864,19 @@ batch per event before iterating candidate subscriptions. It must
 not do a `get_notification` round-trip per subscription on the
 hot path.
 
+Daily send-cap checks use an exact PostgREST count instead of
+counting a capped page of notification rows.
+
 Operational logging: webhook handler, ingest, normalizer, and
 external fetch modules emit INFO logs with safe key fields
 (`provider`, `event_type`, `delivery_id`, `archive_id`,
 `event_id`, `source_id`, ignored reason, retry attempt, cache
 hit/miss). Logs must never include raw body text, PR/comment
 body, headers containing secrets, or external API tokens.
+
+Project-token lockout cache invalidation is process-local in
+2.0a. This is acceptable for the current single Railway bot
+process; scale-out needs DB-backed invalidation or pub/sub.
 
 ---
 
@@ -939,6 +951,9 @@ Concrete e2e scripts the implementation must pass:
 4. POST an unsupported but signed event → 200, archived-only,
    `ignored_reason='unsupported_event_type'`, and an INFO log with
    that reason
+5. Simulate a normalizer/upsert exception after archive succeeds
+   → webhook returns 200, archive row has
+   `ignored_reason='ingest_error'`, and logs include the exception
 
 ---
 

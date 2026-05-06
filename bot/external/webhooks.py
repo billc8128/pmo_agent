@@ -107,14 +107,23 @@ async def _handle_webhook(request: Request, provider: str) -> Response:
         log_delivery_id,
         len(body),
     )
-    await ingest_external_event(
-        provider=provider,
-        event_type=event_type,
-        delivery_id=delivery_id,
-        payload=payload,
-        raw_bytes=body,
-        headers=dict(request.headers),
-    )
+    try:
+        await ingest_external_event(
+            provider=provider,
+            event_type=event_type,
+            delivery_id=delivery_id,
+            payload=payload,
+            raw_bytes=body,
+            headers=dict(request.headers),
+        )
+    except Exception:
+        logger.exception(
+            "webhook.ingest_failed provider=%s event_type=%s delivery_id=%s status=500",
+            log_provider,
+            log_event_type,
+            log_delivery_id,
+        )
+        return Response(status_code=500)
     logger.info(
         "webhook.completed provider=%s event_type=%s delivery_id=%s",
         log_provider,

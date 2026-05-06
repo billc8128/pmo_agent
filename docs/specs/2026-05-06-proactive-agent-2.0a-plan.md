@@ -181,8 +181,8 @@ External ingest:
   NULL; never clobbers an existing successful link.
 - `mark_archive_ignored(archive_id, reason) -> None` — writes
   safe audit reasons like `unsupported_event_type`, `bot_actor`,
-  or `missing_source_identity` for deliveries that were archived
-  but did not become events rows.
+  `missing_source_identity`, or `ingest_error` for deliveries
+  that were archived but did not become events rows.
 - `upsert_event(source, source_id, user_id, project_root,
   occurred_at, payload) -> int` — computes
   `payload_fingerprint` for webhook events from a stable subset of
@@ -448,60 +448,67 @@ async def ingest_external_event(
     logger.info("webhook.archived ... redaction_hits=%s",
                 redaction_hits)
 
-    # 2. Normalize. If event_type is one we don't ingest, return
-    #    here — raw is already archived above.
-    if provider == "github":
-        normalized = normalize_github(event_type, payload)
-    elif provider == "gitea":
-        normalized = normalize_gitea(event_type, payload)
-    else:
-        return
-    if normalized is None:
-        queries.mark_archive_ignored(archive_id,
-                                     "unsupported_event_type")
-        logger.info("webhook.archive_ignored ... reason=unsupported_event_type")
-        return
+    try:
+        # 2. Normalize. If event_type is one we don't ingest,
+        #    return here — raw is already archived above.
+        if provider == "github":
+            normalized = normalize_github(event_type, payload)
+        elif provider == "gitea":
+            normalized = normalize_gitea(event_type, payload)
+        else:
+            queries.mark_archive_ignored(archive_id,
+                                         "unsupported_provider")
+            return
+        if normalized is None:
+            queries.mark_archive_ignored(archive_id,
+                                         "unsupported_event_type")
+            logger.info("webhook.archive_ignored ... reason=unsupported_event_type")
+            return
 
-    if normalized.get("actor", {}).get("is_bot"):
-        queries.mark_archive_ignored(archive_id, "bot_actor")
-        logger.info("webhook.archive_ignored ... reason=bot_actor")
+        if normalized.get("actor", {}).get("is_bot"):
+            queries.mark_archive_ignored(archive_id, "bot_actor")
+            logger.info("webhook.archive_ignored ... reason=bot_actor")
+            return
+
+        source_id = source_id_for_event(normalized)
+        if source_id is None:
+            queries.mark_archive_ignored(archive_id,
+                                         "missing_source_identity")
+            logger.info("webhook.archive_ignored ... reason=missing_source_identity")
+            return
+
+        # 3. Upsert into events with the compact normalised shape.
+        #    source_id is a resource-stable identity, not delivery_id:
+        #    PR: pull_request:{repo}:{number}
+        #    push: push:{repo}:{ref}:{after}
+        #    release: release:{repo}:{tag}
+        #    comment: issue_comment:{repo}:{comment_id}
+        #    Webhook events have no events.user_id subject. The actor
+        #    profile stays inside payload.actor.profile_id.
+        #    project_root is the repo identifier, e.g.
+        #    github:billc8128/vibelive, not external_repos.project_root.
+        #    Idempotency via payload_fingerprint (computed from a
+        #    stable subset of the normalised payload — see helper
+        #    contract in §2). Returns event_id.
+        event_id = queries.upsert_event(
+            source=provider,
+            source_id=source_id,
+            user_id=None,
+            project_root=normalized.get("repo", {}).get("project_root"),
+            occurred_at=normalized["occurred_at"],
+            payload=normalized,
+        )
+
+        # 4. Cross-link the archive row to the event row so audit
+        #    queries can hop "archive → normalized → notification".
+        if event_id is not None:
+            queries.link_archive_to_event(archive_id, event_id)
+        logger.info("webhook.event_upserted ... event_id=%s source_id=%s",
+                    event_id, source_id)
+    except Exception:
+        queries.mark_archive_ignored(archive_id, "ingest_error")
+        logger.exception("webhook.archive_ignored ... reason=ingest_error")
         return
-
-    source_id = source_id_for_event(normalized)
-    if source_id is None:
-        queries.mark_archive_ignored(archive_id,
-                                     "missing_source_identity")
-        logger.info("webhook.archive_ignored ... reason=missing_source_identity")
-        return
-
-    # 3. Upsert into events with the compact normalised shape.
-    #    source_id is a resource-stable identity, not delivery_id:
-    #    PR: pull_request:{repo}:{number}
-    #    push: push:{repo}:{ref}:{after}
-    #    release: release:{repo}:{tag}
-    #    comment: issue_comment:{repo}:{comment_id}
-    #    Webhook events have no events.user_id subject. The actor
-    #    profile stays inside payload.actor.profile_id.
-    #    project_root is the repo identifier, e.g.
-    #    github:billc8128/vibelive, not external_repos.project_root.
-    #    Idempotency via payload_fingerprint (computed from a
-    #    stable subset of the normalised payload — see helper
-    #    contract in §2). Returns event_id.
-    event_id = queries.upsert_event(
-        source=provider,
-        source_id=source_id,
-        user_id=None,
-        project_root=normalized.get("repo", {}).get("project_root"),
-        occurred_at=normalized["occurred_at"],
-        payload=normalized,
-    )
-
-    # 4. Cross-link the archive row to the event row so audit
-    #    queries can hop "archive → normalized → notification".
-    if event_id is not None:
-        queries.link_archive_to_event(archive_id, event_id)
-    logger.info("webhook.event_upserted ... event_id=%s source_id=%s",
-                event_id, source_id)
 
 
 def _safe_headers(headers: dict) -> dict:

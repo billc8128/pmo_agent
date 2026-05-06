@@ -34,6 +34,14 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
+def _integer_text(value: Any) -> str | None:
+    text = _text(value)
+    if not text or not text.isdigit():
+        return None
+    number = int(text)
+    return str(number) if number > 0 else None
+
+
 def _stable_payload(value: dict[str, Any]) -> dict[str, Any]:
     stable = {
         k: v
@@ -56,7 +64,7 @@ def source_id_for_event(normalized: dict[str, Any]) -> str | None:
         return None
 
     if event_type == "pull_request":
-        pr_number = _text(_as_dict(normalized.get("pr")).get("number"))
+        pr_number = _integer_text(_as_dict(normalized.get("pr")).get("number"))
         return f"pull_request:{repo_name}:{pr_number}" if pr_number else None
     if event_type == "push":
         ref = _text(normalized.get("ref"))
@@ -66,7 +74,7 @@ def source_id_for_event(normalized: dict[str, Any]) -> str | None:
         tag = _text(_as_dict(normalized.get("release")).get("tag_name"))
         return f"release:{repo_name}:{tag}" if tag else None
     if event_type == "issue_comment":
-        comment_id = _text(_as_dict(normalized.get("comment")).get("id"))
+        comment_id = _integer_text(_as_dict(normalized.get("comment")).get("id"))
         return f"issue_comment:{repo_name}:{comment_id}" if comment_id else None
     return None
 
@@ -115,75 +123,85 @@ async def ingest_external_event(
         redaction_hits,
     )
 
-    if provider == "github":
-        normalized = normalize_github(event_type, payload)
-    elif provider == "gitea":
-        normalized = normalize_gitea(event_type, payload)
-    else:
-        queries.mark_archive_ignored(archive_id, "unsupported_provider")
-        logger.info(
-            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_provider",
-            log_provider,
-            log_event_type,
-            log_delivery_id,
-            archive_id,
-        )
-        return
-    if normalized is None:
-        queries.mark_archive_ignored(archive_id, "unsupported_event_type")
-        logger.info(
-            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_event_type",
-            log_provider,
-            log_event_type,
-            log_delivery_id,
-            archive_id,
-        )
-        return
+    try:
+        if provider == "github":
+            normalized = normalize_github(event_type, payload)
+        elif provider == "gitea":
+            normalized = normalize_gitea(event_type, payload)
+        else:
+            queries.mark_archive_ignored(archive_id, "unsupported_provider")
+            logger.info(
+                "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_provider",
+                log_provider,
+                log_event_type,
+                log_delivery_id,
+                archive_id,
+            )
+            return
+        if normalized is None:
+            queries.mark_archive_ignored(archive_id, "unsupported_event_type")
+            logger.info(
+                "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_event_type",
+                log_provider,
+                log_event_type,
+                log_delivery_id,
+                archive_id,
+            )
+            return
 
-    actor = _as_dict(normalized.get("actor"))
-    if actor.get("is_bot"):
-        queries.mark_archive_ignored(archive_id, "bot_actor")
+        actor = _as_dict(normalized.get("actor"))
+        if actor.get("is_bot"):
+            queries.mark_archive_ignored(archive_id, "bot_actor")
+            logger.info(
+                "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=bot_actor actor=%s",
+                log_provider,
+                log_event_type,
+                log_delivery_id,
+                archive_id,
+                safe_log_value(actor.get("login") or ""),
+            )
+            return
+
+        source_id = source_id_for_event(normalized)
+        if source_id is None:
+            queries.mark_archive_ignored(archive_id, "missing_source_identity")
+            logger.info(
+                "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=missing_source_identity",
+                log_provider,
+                log_event_type,
+                log_delivery_id,
+                archive_id,
+            )
+            return
+
+        event_id = queries.upsert_event(
+            source=provider,
+            source_id=source_id,
+            user_id=None,
+            project_root=normalized.get("project_root") or (normalized.get("repo") or {}).get("project_root"),
+            occurred_at=normalized.get("occurred_at"),
+            payload=normalized,
+            payload_fingerprint=payload_fingerprint(normalized),
+        )
+        if event_id is not None:
+            queries.link_archive_to_event(archive_id, event_id)
+            lockout.invalidate_project_tokens_cache()
         logger.info(
-            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=bot_actor actor=%s",
+            "webhook.event_upserted provider=%s event_type=%s delivery_id=%s archive_id=%s event_id=%s source_id=%s project_root=%s",
             log_provider,
             log_event_type,
             log_delivery_id,
             archive_id,
-            safe_log_value(actor.get("login") or ""),
+            event_id,
+            safe_log_value(source_id),
+            safe_log_value(normalized.get("project_root") or ""),
         )
-        return
-
-    source_id = source_id_for_event(normalized)
-    if source_id is None:
-        queries.mark_archive_ignored(archive_id, "missing_source_identity")
-        logger.info(
-            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=missing_source_identity",
+    except Exception:
+        queries.mark_archive_ignored(archive_id, "ingest_error")
+        logger.exception(
+            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=ingest_error",
             log_provider,
             log_event_type,
             log_delivery_id,
             archive_id,
         )
-        return
-
-    event_id = queries.upsert_event(
-        source=provider,
-        source_id=source_id,
-        user_id=None,
-        project_root=normalized.get("project_root") or (normalized.get("repo") or {}).get("project_root"),
-        occurred_at=normalized.get("occurred_at"),
-        payload=normalized,
-        payload_fingerprint=payload_fingerprint(normalized),
-    )
-    if event_id is not None:
-        queries.link_archive_to_event(archive_id, event_id)
-        lockout.invalidate_project_tokens_cache()
-    logger.info(
-        "webhook.event_upserted provider=%s event_type=%s delivery_id=%s archive_id=%s event_id=%s source_id=%s project_root=%s",
-        log_provider,
-        log_event_type,
-        log_delivery_id,
-        archive_id,
-        event_id,
-        safe_log_value(source_id),
-        safe_log_value(normalized.get("project_root") or ""),
-    )

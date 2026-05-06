@@ -132,3 +132,14 @@ test('integrations page does not create service-role client for anonymous viewer
   assert.ok(adminClientUse > 0, 'expected page to still use admin client after auth');
   assert.ok(loginGate < adminClientUse, 'anonymous gate must run before adminClient()');
 });
+
+test('integration status refresh requires a signed-in viewer', () => {
+  const source = readFileSync(new URL('../app/integrations/actions.ts', import.meta.url), 'utf8');
+  const refreshStart = source.indexOf('export async function refreshIntegrationStatus()');
+  const requireSignedIn = source.indexOf('await requireSignedInViewer()', refreshStart);
+  const revalidate = source.indexOf('revalidatePath(INTEGRATIONS_PATH)', refreshStart);
+
+  assert.ok(refreshStart > 0, 'expected refresh action to exist');
+  assert.ok(requireSignedIn > refreshStart, 'refresh action must require auth');
+  assert.ok(revalidate > requireSignedIn, 'auth check must run before revalidation');
+});

@@ -50,10 +50,11 @@ export async function deleteExternalRepoMapping(id: string) {
 }
 
 export async function refreshIntegrationStatus() {
+  await requireSignedInViewer();
   revalidatePath(INTEGRATIONS_PATH);
 }
 
-async function requireIntegrationManager() {
+async function requireSignedInViewer() {
   const sb = await serverActionClient();
   const {
     data: { user },
@@ -61,7 +62,13 @@ async function requireIntegrationManager() {
   if (!user) {
     throw new Error('not signed in');
   }
+  return user;
+}
 
+async function requireIntegrationManager() {
+  const user = await requireSignedInViewer();
+
+  const sb = await serverActionClient();
   const { data: profile } = await sb
     .from('profiles')
     .select('id, handle')

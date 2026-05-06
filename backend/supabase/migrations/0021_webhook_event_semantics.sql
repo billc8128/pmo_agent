@@ -3,6 +3,11 @@
 -- (e.g. github:owner/repo), not developer-local filesystem paths.
 
 update public.events
+   set user_id = null
+ where source in ('github', 'gitea')
+   and user_id is not null;
+
+update public.events
    set project_root = lower(source || ':' || (payload #>> '{repo,full_name}')),
        payload = jsonb_set(
            jsonb_set(
