@@ -217,9 +217,20 @@ The schema split is small but the UX is not. Several questions:
 
 1. **Permissions**: can a user set up a rule that delivers to
    ANOTHER user's DM? Probably not by default — that's spam.
-   Either gate by mutual binding (both users have feishu_links
-   AND have at least one shared chat) OR require explicit
-   consent ("albert 同意接收 bcc 设置的提醒吗?").
+   The 2.0b spec resolves this with two distinct paths:
+   - **User-owned rules** require explicit `target_consents`
+     (the target user must have agreed). Granted via a
+     bot-mediated consent prompt where the reply must be a
+     parent_message_id-bound reply to the bot's request — bare
+     "yes" elsewhere doesn't grant.
+   - **Chat-owned rules** can use chat membership as the
+     anchor: both rule creator and target must currently be
+     members of the rule's chat. Verified at creation via
+     Feishu's `chats/{id}/members`; rechecked at delivery
+     time (6h cache).
+   The earlier "shared chat as implicit consent" idea was
+   removed because Feishu doesn't expose the API to enumerate
+   "all chats two users share."
 
 2. **Group-level rule discovery**: in a chat, who can see/edit
    the chat's rules? Default: any chat member. But abusable

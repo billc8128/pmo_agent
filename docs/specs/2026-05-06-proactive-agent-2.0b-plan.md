@@ -43,12 +43,32 @@ Creates:
 - `subscriptions.target_kind` (text, check, default null)
 - `subscriptions.target_id` (text, default null)
 - `subscriptions.target_user_open_id` (text, default null)
+- **`subscriptions.consent_anchor` (text, default null)** —
+  records HOW cross-user permission was granted at creation
+  time. Read by delivery-time recheck (spec §4.3). Format:
+  `null` (no cross-user permission) | `explicit:{consent_uuid}`
+  | `chat:{chat_id}`. Backfill leaves it NULL for all existing
+  rows since none of them are cross-user.
 - Backfill: every existing subscription gets target = current
-  scope (per spec §3.1)
+  scope (per spec §3.1), consent_anchor stays NULL
 - `alter column target_kind set not null` (after backfill)
 - Constraint `subs_target_check` per spec §3.1
+- `notifications.mention_open_id` (text, default null) — used
+  by mention_in_chat delivery (per spec §8 / plan §7)
 - `target_consents` table per spec §3.3
 - Index `target_consents_active_idx`
+- **`pending_target_consents` table per spec §3.4**: id /
+  source_user_id / target_user_id / request_message_id
+  (NULLABLE — see #3 fix below) / rule_description / status /
+  created_at / expires_at / resolved_at. NOT a constraint
+  unique (source_user_id, target_user_id, status); INSTEAD
+  partial unique index on (source_user_id, target_user_id)
+  WHERE status='pending' so multiple resolved/expired rows for
+  the same pair don't conflict but at most one pending exists.
+- New SQL RPC `mark_suppressed_if_claimed(p_notif_id, p_claim_id,
+  p_suppressed_by)` per plan §7 — lease-conditional UPDATE
+  flipping pending → suppressed. ACL: revoke from public/anon/
+  authenticated, grant to service_role only. search_path pinned.
 
 RLS:
 - `target_consents` enabled. Policies:
@@ -57,6 +77,10 @@ RLS:
   - source_user can read their own outgoing consents
     (`auth.uid() = source_user_id`)
   - Inserts/updates only via service-role (the bot mediates)
+- `pending_target_consents` enabled. Policies:
+  - source_user can read their own outgoing requests
+  - target_user can read their own incoming requests
+  - Inserts/updates only via service-role
 
 **Apply path**: via Supabase Management API.
 
@@ -75,13 +99,29 @@ RLS:
 3. **Constraint**: insert a row with
    `target_kind='mention_in_chat'` and target_user_open_id
    NULL → expect constraint violation.
-4. **target_consents unique**: insert two rows with same
-   (target_user_id, source_user_id) → second fails uniqueness.
-5. **RLS**: as anon, select target_consents → 0 rows. As
-   authenticated as user X, select → only rows where X is
-   target or source.
+4. **target_consents unique + UPSERT**: insert two rows with
+   same (target_user_id, source_user_id) → second fails
+   uniqueness. Then run the upsert per spec §3.3
+   (`on conflict ... do update set revoked_at=null,
+   granted_at=now()`) → succeeds, original row updated, no
+   second row.
+5. **target_consents revoke→regrant cycle**: insert row, set
+   revoked_at, then run the upsert → revoked_at=null,
+   granted_at refreshed (same row id).
+6. **pending_target_consents partial unique**: insert pending
+   row for pair (A,B). Insert second pending row for (A,B) →
+   fails on partial unique. Resolve first row to 'declined'.
+   Insert new pending row for (A,B) → succeeds (declined row
+   doesn't conflict because partial unique only fires for
+   status='pending').
+7. **pending_target_consents request_message_id nullable**:
+   insert pending row with request_message_id=NULL → succeeds.
+   UPDATE to set request_message_id later → succeeds.
+8. **RLS**: as anon, select target_consents +
+   pending_target_consents → 0 rows. As authenticated as user
+   X, select → only rows where X is target or source.
 
-**Exit criterion**: all 5 smoke tests pass; ROLLBACK leaves DB
+**Exit criterion**: all 8 smoke tests pass; ROLLBACK leaves DB
 clean.
 
 ---
@@ -92,20 +132,50 @@ clean.
 
 New helpers:
 
-- `add_target_consent(target_user_id, source_user_id) -> dict`
+- `add_target_consent(target_user_id, source_user_id) -> dict` —
+  upsert per spec §3.3: ON CONFLICT DO UPDATE SET
+  revoked_at=null, granted_at=now()
 - `revoke_target_consent(target_user_id, source_user_id) -> bool`
 - `is_consent_granted(target_user_id, source_user_id) -> bool`
 - `list_consents_for_user(user_id, direction='incoming'|'outgoing') -> list[dict]`
-- `users_share_chat(user_a_open_id, user_b_open_id) -> bool` —
-  caches the answer per pair for 6h via in-memory TTL cache
-  (no new table, just a Python dict). Actual lookup hits
-  Feishu's chat membership API.
+- `chat_member_open_ids(chat_id) -> set[str]` — lookup of all
+  open_ids currently in a Feishu chat, cached 6h. Used for
+  chat-owned-rule consent_anchor verification at both creation
+  and delivery time. **The bot can call
+  `chats/{chat_id}/members` against a known chat_id; it CANNOT
+  enumerate "all chats user X is in" — so we never use this
+  helper for user-owned rules.**
+- `pending_consent_create(source_user_id, target_user_id,
+  rule_description) -> uuid` — creates row in
+  `pending_target_consents` with status='pending'; returns id
+  (request_message_id is filled in later via
+  `pending_consent_attach_message`).
+- `pending_consent_attach_message(id, message_id)` — sets
+  request_message_id after the bot DM has been sent.
+- `pending_consent_lookup_by_reply(parent_message_id,
+  sender_profile_id) -> row | None` — used by
+  `_handle_message` to detect consent replies.
+- `pending_consent_resolve(id, status, granted=False)` — sets
+  status to 'granted'/'declined' and resolved_at; if granted=True
+  also calls `add_target_consent`.
 
-The Subscription dataclass needs three more fields: `target_kind`,
-`target_id`, `target_user_open_id`.
+**Removed in this revision**: `users_share_chat()`. The earlier
+draft used it for "user-owned cross-DM with shared chat as
+implicit consent." That path was removed in spec §4.1 because
+Feishu's API doesn't support enumerating two users' shared
+chats reliably. User-owned cross-DM is now explicit-consent-only.
+
+The Subscription dataclass needs FOUR more fields:
+`target_kind`, `target_id`, `target_user_open_id`,
+`consent_anchor`. Without `consent_anchor`, the delivery-time
+recheck path can't tell whether a row needs explicit-consent
+verification or chat-anchor verification.
 
 **Exit criterion**: smoke from REPL — grant a consent, check
-it's granted, revoke, check it's not.
+it's granted, revoke (UPDATE revoked_at), check is_consent_granted
+returns False, re-grant via the upsert helper, check returns True
+again. Pending consent: create a pending row (without message id),
+attach a message id, look up by parent_message_id, resolve.
 
 ---
 
@@ -305,12 +375,19 @@ def _delivery_for_subscription(sub: Subscription) -> tuple[
     the notification suppressed and disable the subscription).
 
     Per spec §4.3, cross-user targets get a delivery-time
-    permission re-check so a target user leaving a shared chat
-    eventually stops receiving the source user's pings.
+    permission re-check. The recheck path is keyed on
+    `consent_anchor` (NOT on scope_kind), so chat-owned rules
+    with cross-user user_dm targets also recheck.
     """
-    if sub.target_kind == "user_dm":
-        if _is_cross_user(sub) and not _consent_still_valid(sub):
+    # Recheck applies whenever consent_anchor is non-null.
+    # Anchor=null means "no cross-user permission needed"
+    # (e.g. user-owned rule targeting self, or chat-owned rule
+    # targeting same chat) → no recheck.
+    if sub.consent_anchor is not None:
+        if not _consent_still_valid(sub):
             return None
+
+    if sub.target_kind == "user_dm":
         link = queries.feishu_link_for_user_id(sub.target_id)
         if not link or not link.feishu_open_id:
             return "feishu_user", "", None  # delivery will fail
@@ -318,35 +395,56 @@ def _delivery_for_subscription(sub: Subscription) -> tuple[
     if sub.target_kind == "chat":
         return "feishu_chat", sub.target_id, None
     if sub.target_kind == "mention_in_chat":
-        if not _consent_still_valid(sub):
-            return None
         return "feishu_chat", sub.target_id, sub.target_user_open_id
     raise ValueError(f"unknown target_kind: {sub.target_kind}")
 
 
-def _is_cross_user(sub: Subscription) -> bool:
-    return (
-        sub.scope_kind == "user"
-        and sub.target_kind in ("user_dm", "mention_in_chat")
-        and sub.target_id != sub.scope_id
-    )
-
-
 def _consent_still_valid(sub: Subscription) -> bool:
-    """Re-checks permission via the same logic as creation time,
-    cached 6h per (owner, target) pair."""
-    cache_key = (sub.scope_id, sub.target_id, sub.target_kind)
-    cached = _consent_cache_get(cache_key)
-    if cached is not None:
-        return cached
-    result = permissions.check_target_allowed(
-        owner_kind=sub.scope_kind, owner_id=sub.scope_id,
-        target_kind=sub.target_kind, target_id=sub.target_id,
-        target_user_open_id=sub.target_user_open_id,
-        requesting_profile_id=sub.created_by or sub.scope_id,
-    )
-    _consent_cache_put(cache_key, result.allowed, ttl_seconds=6 * 3600)
-    return result.allowed
+    """Re-checks permission per the consent_anchor format.
+
+    Per spec §4.3:
+    - explicit:CONSENT_ID  -> re-read target_consents row, NO
+                              positive cache (revokes must take
+                              effect immediately, even within
+                              the would-be cache window)
+    - chat:CHAT_ID         -> re-fetch chat membership, cache
+                              positive results 6h
+    """
+    anchor = sub.consent_anchor or ""
+    if anchor.startswith("explicit:"):
+        consent_id = anchor.split(":", 1)[1]
+        # Direct DB read; no cache. Cheap (single-row UUID lookup)
+        # and revoke must propagate to the next delivery.
+        row = queries.target_consent_get(consent_id)
+        return bool(row and row.get("revoked_at") is None)
+
+    if anchor.startswith("chat:"):
+        chat_id = anchor.split(":", 1)[1]
+        # Both source and target must still be members of the
+        # anchor chat. The chat_member_open_ids helper caches
+        # 6h; we compute the boolean per-call.
+        members = queries.chat_member_open_ids(chat_id)
+        # Need owner's open_id and target's open_id.
+        # Owner: if scope_kind=user, sub.scope_id=profile, look up
+        #        feishu_link. If scope_kind=chat, owner concept is
+        #        a chat, but for cross-user user_dm the original
+        #        creator's profile is in sub.created_by.
+        owner_profile = sub.created_by if sub.scope_kind == "chat" \
+                        else sub.scope_id
+        owner_link = queries.feishu_link_for_user_id(owner_profile)
+        target_link = queries.feishu_link_for_user_id(sub.target_id) \
+                      if sub.target_kind == "user_dm" else None
+        owner_open_id = owner_link.feishu_open_id if owner_link else None
+        target_open_id = (
+            target_link.feishu_open_id if target_link
+            else sub.target_user_open_id  # for mention_in_chat
+        )
+        if not owner_open_id or not target_open_id:
+            return False
+        return owner_open_id in members and target_open_id in members
+
+    # Unknown anchor format → fail closed
+    return False
 ```
 
 **Caller** (the delivery loop's `process_pending` per 1.0c
@@ -456,16 +554,34 @@ notification that, when sent to Feishu, includes the @-mention.
 
 ## 8. End-to-end validation (~1h)
 
-Run the validation scripts from spec §10:
+Run the validation scripts from spec §10 (numbering aligns with
+spec §10's revised list — no longer includes "shared-chat
+implicit consent for user-owned rules" since that path was
+removed in §4.1):
 
-1. Existing subscriptions still deliver post-migration (§10.1)
-2. Cross-DM with shared chat (§10.2)
-3. Cross-DM without shared chat → blocked (§10.3)
-4. Consent grant flow (§10.4)
-5. Mention-in-chat (§10.5)
-6. Group rule UX (§10.6)
+1. Existing subscriptions still deliver post-migration
+2. User-owned cross-DM **without explicit consent** → blocked
+   (no shared-chat fallback, regardless of common chats)
+3. User-owned cross-DM **with explicit consent** → allowed
+4. Consent grant flow via bot-mediated prompt (pending row →
+   reply with parent_message_id match → resolved + consent row)
+5. Consent prompt does NOT match a casual "yes" reply that has
+   no parent_message_id link to a pending row
+6. Chat-owned rule with cross-user target who IS a chat member
+   → allowed via consent_anchor=chat:{C}
+7. Chat-owned rule with cross-user target who is NOT a chat
+   member → requires explicit consent
+8. Delivery-time recheck for chat anchor: user leaves anchor
+   chat → next delivery (after cache expiry) suppressed via
+   `mark_suppressed_if_claimed` + subscription disabled
+9. Delivery-time recheck for explicit consent: target revokes
+   → next delivery suppressed (no positive cache delay for
+   explicit revoke; see plan §7)
+10. mention_in_chat (target is chat member) → renders
+    `<at user_id="ou_xxx">` correctly
+11. Group rule UX: chat members can manage chat-scoped rules
 
-**Exit criterion**: 6/6 validation scripts pass.
+**Exit criterion**: 11/11 validation scripts pass.
 
 ---
 

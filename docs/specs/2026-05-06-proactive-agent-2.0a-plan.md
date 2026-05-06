@@ -221,8 +221,14 @@ async def github_webhook(request: Request) -> Response:
         # but didn't replicate headers). Reject for hygiene.
         return Response(status_code=400)
 
-    await ingest_external_event("github", event_type, delivery,
-                                 payload, raw_body=raw_body)
+    await ingest_external_event(
+        provider="github",
+        event_type=event_type,
+        delivery_id=delivery,
+        payload=payload,
+        raw_bytes=raw_body,
+        headers=dict(request.headers),
+    )
     return Response(status_code=200)
 ```
 
@@ -356,19 +362,41 @@ shape. If investigator wants more (e.g. file diffs), it calls
 
 ```python
 async def ingest_external_event(
-    provider: str,           # 'github' or 'gitea'
-    event_type: str,         # 'pull_request', 'push', etc.
-    delivery_id: str,        # X-{Provider}-Delivery
-    raw_body: dict,
+    provider: str,                # 'github' or 'gitea'
+    event_type: str,              # 'pull_request', 'push', etc.
+    delivery_id: str,             # X-{Provider}-Delivery
+    payload: dict,                # parsed JSON body (already
+                                  # validated by the route)
+    raw_bytes: bytes,             # original body bytes — kept
+                                  # only for audit/debug archive
+    headers: dict[str, str] | None = None,
 ) -> None:
+    # 1. ALWAYS archive the raw delivery first, regardless of
+    #    whether we'll write an events row. This gives us a full
+    #    forensic trail for events we ignore today and might
+    #    decide to ingest later. Per spec §3.5, this table is
+    #    service-role-only; LLMs never read it.
+    queries.archive_external_delivery(
+        provider=provider,
+        delivery_id=delivery_id,
+        event_type=event_type,
+        raw_body=payload,         # parsed dict; row is jsonb
+        raw_headers=_safe_headers(headers or {}),
+    )
+
+    # 2. Normalize. If event_type is one we don't ingest, return
+    #    here — raw is already archived above.
     if provider == "github":
-        normalized = normalize_github(event_type, raw_body)
+        normalized = normalize_github(event_type, payload)
     elif provider == "gitea":
-        normalized = normalize_gitea(event_type, raw_body)
+        normalized = normalize_gitea(event_type, payload)
     else:
         return
     if normalized is None:
-        return  # event type ignored
+        return  # event type ignored — raw still archived
+
+    # 3. Upsert into events with the compact normalised shape.
+    #    Idempotency via payload_fingerprint — see below.
     queries.upsert_event(
         source=provider,
         source_id=f"{event_type}:{delivery_id}",
@@ -377,6 +405,13 @@ async def ingest_external_event(
         occurred_at=normalized["occurred_at"],
         payload=normalized,
     )
+
+
+def _safe_headers(headers: dict) -> dict:
+    """Strip auth/signing headers before archiving."""
+    redact = {"x-hub-signature", "x-hub-signature-256",
+              "x-gitea-signature", "authorization", "cookie"}
+    return {k: v for k, v in headers.items() if k.lower() not in redact}
 ```
 
 Note `queries.upsert_event` is **a new helper** — current 1.0a

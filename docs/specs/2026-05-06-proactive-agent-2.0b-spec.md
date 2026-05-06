@@ -243,9 +243,12 @@ create table public.pending_target_consents (
     id                  uuid primary key default gen_random_uuid(),
     source_user_id      uuid not null references public.profiles(id) on delete cascade,
     target_user_id      uuid not null references public.profiles(id) on delete cascade,
-    request_message_id  text not null,    -- Feishu message id of the
-                                          -- bot's request DM, used to
-                                          -- match parent_id replies
+    -- Nullable on purpose: the row is created BEFORE the bot
+    -- sends the prompt DM (so we have an id to attach to the
+    -- DM body). After the DM is sent, the bot's outgoing
+    -- message_id is written here via UPDATE. Reply-detection
+    -- ignores rows where request_message_id is still NULL.
+    request_message_id  text,
     rule_description    text not null,    -- the rule the source wants
                                           -- to set up (shown to target)
     status              text not null default 'pending' check (
@@ -253,20 +256,49 @@ create table public.pending_target_consents (
                         ),
     created_at          timestamptz not null default now(),
     expires_at          timestamptz not null default (now() + interval '7 days'),
-    resolved_at         timestamptz,
-    -- A given pair can have at most one pending request at a time;
-    -- previously-resolved requests don't block new ones (status filter).
-    constraint pending_consent_one_active
-        unique (source_user_id, target_user_id, status)
+    resolved_at         timestamptz
 );
 
+-- A given (source, target) pair can have at most ONE pending
+-- request at a time. Previously-resolved (granted / declined /
+-- expired) rows don't block new pending requests because the
+-- partial unique index only fires for status='pending'.
+-- This is a true partial unique index, NOT a constraint that
+-- includes status in its key — that would have allowed two
+-- 'declined' rows for the same pair, exactly the bug round 3
+-- caught.
+create unique index pending_consent_one_active_idx
+    on public.pending_target_consents (source_user_id, target_user_id)
+    where status = 'pending';
+
 create index pending_consent_message_idx
-    on public.pending_target_consents (request_message_id);
+    on public.pending_target_consents (request_message_id)
+    where request_message_id is not null;
 
 create index pending_consent_expires_idx
     on public.pending_target_consents (expires_at)
     where status = 'pending';
 ```
+
+Lifecycle:
+1. `pending_consent_create(source, target, rule_description)`
+   inserts a row with `request_message_id=NULL,
+   status='pending'`. Returns the row id.
+2. Bot sends consent prompt DM via Feishu API. The outgoing
+   message body includes the row id (so the user can quote it
+   in customer support). The Feishu API returns the bot's
+   outgoing message_id.
+3. `pending_consent_attach_message(id, message_id)` UPDATEs the
+   row with the captured message_id.
+4. Reply detection: incoming message's parent_message_id
+   matches a row's request_message_id (where status='pending'
+   AND request_message_id IS NOT NULL) AND sender's
+   profile_id = row.target_user_id → consent reply detected.
+5. If the bot crashes between steps 1 and 3, the row exists
+   without request_message_id. Daily cleanup removes orphans:
+   `DELETE FROM pending_target_consents WHERE
+   request_message_id IS NULL AND created_at < now() -
+   interval '30 minutes'`.
 
 Reply detection logic in `_handle_message` (1.0a path) consults
 this table:
@@ -684,41 +716,98 @@ Storage:
 1. Existing 1.0c subscription "vibelive 进展告诉我" with
    scope_kind='user', scope_id=bcc.profile_id
 2. Run migration 0021; verify subscription row gains
-   target_kind='user_dm', target_id=bcc.profile_id
+   target_kind='user_dm', target_id=bcc.profile_id,
+   consent_anchor=null (no cross-user permission needed)
 3. Trigger an event that matches; verify notification still
    reaches bcc's DM
 
-### 10.2 Cross-DM with shared chat
+### 10.2 User-owned cross-DM without consent → blocked
 
-1. bcc and albert share group chat #vibelive
-2. bcc creates subscription targeting albert's DM
-3. Permission check passes (shared chat); subscription created
-4. albert's DM receives the notification
+1. bcc and albert have NO `target_consents` row between them
+2. bcc tries to create subscription with target_kind='user_dm',
+   target_id=albert.profile_id from a DM with the bot
+3. Permission check fails — error: "albert hasn't granted you
+   permission to route notifications. Want to ask?"
+4. NO subscription row created
+5. Even if bcc and albert share group chats, the result is the
+   same — user-owned rules don't accept shared-chat as implicit
+   consent (per §4.1)
 
-### 10.3 Cross-DM without shared chat → blocked
+### 10.3 User-owned cross-DM with explicit consent → allowed
 
-1. bcc and someone-not-in-any-shared-chat ("xyz")
-2. bcc tries to create subscription targeting xyz's DM
-3. Permission check fails; subscription NOT created; error
-   message explains "xyz needs to grant consent or share a chat"
+1. albert grants consent via `grant_target_consent` source=bcc
+2. bcc creates the same subscription
+3. Permission check passes; subscription created with
+   `consent_anchor='explicit:{consent_id}'`
+4. Trigger event; albert's DM receives notification
 
-### 10.4 Consent grant flow
+### 10.4 Bot-mediated consent grant flow
 
-1. xyz uses `grant_target_consent` with source_handle='bcc'
-2. bcc retries the cross-DM subscription; now permitted
-3. xyz revokes consent
-4. Subscription is automatically disabled (next reconciler run
-   or via trigger)
+1. bcc tries cross-DM target without explicit consent (§10.2)
+2. bcc clicks "Send request" / runs equivalent chat command
+3. `pending_target_consents` row created with status='pending',
+   request_message_id INITIALLY NULL
+4. Bot DMs albert with the consent prompt; outgoing message_id
+   captured and `pending_consent_attach_message` writes it back
+5. albert replies "同意" with parent_message_id matching the
+   bot's prompt → row resolves to status='granted',
+   `target_consents` row inserted/upserted
+6. bcc retries subscription creation; succeeds
 
-### 10.5 Mention-in-chat
+### 10.5 Pattern-match resistance
 
-1. In #vibelive group, bcc creates subscription with
-   target_kind='mention_in_chat', target_chat_id=#vibelive_id,
-   target_user_open_id=albert.open_id
-2. Event fires; notification sent to #vibelive with
+1. albert receives the bot's consent prompt (pending row exists)
+2. albert ALSO receives a separate DM from a friend about
+   something else; replies "同意" to the friend (NOT to the bot)
+3. Bot's webhook handler sees the "同意" message but its
+   parent_message_id does NOT match any pending_target_consents
+   row → treated as a normal agent message; NO consent granted
+4. albert's pending row remains status='pending'
+
+### 10.6 Chat-owned rule, target is chat member
+
+1. albert (member of #vibelive) creates a chat-owned rule with
+   target_kind='user_dm', target_id=bcc.profile_id (also member)
+2. Permission check verifies bcc is a current member of
+   #vibelive via Feishu API
+3. Subscription created with `consent_anchor='chat:{vibelive_id}'`
+4. bcc's DM receives notifications
+
+### 10.7 Chat-owned rule, target NOT a chat member
+
+1. albert tries to create chat-owned rule targeting xyz (not a
+   member of #vibelive)
+2. Permission check fails — error: "xyz is not a member of this
+   chat. Cross-chat routing requires explicit consent."
+
+### 10.8 Delivery-time chat-anchor recheck
+
+1. Sub from §10.6 exists; bcc leaves #vibelive
+2. After 6h cache expiry, next event triggers delivery →
+   `_consent_still_valid` re-fetches chat members → bcc is
+   absent → `mark_suppressed_if_claimed` runs → notification
+   `status='suppressed'`, `suppressed_by='permission_revoked'`
+3. Subscription is disabled
+
+### 10.9 Delivery-time explicit-revoke recheck (no cache)
+
+1. Cross-DM sub with consent_anchor='explicit:{id}' exists
+2. albert revokes consent (`UPDATE target_consents SET
+   revoked_at = now()`)
+3. WITHIN the would-be 6h cache window, next event triggers
+   delivery → recheck reads `target_consents.revoked_at` (NOT
+   cached) → revoked → suppress + disable
+4. (See plan §7 — explicit consent recheck does not use the 6h
+   positive cache; only chat-anchor membership uses it)
+
+### 10.10 mention_in_chat rendering
+
+1. In #vibelive, chat-owned rule with
+   target_kind='mention_in_chat', target_user_open_id=albert
+2. Event fires; notification posted to #vibelive with
    `<at user_id="ou_albert">` rendering correctly
 
-### 10.6 Group rule UX
+### 10.11 Group rule UX
 
 1. albert in #vibelive uses chat agent to create a rule for
    the chat

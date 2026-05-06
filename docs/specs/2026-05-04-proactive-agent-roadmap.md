@@ -327,8 +327,20 @@ concepts:
   user to @ inside a chat)
 
 Plus permission gates so a third party can't weaponise the bot to
-DM-spam someone — "tell albert in DM about a rule I set in this
-group" requires mutual binding + shared chat.
+DM-spam someone. Two paths:
+- **User-owned rules** with cross-user DM target → require
+  explicit `target_consents` row (granted via the bot-mediated
+  consent prompt; reply detection is parent-message-id bound,
+  not pattern-matched).
+- **Chat-owned rules** with cross-user DM target → both parties
+  must currently be members of the rule's anchor chat; verified
+  at creation via Feishu's `chats/{id}/members` API and rechecked
+  at delivery time (6h cache).
+
+Earlier drafts allowed "shared chat anywhere" as implicit
+consent for user-owned rules. Removed in 2.0b round-3 review:
+Feishu's API doesn't reliably enumerate "all chats two users
+share," so that path was unimplementable cleanly.
 
 Unlocks: chat-mediated rule creation, mention-in-chat as a
 delivery target, third-party rules where owner ≠ target.
