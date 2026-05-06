@@ -31,6 +31,11 @@ def known_project_tokens() -> tuple[set[str], str]:
     return set(_cached_tokens), _cached_hash
 
 
+def invalidate_project_tokens_cache() -> None:
+    global _cached_at
+    _cached_at = 0.0
+
+
 def last_segment(project_root: str | None) -> str:
     if not project_root:
         return ""

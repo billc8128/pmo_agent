@@ -352,6 +352,28 @@ def test_ingest_redacts_secret_like_strings_before_archive_and_event_upsert(monk
     assert "[REDACTED]" in serialized
 
 
+def test_redaction_covers_common_external_secret_shapes():
+    from external.redaction import redact_text
+
+    stripe_secret = "sk_" + "live_" + "1234567890abcdefghijklmnopqrstuvwxyz"
+    samples = [
+        "jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        f"stripe={stripe_secret}",
+        "auth=Bearer ghp_1234567890abcdefghijklmnopqrstuvwxyz1234",
+        "db=postgres://user:pass@example.internal:5432/app",
+        "hook=https://open.feishu.cn/open-apis/bot/v2/hook/12345678-1234-1234-1234-1234567890ab",
+    ]
+
+    redacted, count = redact_text("\n".join(samples))
+
+    assert count >= len(samples)
+    assert "eyJhbGciOi" not in redacted
+    assert "sk_" + "live_" not in redacted
+    assert "Bearer ghp_" not in redacted
+    assert "postgres://user:pass" not in redacted
+    assert "open-apis/bot/v2/hook" not in redacted
+
+
 def test_ingest_upserts_event_and_links_archive(monkeypatch):
     from external import ingest, normalizer
 
@@ -359,6 +381,7 @@ def test_ingest_upserts_event_and_links_archive(monkeypatch):
 
     monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", lambda *args, **kwargs: None)
     monkeypatch.setattr(normalizer.queries, "lookup_project_root_for_repo", lambda *args, **kwargs: "/repo/vibelive")
+    monkeypatch.setattr(ingest.lockout, "invalidate_project_tokens_cache", lambda: calls.append(("lockout_invalidate", None)))
 
     class FakeQueries:
         @staticmethod
@@ -402,6 +425,19 @@ def test_ingest_upserts_event_and_links_archive(monkeypatch):
     assert upsert["payload"]["event_type"] == "pull_request"
     assert upsert["payload"]["actor"]["profile_id"] is None
     assert calls[2] == ("link", (7, 99))
+    assert calls[3] == ("lockout_invalidate", None)
+
+
+def test_legitimate_dash_bot_login_is_not_treated_as_bot(monkeypatch):
+    from external import normalizer
+
+    monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", lambda *args, **kwargs: None)
+    payload = _github_pr_payload(sender={"login": "happy-bot", "id": 12345, "type": "User"})
+
+    normalized = normalizer.normalize_github("pull_request", payload)
+
+    assert normalized["actor"]["login"] == "happy-bot"
+    assert normalized["actor"]["is_bot"] is False
 
 
 def test_ingest_uses_resource_stable_source_id_across_deliveries(monkeypatch):
@@ -533,6 +569,46 @@ def test_ingest_logs_archive_only_reason(monkeypatch, caplog):
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("webhook.archive_ignored" in msg and "unsupported_event_type" in msg for msg in messages)
+
+
+def test_ingest_logs_sanitize_attacker_controlled_identifiers(monkeypatch, caplog):
+    from external import ingest
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            return 7
+
+        @staticmethod
+        def mark_archive_ignored(*args):
+            return None
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            raise AssertionError("unsupported events should not be upserted")
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            raise AssertionError("unsupported events should not be linked")
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+
+    with caplog.at_level(logging.INFO, logger="external.ingest"):
+        asyncio.run(
+            ingest.ingest_external_event(
+                provider="github",
+                event_type="workflow_run\nforged",
+                delivery_id="delivery-1\x1b[31m\nforged",
+                payload={"action": "completed"},
+                raw_bytes=b"{}",
+                headers={},
+            )
+        )
+
+    for record in caplog.records:
+        message = record.getMessage()
+        assert "\n" not in message
+        assert "\x1b" not in message
 
 
 def test_source_id_for_external_events_uses_resource_identity_not_delivery():
@@ -888,6 +964,36 @@ def test_webhook_logs_accepted_delivery(monkeypatch, caplog):
     assert any("webhook.accepted" in record.getMessage() for record in caplog.records)
 
 
+def test_webhook_logs_sanitize_attacker_controlled_headers(monkeypatch, caplog):
+    from external import webhooks
+
+    async def fake_ingest(**kwargs):
+        return None
+
+    monkeypatch.setattr(webhooks.settings, "github_webhook_secret", "secret")
+    monkeypatch.setattr(webhooks, "ingest_external_event", fake_ingest)
+    body = json.dumps(_github_pr_payload()).encode("utf-8")
+    signature = "sha256=" + hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+    request = _FakeRequest(
+        {
+            "content-length": str(len(body)),
+            "x-hub-signature-256": signature,
+            "x-github-event": "pull_request\nforged",
+            "x-github-delivery": "delivery-log\x1b[31m\nforged",
+        },
+        body,
+    )
+
+    with caplog.at_level(logging.INFO, logger="external.webhooks"):
+        response = asyncio.run(webhooks._handle_webhook(request, "github"))
+
+    assert response.status_code == 200
+    for record in caplog.records:
+        message = record.getMessage()
+        assert "\n" not in message
+        assert "\x1b" not in message
+
+
 def test_webhook_rejects_invalid_content_length_as_bad_request(monkeypatch):
     from external import webhooks
 
@@ -994,6 +1100,54 @@ def test_fetch_pr_files_returns_patch_excerpt_not_content_excerpt(monkeypatch):
     assert secret not in result["files"][0]["patch_excerpt"]
     assert result["files"][0]["patch_excerpt"] == "@@ -1 +1 @@\n-old\n+token=[REDACTED]"
     assert "content_excerpt" not in result["files"][0]
+
+
+def test_fetch_pr_files_redacts_full_patch_before_truncating(monkeypatch):
+    from external import fetch
+
+    secret = "ghp_1234567890abcdefghijklmnopqrstuvwxyz1234"
+    prefix = ("x" * 174) + "token="
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"filename": "src/app.ts", "patch": prefix + secret}]
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(fetch._fetch_pr_files_remote("github", "billc8128/vibelive", 42))
+
+    patch_excerpt = result["files"][0]["patch_excerpt"]
+    assert "ghp_" not in patch_excerpt
+    assert patch_excerpt == prefix + "[REDACTED]"
+
+
+def test_fetch_pr_files_rejects_malformed_repo_before_building_url(monkeypatch):
+    from external import fetch
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("invalid repo names must not reach http client")
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+
+    with pytest.raises(ValueError, match="repo_full_name"):
+        asyncio.run(fetch._fetch_pr_files_remote("github", "billc8128/vibelive/../../meta", 42))
 
 
 def test_fetch_pr_files_cache_key_includes_head_sha(monkeypatch):
@@ -1152,6 +1306,11 @@ def test_migration_0021_uses_repo_identifier_project_tokens():
 def test_migration_0022_adds_delivery_ignore_audit_fields():
     sql = Path("backend/supabase/migrations/0022_external_delivery_audit.sql").read_text()
 
+    assert "comment on column public.external_webhook_deliveries.raw_body" in sql
+    assert "redacted parsed payload" in sql
+    assert "row_number() over" in sql
+    assert "partition by provider, lower(repo_full_name)" in sql
+    assert "ranked_external_repos" in sql
     assert "ignored_reason text" in sql
     assert "ignored_at timestamptz" in sql
     assert "webhook_deliveries_ignored_idx" in sql

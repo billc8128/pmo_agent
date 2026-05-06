@@ -11,6 +11,7 @@ import type {
 import {
   createExternalRepoMapping,
   deleteExternalRepoMapping,
+  refreshIntegrationStatus,
 } from './actions';
 
 type ProviderSummary = {
@@ -77,8 +78,9 @@ export function IntegrationsPanel({
               Access model
             </p>
             <p className="mt-1 leading-relaxed">
-              Everyone can see connected repos. Signed-in maintainers can add or
-              remove mappings; provider secrets stay in the bot deployment.
+              Signed-in users can see connected repos. Integration maintainers
+              can add or remove mappings; provider secrets stay in the bot
+              deployment.
             </p>
           </div>
         </div>
@@ -178,10 +180,20 @@ export function IntegrationsPanel({
               Recent accepted deliveries
             </h2>
             <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">
-              Shows webhooks that reached the bot. Raw payloads are never
-              exposed in the browser.
+              Use the provider test or redelivery action, then check here for
+              the event status. Raw payloads are never exposed in the browser.
             </p>
           </div>
+          {signedIn && (
+            <button
+              type="button"
+              disabled={pending}
+              onClick={() => run(refreshIntegrationStatus)}
+              className="shrink-0 rounded border border-zinc-200 px-2.5 py-1.5 text-xs font-medium text-zinc-600 transition hover:border-zinc-300 hover:text-zinc-900 disabled:opacity-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:border-zinc-700 dark:hover:text-zinc-100"
+            >
+              Check latest delivery
+            </button>
+          )}
         </div>
 
         {deliveries.length === 0 ? (
@@ -208,13 +220,14 @@ export function IntegrationsPanel({
                 </div>
                 <div className="text-left text-xs text-zinc-500 dark:text-zinc-500 sm:text-right">
                   <p>{formatDate(delivery.receivedAt)}</p>
-                  <p className={delivery.linkedToEvent ? 'text-emerald-700 dark:text-emerald-300' : 'text-zinc-400 dark:text-zinc-500'}>
-                    {delivery.linkedToEvent
-                      ? 'event created'
-                      : delivery.ignoredReason
-                        ? `ignored: ${delivery.ignoredReason}`
-                        : 'archived only'}
-                  </p>
+                  <span className={statusClass(delivery.statusTone)}>
+                    {delivery.statusLabel}
+                  </span>
+                  {delivery.statusDetail && (
+                    <p className="mt-1 leading-snug text-zinc-400 dark:text-zinc-500">
+                      {delivery.statusDetail}
+                    </p>
+                  )}
                 </div>
               </li>
             ))}
@@ -411,10 +424,13 @@ function formatDate(value: string): string {
   return new Date(value).toLocaleString();
 }
 
-function statusClass(kind: 'ok' | 'idle'): string {
+function statusClass(kind: 'ok' | 'warn' | 'idle'): string {
   const base = 'rounded-full px-2 py-0.5 text-[11px] font-medium';
   if (kind === 'ok') {
     return `${base} bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300`;
+  }
+  if (kind === 'warn') {
+    return `${base} bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-200`;
   }
   return `${base} bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400`;
 }

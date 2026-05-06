@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from db import queries
+from external.logging import safe_log_value
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ def _login(value: Any) -> str:
 
 
 def _is_bot_login(login: str) -> bool:
-    return login.endswith("[bot]") or login.endswith("-bot")
+    return login.endswith("[bot]")
 
 
 def _repo_identifier(provider: str, full_name: str) -> str | None:
@@ -217,13 +218,13 @@ def _log_normalized(provider: str, normalized: dict[str, Any]) -> None:
     actor = _as_dict(normalized.get("actor"))
     logger.info(
         "webhook.normalized provider=%s event_type=%s action=%s repo=%s actor=%s is_bot=%s occurred_at=%s",
-        provider,
-        normalized.get("event_type"),
-        normalized.get("action") or "",
-        repo.get("full_name") or "",
-        actor.get("login") or "",
+        safe_log_value(provider),
+        safe_log_value(normalized.get("event_type")),
+        safe_log_value(normalized.get("action") or ""),
+        safe_log_value(repo.get("full_name") or ""),
+        safe_log_value(actor.get("login") or ""),
         bool(actor.get("is_bot")),
-        normalized.get("occurred_at") or "",
+        safe_log_value(normalized.get("occurred_at") or ""),
     )
 
 
@@ -236,7 +237,10 @@ def normalize_github(event_type: str, raw: dict[str, Any]) -> dict[str, Any] | N
     }
     handler = handlers.get(event_type)
     if not handler:
-        logger.info("webhook.normalizer_ignored provider=github event_type=%s reason=unsupported_event_type", event_type)
+        logger.info(
+            "webhook.normalizer_ignored provider=github event_type=%s reason=unsupported_event_type",
+            safe_log_value(event_type),
+        )
         return None
     return handler("github", raw)
 
@@ -250,6 +254,9 @@ def normalize_gitea(event_type: str, raw: dict[str, Any]) -> dict[str, Any] | No
     }
     handler = handlers.get(event_type)
     if not handler:
-        logger.info("webhook.normalizer_ignored provider=gitea event_type=%s reason=unsupported_event_type", event_type)
+        logger.info(
+            "webhook.normalizer_ignored provider=gitea event_type=%s reason=unsupported_event_type",
+            safe_log_value(event_type),
+        )
         return None
     return handler("gitea", raw)

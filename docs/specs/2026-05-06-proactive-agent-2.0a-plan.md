@@ -336,8 +336,10 @@ def normalize_github(event_type: str, raw: dict) -> dict | None:
 Each handler:
 - extracts the typed fields per spec §4.3
 - looks up actor profile_id via `lookup_profile_by_external_login`
-  and marks bot senders (`sender.type=Bot`, `login` ending in
-  `[bot]` / `-bot`) so ingest can archive-only those deliveries
+  and marks bot senders (`sender.type=Bot` or `login` ending in
+  `[bot]`) so ingest can archive-only those deliveries. Do not
+  treat arbitrary `-bot` suffixes as bots; those can be legitimate
+  user names.
 - sets `project_root` to the repo identifier
   `{provider}:{lower(repo_full_name)}`; it does not copy
   `external_repos.project_root` into events
@@ -675,7 +677,8 @@ opening SQL.
 - Raw webhook payloads are never exposed; recent deliveries only
   show provider, event type, repo full name, received_at, and
   whether an `events` row was created. Archive-only deliveries
-  may show safe ignored reasons such as `bot_actor`.
+  translate safe ignored reasons such as `bot_actor` and
+  `missing_source_identity` into user-readable status text.
 - Optional `external_identities` remains an actor-attribution
   feature for "my PRs" semantics, not the source-access flow.
 - Repo full names entered in the UI are lowercased before write
@@ -789,8 +792,8 @@ notify/suppress decision.
 - Insert a synthetic `pull_request` event referencing a real PR
 - Call `fetch_pr_files` with the event_id → returns file list with
   `patch_excerpt`, not `content_excerpt`
-- Fake token-like strings in `patch_excerpt` are redacted before
-  cache/tool return
+- Fake token-like strings in full patches are redacted before
+  `patch_excerpt` truncation, cache write, and tool return
 - Repeat call → second call hits cache (no external API call)
 - Same PR number with a different head_sha → different cache key
 - Call with paths_filter=['spec.md'] → only spec.md returned

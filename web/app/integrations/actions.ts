@@ -49,6 +49,10 @@ export async function deleteExternalRepoMapping(id: string) {
   revalidatePath(INTEGRATIONS_PATH);
 }
 
+export async function refreshIntegrationStatus() {
+  revalidatePath(INTEGRATIONS_PATH);
+}
+
 async function requireIntegrationManager() {
   const sb = await serverActionClient();
   const {

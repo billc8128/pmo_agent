@@ -263,7 +263,8 @@ create table public.external_webhook_deliveries (
     delivery_id  text not null,             -- X-{Provider}-Delivery
     event_type   text not null,
     received_at  timestamptz not null default now(),
-    raw_body     jsonb not null,
+    raw_body     jsonb not null,            -- redacted parsed payload,
+                                            -- not original bytes
     raw_headers  jsonb,                     -- minus auth/signing
     event_id     bigint references public.events(id) on delete set null,
     ignored_reason text,
@@ -386,8 +387,10 @@ through a server-side best-effort redaction pass. This is a
 compensation for the fact that GitHub/Gitea webhooks do not pass
 through the local daemon redaction layer from `CLAUDE.md`.
 Redaction covers common token/private-key/key-value-secret
-patterns; the original unredacted parsed body is not written to
-Postgres.
+patterns, including GitHub tokens, JWTs, Stripe live keys,
+Bearer tokens, Postgres connection strings, and Feishu/Lark bot
+webhook URLs. The original unredacted parsed body is not written
+to Postgres.
 
 For each event type we extract a stable shape into
 `events.payload`. The redacted webhook body lives **only** in
@@ -498,11 +501,14 @@ is written to `events`**. The archive row is marked with
 `ignored_reason='unsupported_event_type'` so operators can tell
 the difference between "accepted but intentionally ignored" and
 "accepted but failed to normalise". Bot-authored deliveries are
-also archived-only with `ignored_reason='bot_actor'`. These
-events don't enter the investigation pipeline at all. Adding a
-typed shape for one of these is a small follow-up if usage data
-shows demand. The investigator does NOT have a "fall back to raw"
-path, by design: raw bodies never reach LLM prompts.
+also archived-only with `ignored_reason='bot_actor'`. Bot
+detection uses provider metadata such as `sender.type=Bot` plus
+the conventional `[bot]` login suffix; arbitrary `-bot` suffixes
+are not treated as bots. These events don't enter the
+investigation pipeline at all. Adding a typed shape for one of
+these is a small follow-up if usage data shows demand. The
+investigator does NOT have a "fall back to raw" path, by design:
+raw bodies never reach LLM prompts.
 
 ### 4.4 What `events.occurred_at` is set to
 
@@ -587,8 +593,8 @@ normal PMO product permissions.
 - Redacted webhook payloads stay service-only in
   `external_webhook_deliveries`; the UI exposes only provider,
   event type, repo full name, delivery time, whether an `events`
-  row was created, and the safe ignored reason when a delivery was
-  archived-only.
+  row was created, and user-readable status text translated from
+  safe ignored reasons when a delivery was archived-only.
 
 The setup flow is:
 
@@ -656,8 +662,9 @@ Implementation:
   updates do not reuse stale file lists.
 - Retry transient HTTP/network failures with bounded backoff;
   permanent 4xx responses fail fast.
-- `patch_excerpt` is redacted with the same server-side redaction
-  pass before caching or returning to the investigator.
+- `patch_excerpt` is produced by redacting the full returned patch
+  first, then truncating to 200 characters. Truncating before
+  redaction can leak token prefixes that cross the boundary.
 
 This tool is added only to the investigator's tool subset. The
 renderer deliberately does not get it; renderer must turn the

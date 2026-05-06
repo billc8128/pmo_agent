@@ -79,6 +79,9 @@ test('maps recent deliveries to safe public fields', () => {
     receivedAt: '2026-05-06T00:00:00.000Z',
     linkedToEvent: false,
     ignoredReason: 'missing_source_identity',
+    statusLabel: 'Missing resource id',
+    statusDetail: 'The bot archived this webhook, but the payload did not include the PR number, commit SHA, release tag, or comment id needed to create an event.',
+    statusTone: 'warn',
     repoFullName: 'billc8128/vibelive',
   });
   assert.equal(Object.hasOwn(delivery, 'raw_body'), false);

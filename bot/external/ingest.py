@@ -5,7 +5,9 @@ import json
 import logging
 from typing import Any
 
+from agent import lockout
 from db import queries
+from external.logging import safe_log_value
 from external.normalizer import normalize_github, normalize_gitea
 from external.redaction import redact_payload
 
@@ -93,6 +95,9 @@ async def ingest_external_event(
     raw_bytes: bytes,
     headers: dict[str, str] | None = None,
 ) -> None:
+    log_provider = safe_log_value(provider)
+    log_event_type = safe_log_value(event_type)
+    log_delivery_id = safe_log_value(delivery_id)
     payload, redaction_hits = redact_payload(payload)
     archive_id = queries.archive_external_delivery(
         provider=provider,
@@ -103,9 +108,9 @@ async def ingest_external_event(
     )
     logger.info(
         "webhook.archived provider=%s event_type=%s delivery_id=%s archive_id=%s redaction_hits=%s",
-        provider,
-        event_type,
-        delivery_id,
+        log_provider,
+        log_event_type,
+        log_delivery_id,
         archive_id,
         redaction_hits,
     )
@@ -118,9 +123,9 @@ async def ingest_external_event(
         queries.mark_archive_ignored(archive_id, "unsupported_provider")
         logger.info(
             "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_provider",
-            provider,
-            event_type,
-            delivery_id,
+            log_provider,
+            log_event_type,
+            log_delivery_id,
             archive_id,
         )
         return
@@ -128,9 +133,9 @@ async def ingest_external_event(
         queries.mark_archive_ignored(archive_id, "unsupported_event_type")
         logger.info(
             "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_event_type",
-            provider,
-            event_type,
-            delivery_id,
+            log_provider,
+            log_event_type,
+            log_delivery_id,
             archive_id,
         )
         return
@@ -140,11 +145,11 @@ async def ingest_external_event(
         queries.mark_archive_ignored(archive_id, "bot_actor")
         logger.info(
             "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=bot_actor actor=%s",
-            provider,
-            event_type,
-            delivery_id,
+            log_provider,
+            log_event_type,
+            log_delivery_id,
             archive_id,
-            actor.get("login") or "",
+            safe_log_value(actor.get("login") or ""),
         )
         return
 
@@ -153,9 +158,9 @@ async def ingest_external_event(
         queries.mark_archive_ignored(archive_id, "missing_source_identity")
         logger.info(
             "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=missing_source_identity",
-            provider,
-            event_type,
-            delivery_id,
+            log_provider,
+            log_event_type,
+            log_delivery_id,
             archive_id,
         )
         return
@@ -171,13 +176,14 @@ async def ingest_external_event(
     )
     if event_id is not None:
         queries.link_archive_to_event(archive_id, event_id)
+        lockout.invalidate_project_tokens_cache()
     logger.info(
         "webhook.event_upserted provider=%s event_type=%s delivery_id=%s archive_id=%s event_id=%s source_id=%s project_root=%s",
-        provider,
-        event_type,
-        delivery_id,
+        log_provider,
+        log_event_type,
+        log_delivery_id,
         archive_id,
         event_id,
-        source_id,
-        normalized.get("project_root") or "",
+        safe_log_value(source_id),
+        safe_log_value(normalized.get("project_root") or ""),
     )

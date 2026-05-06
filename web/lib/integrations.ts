@@ -47,6 +47,9 @@ export type PublicExternalDelivery = {
   receivedAt: string;
   linkedToEvent: boolean;
   ignoredReason: string | null;
+  statusLabel: string;
+  statusDetail: string | null;
+  statusTone: 'ok' | 'warn' | 'idle';
   repoFullName: string | null;
 };
 
@@ -104,6 +107,10 @@ export function toPublicExternalDelivery(
 ): PublicExternalDelivery | null {
   if (!row.provider || !row.delivery_id || !row.event_type) return null;
   const provider = normalizeProvider(row.provider);
+  const ignoredReason = typeof row.ignored_reason === 'string' && row.ignored_reason.trim()
+    ? row.ignored_reason.trim()
+    : null;
+  const status = deliveryStatus(row.event_id != null, ignoredReason);
   return {
     viewKey: `${row.received_at}:${provider}:${row.delivery_id}`,
     provider,
@@ -111,9 +118,10 @@ export function toPublicExternalDelivery(
     eventType: row.event_type,
     receivedAt: row.received_at,
     linkedToEvent: row.event_id != null,
-    ignoredReason: typeof row.ignored_reason === 'string' && row.ignored_reason.trim()
-      ? row.ignored_reason.trim()
-      : null,
+    ignoredReason,
+    statusLabel: status.label,
+    statusDetail: status.detail,
+    statusTone: status.tone,
     repoFullName: repoFullNameFromRawBody(row.raw_body),
   };
 }
@@ -139,6 +147,54 @@ function repoFullNameFromRawBody(rawBody: unknown): string | null {
   return typeof fullName === 'string' && fullName.trim()
     ? fullName.trim().toLowerCase()
     : null;
+}
+
+function deliveryStatus(
+  linkedToEvent: boolean,
+  ignoredReason: string | null,
+): { label: string; detail: string | null; tone: 'ok' | 'warn' | 'idle' } {
+  if (linkedToEvent) {
+    return { label: 'Event created', detail: null, tone: 'ok' };
+  }
+  if (!ignoredReason) {
+    return {
+      label: 'Archived only',
+      detail: 'The bot accepted this delivery but has not linked it to a proactive event yet.',
+      tone: 'idle',
+    };
+  }
+  switch (ignoredReason) {
+    case 'unsupported_event_type':
+      return {
+        label: 'Unsupported event type',
+        detail: 'Enable pull request, push, release, or issue comment events in the provider webhook settings.',
+        tone: 'warn',
+      };
+    case 'bot_actor':
+      return {
+        label: 'Bot actor ignored',
+        detail: 'The delivery came from a bot account, so it was archived without creating a proactive event.',
+        tone: 'idle',
+      };
+    case 'missing_source_identity':
+      return {
+        label: 'Missing resource id',
+        detail: 'The bot archived this webhook, but the payload did not include the PR number, commit SHA, release tag, or comment id needed to create an event.',
+        tone: 'warn',
+      };
+    case 'unsupported_provider':
+      return {
+        label: 'Unsupported provider',
+        detail: 'Only GitHub and Gitea webhook payloads are supported in this deployment.',
+        tone: 'warn',
+      };
+    default:
+      return {
+        label: 'Archived only',
+        detail: `The bot archived this delivery with reason: ${ignoredReason}.`,
+        tone: 'idle',
+      };
+  }
 }
 
 function normalizeProfile(

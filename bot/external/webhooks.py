@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request, Response
 
 from config import settings
 from external.ingest import ingest_external_event
+from external.logging import safe_log_value
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -48,14 +49,15 @@ async def _read_limited_body(request: Request) -> tuple[bytes | None, int | None
 
 
 async def _handle_webhook(request: Request, provider: str) -> Response:
+    log_provider = safe_log_value(provider)
     body, body_error = await _read_limited_body(request)
     if body_error is not None or body is None:
-        logger.info("webhook.rejected provider=%s reason=body_limit status=%s", provider, body_error or 400)
+        logger.info("webhook.rejected provider=%s reason=body_limit status=%s", log_provider, body_error or 400)
         return Response(status_code=body_error or 400)
     if provider == "github":
         secret = settings.github_webhook_secret
         if not secret:
-            logger.info("webhook.rejected provider=%s reason=missing_secret status=500", provider)
+            logger.info("webhook.rejected provider=%s reason=missing_secret status=500", log_provider)
             return Response(status_code=500)
         signature = request.headers.get("x-hub-signature-256", "")
         verified = _verify_github_signature(body, signature, secret)
@@ -64,28 +66,45 @@ async def _handle_webhook(request: Request, provider: str) -> Response:
     else:
         secret = settings.gitea_webhook_secret
         if not secret:
-            logger.info("webhook.rejected provider=%s reason=missing_secret status=500", provider)
+            logger.info("webhook.rejected provider=%s reason=missing_secret status=500", log_provider)
             return Response(status_code=500)
         signature = request.headers.get("x-gitea-signature", "")
         verified = _verify_gitea_signature(body, signature, secret)
         event_type = request.headers.get("x-gitea-event", "")
         delivery_id = request.headers.get("x-gitea-delivery", "")
+    log_event_type = safe_log_value(event_type)
+    log_delivery_id = safe_log_value(delivery_id)
     if not verified:
-        logger.info("webhook.rejected provider=%s event_type=%s delivery_id=%s reason=bad_signature status=401", provider, event_type, delivery_id)
+        logger.info(
+            "webhook.rejected provider=%s event_type=%s delivery_id=%s reason=bad_signature status=401",
+            log_provider,
+            log_event_type,
+            log_delivery_id,
+        )
         return Response(status_code=401)
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
-        logger.info("webhook.rejected provider=%s event_type=%s delivery_id=%s reason=bad_json status=400", provider, event_type, delivery_id)
+        logger.info(
+            "webhook.rejected provider=%s event_type=%s delivery_id=%s reason=bad_json status=400",
+            log_provider,
+            log_event_type,
+            log_delivery_id,
+        )
         return Response(status_code=400)
     if not isinstance(payload, dict) or not event_type or not delivery_id:
-        logger.info("webhook.rejected provider=%s event_type=%s delivery_id=%s reason=bad_shape status=400", provider, event_type, delivery_id)
+        logger.info(
+            "webhook.rejected provider=%s event_type=%s delivery_id=%s reason=bad_shape status=400",
+            log_provider,
+            log_event_type,
+            log_delivery_id,
+        )
         return Response(status_code=400)
     logger.info(
         "webhook.accepted provider=%s event_type=%s delivery_id=%s bytes=%s",
-        provider,
-        event_type,
-        delivery_id,
+        log_provider,
+        log_event_type,
+        log_delivery_id,
         len(body),
     )
     await ingest_external_event(
@@ -96,7 +115,12 @@ async def _handle_webhook(request: Request, provider: str) -> Response:
         raw_bytes=body,
         headers=dict(request.headers),
     )
-    logger.info("webhook.completed provider=%s event_type=%s delivery_id=%s", provider, event_type, delivery_id)
+    logger.info(
+        "webhook.completed provider=%s event_type=%s delivery_id=%s",
+        log_provider,
+        log_event_type,
+        log_delivery_id,
+    )
     return Response(status_code=200)
 
 

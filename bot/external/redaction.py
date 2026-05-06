@@ -10,6 +10,11 @@ _PRIVATE_KEY_RE = re.compile(
     re.DOTALL,
 )
 _TOKEN_RES = [
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b"),
+    re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"(?i)\bpostgres(?:ql)?://[^\s\"'<>]+"),
+    re.compile(r"https://open\.(?:feishu\.cn|larksuite\.com)/open-apis/bot/v2/hook/[A-Za-z0-9_-]+"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
