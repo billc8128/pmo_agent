@@ -1,330 +1,539 @@
 # Proactive PMO Agent 2.0 — Strategy
 
 - **Status**: Strategic exploration, not committed
-- **Date**: 2026-05-06
+- **Date**: 2026-05-06 (rev. 2)
 - **Branch**: `proactive-agent`
 - **Roadmap**: [proactive-agent-roadmap.md](2026-05-04-proactive-agent-roadmap.md)
 - **Predecessors**: 1.0a (skeleton) + 1.0b (public rules panel) +
   1.0c (gatekeeper-investigator-renderer) all in flight
 
-This document is the **product-level strategy** for 2.0. Unlike the
-1.0 series specs which are implementation contracts, this one
-sketches the destination and what we'd build next, **without
-committing**. The sequencing question — what to build first — is
-deliberately answered by "wait for 1.0a/b/c usage data."
+This document is the **product-level strategy** for 2.0.
+
+The previous draft of this doc enumerated 5 unrelated candidate
+features. That framing was wrong. 2.0 is not a feature list — it
+is a coherent expansion along **three orthogonal axes** of the
+1.0c architecture. Each axis can advance independently, and each
+of them, on its own, is incomplete without the others.
 
 ---
 
-## 1. Where 1.0 leaves us
+## 1. The three axes
 
-After 1.0a-c, the bot can:
+The 1.0c bot is a function:
 
-- Receive an arbitrary natural-language subscription
-- Filter events deterministically by project (no more wrong-project
-  firing)
-- Aggregate a "thread" of related events into one investigation
-- Read deeper context (turns, project overviews, history) before
-  deciding to notify
-- Render a faithful Feishu message with the cited evidence
-- Manage rules from chat OR public web panel
+```
+events × subscriptions  →  (notify? topic? to whom?)  →  Feishu DM
+```
 
-What 1.0 explicitly **doesn't** do:
+Three things about that function are still impoverished:
 
-- Take action — only tell the user
-- Coordinate between people — only notify individuals
-- Schedule anything — only react to events
-- Cross external systems — only `turns` from pmo_agent itself
-- Maintain project state — no deadlines, no roadmap, no goals
+1. **The input event stream is too narrow.** Only `turn` events
+   exist. Users actually work in GitHub / Gitea / Linear /
+   Feishu Calendar — most "watchable" things happen there, not
+   in turns alone.
 
-These five gaps are the design space for 2.0.
+2. **The output channel is too constrained.** Subscriptions and
+   deliveries are mostly user-DM-shaped. Real PMO behaviour is
+   chat-mediated: people @ each other in groups, ask the bot to
+   "tell albert later," set up rules collaboratively in a project
+   channel.
 
----
+3. **The trigger logic is too mechanical.** Today the bot reacts
+   to events that match a stored subscription. A real PMO
+   doesn't wait for a rule — they look at the team's state and
+   decide on their own when to speak, in which room, to whom.
+   1.0c is "rule-driven proactive"; 2.0 is "judgment-driven
+   proactive."
 
-## 2. Five candidate features, ranked by leverage
+Each axis maps to a piece of the 1.0c diagram:
 
-These are NOT in build order. Build order depends on data from
-1.0a/b/c usage — see §3.
+```
+Axis 1 (events)        Axis 3 (trigger logic)
+       │                       │
+       ▼                       ▼
+   ┌────────┐  ┌────────┐  ┌──────────┐  ┌────────┐
+   │ events │→ │decider │→ │investiga-│→ │renderer│→ Feishu
+   │  +     │  │ (gate- │  │   tor    │  │        │
+   │webhook │  │ keeper)│  │          │  │        │
+   └────────┘  └────────┘  └──────────┘  └────────┘
+                                              │
+                                              ▼
+                                    Axis 2 (output channel:
+                                    DM/chat routing, who
+                                    can ask whom, where)
+```
 
-### 2.A — Scheduled briefs (周报 / 日报)
-
-**What**: cron-triggered, no event needed. "Every Monday 09:00,
-private-DM bcc with last-week summary of the team." "Every weekday
-17:00, post a project-X day-end digest to the project chat."
-
-**User stories**:
-- "我想每周一早上看上周大家都做了啥"
-- "项目群里每天五点总结一下今天的关键进展"
-- "我在做的项目每周给我个客观的进度评估"
-
-**Why high leverage**: doesn't need new architecture. Reuses 1.0c's
-investigator pipeline with a cron trigger instead of an event
-trigger. Output goes through the same renderer. Probably 60% of
-real "PMO" value comes from this single feature.
-
-**New parts needed**:
-- `scheduled_briefs` table: subscription_id (user OR chat) +
-  cron_expression + brief_type ('week_summary'|'day_summary'|...)
-  + last_run_at
-- `scheduled_brief_runs` table: trigger row with seed events
-  collected by SQL query (e.g., "all events for albert in last 7
-  days") instead of by gatekeeper
-- A new `scheduler_loop.py` background task: every 5min, finds
-  scheduled briefs whose cron is due, builds a synthetic
-  investigation_job with seed_events from a time-window query,
-  hands off to existing investigator → renderer → delivery
-- New investigator prompt mode for "summarise N days of activity"
-  rather than "is this thread worth a notification"
-
-**Estimate**: 5-7 days. Most of this is the cron infra +
-seed-collection query, not new LLM work.
-
-**Risk**: scheduled briefs are by definition NOT triggered by a
-specific event, so the "evidence_event_ids" structure in 1.0c
-brief carries dozens of events. Renderer would need to handle
-larger bundles. Might split into "highlight 5-10 events" sub-step.
-
-### 2.B — Cross-person collision detection (同事撞车)
-
-**What**: when two profiles work in the same project_root within
-a short window, bot offers a quick "want me to introduce you?" or
-"want a sync?". Special case of "stall detection inverted" —
-notice multiple people converging.
-
-**User stories**:
-- "如果有人在改我正在改的代码告诉我"
-- "我要做的事如果别人已经在做，提醒一下避免重复"
-
-**Why interesting**: this is the single feature that's about
-**team coordination** not personal feed. It needs to read
-"current activity" across people, not just react to one person's
-event.
-
-**New parts needed**:
-- New event-correlation pass: when ingesting a turn, check
-  `events` for OTHER users active in the same project_root in
-  last N hours; if found AND not yet correlated, open a
-  `collision_jobs` row
-- New event source `collision` (alongside `turn`, `github`)
-- Investigator prompt that frames "two people, one project" as
-  the question
-- Subscriptions like "如果有人撞我代码告诉我" route to
-  collision-source events specifically
-
-**Estimate**: 4-6 days.
-
-**Risk**: signal-to-noise. Two people touching `vibelive` for
-totally unrelated reasons happens daily. Threshold tuning matters
-a lot. Probably needs file-level overlap (1.0c's events don't
-record changed files yet — needs daemon work too).
-
-### 2.C — GitHub / Gitea webhook ingestion
-
-**What**: webhook-driven event source. PR opened, commit pushed,
-release tagged → events row → flows through existing 1.0c
-gatekeeper → investigator → renderer.
-
-**User stories**:
-- "vibelive 有 PR 合并提示我"
-- "我的项目有 release 了告诉我"
-- "watch albert 的提交"
-
-**Why obvious but lower**: 1.0c already supports multiple event
-sources via the `events.source` column. Adding GitHub is "wire it
-up" not "design new architecture." It's only **lower** because
-turns already capture most of the signal — if albert is working,
-a turn fires before a commit lands. GitHub adds value for
-**non-pmo-user collaborators** (people on the team without daemon
-running) and for **non-coding events** (release tags, issue
-comments).
-
-**New parts needed**:
-- `bot/web/feishu/webhook.py` → add `bot/webhooks/github.py`
-  + `gitea.py` route handlers
-- Webhook signature verification (per source — GitHub HMAC,
-  Gitea HMAC, signature secret env var per source)
-- Map webhook payload to `events.payload` shape — agent_summary
-  needs to be filled by a small LLM call ("summarize this PR")
-  OR by extracting the title/description verbatim
-- Possibly a `external_identities` table mapping
-  `(github_user → profile_id)` so the gatekeeper can apply
-  subscriptions like "albert 的 PR" correctly
-
-**Estimate**: 3-5 days. Most work is in identity mapping.
-
-**Risk**: webhook reliability. Need retry / dedup. GitHub will
-re-deliver on receiver errors → events table needs (source,
-source_id) unique handling that already exists in 1.0a's design.
-
-### 2.D — Stall / blocker detection (项目卡住了)
-
-**What**: bot proactively warns when a "watched" project goes
-quiet, or when a subscription's expected cadence drops.
-
-**User stories**:
-- "C 项目 5 天没活动了，bcc 你说月底要 ship，要查查吗?"
-- "albert 这周才跑了 5 个 turn，平时是 30+，他还好吗?"
-- "我说要在 X 之前完成的事，截止前 24h 提醒我"
-
-**Why exciting but expensive**: this is the closest 2.0 feature
-to "real PMO behaviour." But it requires structured project
-state that pmo_agent doesn't have today: deadlines, milestones,
-ownership.
-
-**New parts needed**:
-- `projects` table: project_root + display_name + owner +
-  goals (jsonb) + cadence_baseline + ship_target. Populated
-  manually or via "tell bot the goal" chat command.
-- A separate `stall_check` cron loop running daily: for each
-  project, computes "expected vs actual" activity, opens an
-  investigation if the gap crosses threshold
-- New investigator prompt: "is this stall meaningful or just a
-  weekend?"
-
-**Estimate**: 8-12 days. The data-modeling work for `projects` is
-the bulk; the LLM piece is straightforward.
-
-**Risk**: project metadata management is its own UX. Ad-hoc Slack
-"track this" approach OR explicit roadmap import OR "bot watches
-your stated goals" — this is a product question we can't answer
-without trying. **Probably the right path is to ship 2.A and
-2.E first, then bolt this on once users tell us what kind of
-"goal tracking" they want.**
-
-### 2.E — PR / Linear / Meeting linking (turn 自动关联外部资源)
-
-**What**: when a turn's payload mentions "PR #123" / "issue
-ABC-456" / "feishu meeting xxx", bot auto-fetches that resource
-and includes it in the brief.
-
-**User stories**:
-- "albert 提到 PR 1234 的时候，brief 里直接给我 PR diff 摘要"
-- "回复了 issue 后通知我新评论"
-- "约了会的时候提醒我提前 10 分钟"
-
-**Why nice but expensive**: this isn't a new product feature, it's
-**better content** in existing notifications. Each external
-integration is its own auth/rate-limit/parsing problem.
-
-**New parts needed**:
-- `external_link_resolvers` registry: per-pattern resolver
-  (regex on user_message + agent_response → fetch handler).
-  GitHub PR / GitHub issue / Linear ticket / Feishu doc / Feishu
-  calendar event handler each ~1 day's work.
-- Cache layer for external API responses (`external_resources`
-  table)
-- Investigator prompt extended to consume linked resources
-
-**Estimate**: 2-4 days per resolver. Probably ship one (GitHub PR)
-first, see if anyone uses it.
-
-**Risk**: privacy. Cached external content gets stored in
-Supabase next to public turn data. Needs a clear "this resource
-was readable by the bot but not by other users" boundary.
+All three axes preserve the 1.0c architecture. Each is its own
+slice of work; together they constitute "2.0."
 
 ---
 
-## 3. Sequencing — what to build first depends on observation
+## 2. Axis 1 — External event sources
 
-Don't pick yet. Wait for 1.0a/b/c usage data and let it answer:
+### What's happening
 
-| Observation | Likely choice |
-|-------------|---------------|
-| Users keep asking for "weekly summaries" | 2.A (scheduled briefs) |
-| Users complain that 1.0c misses cross-team work | 2.B (collision detection) |
-| Most subscriptions are about non-pmo-user activity | 2.C (GitHub webhooks) |
-| Users state goals/deadlines and expect tracking | 2.D (stall detection) |
-| Notifications feel underwritten without external context | 2.E (link resolvers) |
+Today `events.source = 'turn'` is the only path. A turn is a single
+person × single agent × single project interaction. But the actual
+team's collaboration happens through:
 
-The instrumentation we already have to read these signals:
-- `decision_logs` table — what gatekeeper saw / decided
-- `investigation_jobs` table — what investigator concluded
-- `notifications` table with `feishu_msg_id` / sent_at
-- Conversation tools (the bot itself) — users will say what they
-  want directly
+- **GitHub / Gitea**: PR opened/merged, commit pushed, release
+  tagged, issue commented, review requested
+- **Linear / Jira**: ticket state change, sprint boundary,
+  estimate vs actual
+- **Feishu Calendar / Lark Doc**: meeting scheduled, doc updated,
+  doc shared with you
+- **Slack / Feishu chat**: someone @-mentioned you, thread spawned
 
-After ~2 weeks of 1.0a/b/c in real use, run a small analysis
-script: top-N missing notification topics, top-N suppressed
-reasons, top-N user follow-up questions. Pick the 2.0 feature
-that addresses the dominant signal.
+The user examples you gave are GitHub-shaped:
 
-**Default if no clear signal**: ship 2.A (scheduled briefs)
-first. It's the highest-confidence "users will use this"
-feature, infrastructure cost is bounded, and it doesn't touch
-the 1.0c core. Risk is lowest.
+> 每个项目A的 merge 都要发给 X 总结，让他确认技术方案
+> 每次有 merge 都把当次改动的 spec 和 plan 文件发给 X
+
+These can't be expressed in 1.0c because there's no "merge" event
+to subscribe against. Subscriptions like "vibelive merge 告诉我"
+are technically allowed, but they fire only when a turn happens
+to mention "merge" — not on the actual merge.
+
+### What's needed
+
+A second event ingestion layer that mirrors the existing turn
+trigger:
+
+```
+GitHub PR merged webhook
+       │
+       ▼
+   /webhooks/github route in bot/web
+       │ verifies HMAC, writes →
+       ▼
+   events row (source='github', source_id='pr-1234',
+              user_id=mapped, project_root=/repo/X,
+              payload={pr_number, title, body, diff_url, files,
+                       author, reviewers, base_branch, ...})
+       │
+       ▼
+   1.0c gatekeeper / investigator / renderer (UNCHANGED)
+```
+
+Three pieces this needs:
+
+1. **Webhook routes**: `/webhooks/github`, `/webhooks/gitea`. HMAC
+   signature verification per source. Idempotent retries (GitHub
+   re-delivers on errors).
+
+2. **Identity mapping**: `external_identities` table linking
+   `(github_login, profile_id)`, `(gitea_username, profile_id)`.
+   Populated either via the user telling the bot "我的 GitHub 是
+   billc8128" OR via OAuth (later — start with self-claim).
+   Without this mapping, gatekeeper can't apply subscriptions
+   like "albert 的 PR" because it doesn't know which PR author
+   counts as albert.
+
+3. **Project mapping**: `(github_repo_full_name → project_root)`
+   so a PR on `billc8128/vibelive` lands under
+   `project_root='/Users/.../vibelive'` and the existing project
+   lockout in 1.0c continues to work. Either store this in a new
+   `external_repos` table OR derive it from the daemon's
+   `project_root` for existing pmo users.
+
+4. **Renderer enrichments**: when the brief's evidence references
+   a github PR, the renderer can fetch its diff/files (cached)
+   and embed a summary. Most user value here is "include the
+   spec/plan files mentioned in the merge" — which means
+   investigator needs the ability to read PR file contents.
+
+The pipeline downstream is unchanged: existing gatekeeper,
+investigator, renderer, delivery all work because they read
+`events.payload` opaquely.
+
+### What it unlocks
+
+- "vibelive 项目 PR merge 时把 spec 和 plan 给 albert"
+- "我提的 PR 收到 review 通知我"
+- "release 标签打了之后，给项目群发布 changelog"
+- "GitHub 上有人 @ 我了，提醒我去回复"
+
+Crucially, this is also a prerequisite for Axis 3 — judgment-driven
+proactive — because a real PMO uses GitHub state heavily to decide
+whether something is worth speaking up about.
+
+### Estimate / risk
+
+**Estimate**: 5-8 days for GitHub + Gitea (mostly identity mapping
++ webhook reliability). Linear / Calendar later, separately.
+
+**Risk**: webhook reliability and identity. If `external_identities`
+isn't populated for everyone on the team, half the PRs will look
+like they have no author for the bot's purposes. Bootstrap UX
+needs care.
 
 ---
 
-## 4. Architectural invariants to preserve in 2.0
+## 3. Axis 2 — Group-as-first-class
 
-1. **Single Feishu app, single bot**. Group subscriptions are NOT
-   a different bot.
-2. **Events stay append-only**. Whatever 2.0 features add must
-   produce `events` rows that look like `turn` events from the
-   pipeline's perspective.
-3. **Investigator owns notify/suppress**. Scheduled briefs use
-   the same investigator; they just have a different trigger.
-4. **No write actions in response to events**. 2.0 may extend
-   what bot can DO when user asks (chat-driven), but proactive
-   path stays read-only.
-5. **All LLM calls have a budget**. New features must declare
-   their token budget upfront. 2.A in particular will be heavy
-   per-call but rare.
-6. **Decision authority is explicit**. New "actors" (collision
-   detector, stall detector) must define what they decide and
-   what defers to investigator/renderer downstream.
+### What's happening
+
+1.0a/b chose subscriptions to be either user-scoped OR chat-scoped.
+The chat-scoped path was implemented but exclusively for "user @
+bot in group, group becomes the subscription owner." There's no
+notion of:
+
+- **Cross-routing**: someone in a chat says "tell albert privately
+  when X happens"
+- **Mediated rules**: in the team channel, anyone can set up rules
+  for the channel; bot accepts (with audit) instead of treating
+  it as one user's request
+- **Per-room conventions**: project channel has its own subscription
+  set, default routing, default quiet hours
+
+Your examples:
+
+> 人和人在群聊里都可以让 pmo agent 发送提醒到这个群里或者和任何人的私聊里
+
+This is the **routing flexibility gap**. Today subscription
+scope determines where the notification lands. Subscription
+scope = where it was created. This couples *who set it up* with
+*where it's delivered*. A real PMO does both flexibly:
+- "Tell me privately when this group's rule fires"
+- "Tell the group when this private rule fires"
+- "Tell albert (specifically) when X happens, not me"
+
+### What's needed
+
+Decompose subscription scope into two separate concepts:
+
+```
+Subscription
+  ├── owner:  who CAN edit/disable this rule
+  │           (user OR chat — same as 1.0a/b)
+  └── target: where delivery LANDS
+              ├── target_kind: user_dm | chat | mention_in_chat
+              ├── target_id:   the open_id or chat_id
+              └── target_user_open_id: optional, for "@ this user
+                                       within the chat"
+```
+
+The schema split is small but the UX is not. Several questions:
+
+1. **Permissions**: can a user set up a rule that delivers to
+   ANOTHER user's DM? Probably not by default — that's spam.
+   Either gate by mutual binding (both users have feishu_links
+   AND have at least one shared chat) OR require explicit
+   consent ("albert 同意接收 bcc 设置的提醒吗?").
+
+2. **Group-level rule discovery**: in a chat, who can see/edit
+   the chat's rules? Default: any chat member. But abusable
+   when chat has 200 people. Probably: chat member can ADD,
+   only original creator can DISABLE.
+
+3. **Cross-chat routing**: "in group A, watch project X; deliver
+   to group B" is technically two-table-row but UX-wise it's
+   confusing. Probably defer this — start with target=this_chat
+   or target=specific_user_dm.
+
+4. **@-mention as delivery target**: bot post in chat with
+   `<at user_id="ou_xxx">` mentions. Distinct from DM in that
+   the whole chat sees it. User cases: "when X happens, ping
+   bcc in this group instead of DM-ing him."
+
+### What it unlocks
+
+- Project chat as collaborative PMO surface (everyone sets rules,
+  everyone sees delivery)
+- "Tell albert in #vibelive when his PR breaks the build" — third
+  party sets a rule about a fourth party
+- Bot becomes a proper team member: people @ it, give it
+  instructions about other people, and it follows them
+  (within ACL)
+
+### Estimate / risk
+
+**Estimate**: 4-6 days for schema + routing + basic permissions
+UX. Bootstrap UX (how to opt-in to receiving rules others made
+about you) is the hard part.
+
+**Risk**: stalker-by-default. Without permission gates, this
+feature lets one user spam another's DM through the bot. Get the
+ACL right before shipping.
 
 ---
 
-## 5. Anti-patterns to avoid
+## 4. Axis 3 — Judgment-driven proactive
 
-- **Don't add a "rules engine"**. Specifically: when 2.A's
-  scheduled briefs need "skip if user is on vacation," resist
-  the urge to build a vacation table. Instead, let users say
-  "本周不要发周报" via chat — same natural-language subscription
-  mechanism.
-- **Don't multiply event sources prematurely**. Adding GitHub +
-  Gitea + Linear + Slack creates coupling that's hard to back
-  out. Add ONE external source first, see how often investigator
-  needs cross-source dedup, decide based on that.
-- **Don't pre-build "team" abstractions**. The current
-  subscription scope (user OR chat) is enough for two-team
-  workflows by convention. A real `teams` table is needed only
-  when org structure has hard boundaries (which 1.0a/b/c users
-  don't have).
-- **Don't auto-act**. Even if "auto-schedule a code review when
-  PR opens" is tempting, gate it behind the user explicitly
-  asking the bot to do it on every PR. Auto-action erodes user
-  trust faster than missed notifications.
+### What's happening
+
+1.0c has investigators, but they are **rule-bound**: they only run
+when a subscription matched a candidate event. The investigator
+decides "should I notify the user about THIS thread" but not
+"should I speak up at all today, in any room, to anyone, about
+anything."
+
+Your phrasing:
+
+> 没有做到真人 pmo 那样根据 context 自己判断什么时候应该主动
+> 说话，在哪里主动说话、和谁主动说话
+
+This is the qualitative jump from "notification system" to "PMO
+agent." A real PMO does these things daily:
+
+- "Albert hasn't shown up in stand-up logs for 3 days; nobody's
+  flagged it; let me ping him." — no rule existed for this
+- "The release retro is in 2 days but nobody started the doc;
+  let me drop a reminder in the project channel." — situational,
+  not subscribed
+- "BCC mentioned the deploy issue 3 times this week, looks
+  recurring; let me proactively suggest a sync between him and
+  the SRE." — synthesis across people/topics
+- "I noticed the team's been heads-down for 6 hours without a
+  break; let me suggest a coffee." — vibe sensing
+
+None of these match the "subscription → match → notify" model.
+
+### What's needed
+
+A new background process I'll call the **observer**. It's a step
+above the gatekeeper, with broader inputs and looser triggers:
+
+```
+Every N minutes (e.g. every 30min), the observer:
+  1. Reads the team's state — recent events across all sources,
+     active investigations, recent notifications, current time,
+     known goals/deadlines (from Axis 4 if it ever exists).
+  2. Asks the LLM: "given this snapshot, is there anything a real
+     PMO would proactively say right now? If so, what? to whom?
+     in what room?"
+  3. The LLM may return zero, one, or many "speech acts." Each
+     speech act is essentially a synthetic investigation_job:
+     "I want the bot to say X to Y in Z."
+  4. Each speech act goes through the SAME investigator → renderer
+     → delivery pipeline as 1.0c, with a different trigger reason.
+```
+
+**This is a different LLM mode than the gatekeeper.** Gatekeeper
+asks "is this event worth investigating for THIS subscription."
+Observer asks "is anything in the team's state worth speaking
+about, regardless of any subscription." The same investigator
+infrastructure handles both because both eventually produce a
+brief that the investigator can flesh out.
+
+Three things this needs that don't exist:
+
+1. **Team state snapshot**: a curated view of "what's relevant
+   for the observer." Not raw events — a digested narrative:
+   "team activity over last 24h: bcc finished PR 1234; albert is
+   3 days into vibelive player rewrite; oneship has been quiet
+   since Tuesday; the pmo_agent investigator missed a beat at
+   T-3min." This is itself an LLM-summarised artifact, written
+   by a separate cheap call, refreshed every 15min.
+
+2. **Speech-act schema**: structured output of the observer.
+
+   ```jsonc
+   {
+     "speak": true,
+     "to_whom": "bcc",                 // user_id, chat_id, or "many"
+     "where": "dm",                    // dm | chat:CHAT_ID | mention_in:CHAT_ID
+     "why_now": "albert went quiet for 3 days, expected daily",
+     "evidence_event_ids": [...],
+     "topic": "albert disappearance",
+     "headline_hint": "...",
+     "confidence": "low|medium|high",
+     "expires_at": "..."               // observation may go stale
+   }
+   ```
+
+3. **Frequency / trust budgets**: observer-driven speech is
+   NOT subscribed-to. Users haven't asked for it. So the bot
+   must be very stingy. Per-user-per-day cap, per-chat-per-day
+   cap, "user said this kind of thing was not useful" → reduce
+   confidence threshold for that type of speech act, etc. This
+   is the moral hazard area: if the observer is too chatty,
+   users disable the bot. If too quiet, the feature has no value.
+
+### What it unlocks
+
+- The bot becomes a real PMO presence, not a notification feed
+- The `主动` in `proactive-agent` finally means what the name
+  implies
+- Most user complaints about "the bot doesn't notice obvious
+  things" — covered
+
+### Estimate / risk
+
+**Estimate**: 10-15 days. Core observer is 4-5 days; budget /
+trust UX is 5+ days; team state summariser is 2-3 days.
+
+**Risk**: this is the FEATURE that can destroy the product if
+done wrong. An over-eager observer that DMs "looks like albert is
+slacking" to the wrong person, even once, is product-fatal.
+
+The right shape is probably:
+- Observer ALWAYS produces speech acts with low confidence by
+  default
+- Bot delivers them only with a hard-locked daily cap (e.g. 1-2
+  per user per day)
+- Each delivery includes a "was this useful?" UX
+- That feedback feeds back into per-act-type confidence
+- Speech acts user marks "not useful" 3+ times in same category
+  → bot stops attempting that category for that user
+
+This is the only 2.0 piece that requires real telemetry-driven
+iteration, not just spec-and-build.
 
 ---
 
-## 6. Out of scope (still, possibly forever)
+## 5. Are these three independent?
 
-- Voice / phone notifications
-- Mobile push (Feishu desktop only)
-- Multi-org / multi-tenant pmo_agent — separate product
+Mostly yes, with two coupling points:
+
+**Axis 1 strengthens Axis 3**. The observer is much more useful
+when it can see GitHub state, not just turns. "albert pushed 5
+commits to vibelive in 3 hours" is a stronger signal than just
+seeing turns. So if you build the observer first without
+external sources, it'll be substantially weaker.
+
+**Axis 2 enables Axis 3 to land well**. Once observer can speak
+unprompted, "where to deliver" becomes critical. "Tell albert in
+#vibelive when…" is exactly the routing flexibility Axis 2
+provides. Without Axis 2, observer-driven speech can only land
+in the asker's DM, which is the wrong room half the time.
+
+So the natural sequence is:
+
+```
+Axis 1 (events broaden)  →  Axis 2 (output broaden)  →  Axis 3 (trigger broaden)
+```
+
+Building Axis 3 first is risky. Building Axis 1 first is safest
+and sets up the rest.
+
+---
+
+## 6. Sequence proposal
+
+### 2.0a — Axis 1: external event sources (5-8 days)
+
+GitHub + Gitea webhooks. `external_identities` table.
+`external_repos` mapping. Renderer enrichment for PR
+diff/spec/plan files. End-to-end smoke: "bcc opens PR in
+vibelive, albert with a 'vibelive merge 告诉我' subscription
+gets a notification with PR summary."
+
+### 2.0b — Axis 2: routing flexibility (4-6 days)
+
+Decompose subscription owner from delivery target. Add
+`target_kind` / `target_id` / `target_user_open_id` columns.
+Group-aware UX: chat-mediated rule creation + ACL gates.
+End-to-end smoke: "in #vibelive group, set rule 'tell albert in
+DM when his PR breaks the build'; wire works."
+
+### 2.0c — Axis 3: judgment-driven observer (10-15 days)
+
+Team state snapshot job. Observer LLM call. Speech-act schema
+plumbed through investigator → renderer. Trust budget +
+"useful?" feedback. End-to-end: observe team for a week, see
+how many speech acts fire, tune.
+
+This is **explicitly the longest and riskiest** of the three.
+Don't start until 2.0a + 2.0b are stable AND we've watched 1-2
+weeks of usage data to know what kinds of "spontaneous PMO
+moments" users actually want.
+
+---
+
+## 7. Architectural invariants 2.0 inherits from 1.0
+
+Even with all three axes built, the following must hold:
+
+1. **One Feishu app, one bot identity.** Group rules don't spawn
+   a second bot.
+2. **Events are append-only by `(source, source_id)`.** Webhook
+   sources play by the same rules as turn events.
+3. **Investigator is the only notify/suppress decider.** Observer
+   produces candidates; investigator validates them like any
+   other event.
+4. **Renderer doesn't decide.** Even for observer-triggered
+   speech acts, renderer faithfully transcribes the brief.
+5. **No write actions.** 2.0 broadens what bot SAYS, not what
+   bot DOES.
+6. **Token / cost budgets per loop.** Observer in particular has
+   a tight budget — it runs every 30min over the whole team's
+   state.
+7. **User can disable everything from chat.** If observer becomes
+   annoying, "stop being so chatty" must work as a subscription
+   instruction.
+
+---
+
+## 8. What this means for "what to build first"
+
+If you want to commit to 2.0 work now, the right starting point
+is **2.0a (external sources)**:
+
+- Smallest scope per chunk of value (3-5 days for first source)
+- Reuses 1.0c pipeline entirely; no architectural extension
+- Strengthens both 2.0b and 2.0c as prerequisites
+- Failure mode is bounded: webhook arrives, doesn't match any
+  subscription, gets suppressed quietly. Same as a turn that
+  matches nothing.
+
+If you want to commit but can't yet (1.0c not on prod): wait,
+watch 1.0c's decision_logs for ~1 week, then either:
+- Many users frustrated by "GitHub events not reachable" → 2.0a
+- Many users frustrated by "can't tell X to Y" → 2.0b first
+- Many users say "you should've noticed Y" → 2.0c first (risky)
+
+The default answer if no clear signal is still **2.0a**.
+
+---
+
+## 9. Anti-patterns to avoid
+
+- **Don't build cross-axis abstractions early.** A "universal event
+  metadata schema" or a "unified routing table" sounds clean but
+  ossifies decisions before we know what they should be.
+- **Don't auto-act in 2.0.** Even tempting things like "when PR
+  opens, schedule code review meeting" — gate behind explicit
+  user instruction every time.
+- **Don't add an observer threshold knob in config.** It's a
+  trust-loss accelerator. Let the bot learn from per-user
+  feedback instead.
+- **Don't pre-build a `teams` abstraction.** 1.0c's
+  user-or-chat scope + 2.0b's flexible routing covers
+  team-by-convention without a teams table.
+- **Don't ship Axis 3 without "this was useless, never do this
+  again" UX.** The observer's ONLY survival mechanism is
+  user-controlled silence.
+
+---
+
+## 10. Out of scope across all axes
+
+- Voice / phone notifications — Feishu only
+- Multi-org pmo_agent — separate product
 - Replacing existing tools (Linear, GitHub, calendars) — bot is
   glue, not source of truth
 - Native code execution / PR creation by bot
-- Pricing / billing / usage caps — until we have paid users
+- Pricing / billing / usage caps — until paid users
+- Bot-initiated DMs to users without bound feishu_links — would
+  fail at delivery anyway
 
 ---
 
-## 7. Concrete next step (if you want to commit to ANY 2.0 work now)
+## 11. Concrete next decision
 
-The lowest-risk way to start 2.0 work without depending on data:
+Three options, in increasing commitment:
 
-1. **Apply 1.0c sandbox + production**, watch it for 1 week
-2. **Run an analysis script** on the resulting decision_logs and
-   notifications, identifying top patterns
-3. **Pick 2.A or 2.C** based on what you see — both reuse 1.0c
-   infra without extending architecture
-4. Write a 2.A or 2.C **mini-spec** at the same level of detail
-   as the 1.0c spec
-5. Iterate with codex review until ready to implement
-6. Implement, deploy, observe again
+A) **Wait** — finish 1.0c sandbox + production, watch real
+   subscriptions for 1-2 weeks, decide based on observed pain
+   points.
 
-If 1.0a/b/c watching is impatient: **just start 2.A**. Scheduled
-briefs are the safest 2.0 feature to build speculatively because
-they reuse everything below them — failure mode is "users don't
-read the weekly digest" rather than "production is broken."
+B) **Start 2.0a (GitHub webhooks) now** — lowest-risk 2.0 work,
+   doesn't depend on 1.0c usage data, sets up 2.0b/c. About
+   5-8 days.
+
+C) **Skip ahead to 2.0c (observer)** — most ambitious, biggest
+   risk to product trust. Don't recommend without first having
+   2.0a + 2.0b in place.
+
+Default: A. If you can't wait: B.
