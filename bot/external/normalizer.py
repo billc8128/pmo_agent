@@ -12,9 +12,13 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _login(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
 def _actor(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
     sender = _as_dict(raw.get("sender") or raw.get("user"))
-    login = str(sender.get("login") or sender.get("username") or "").strip()
+    login = _login(sender.get("login") or sender.get("username"))
     external_id = sender.get("id")
     external_id_str = str(external_id) if external_id is not None else None
     profile_id = queries.lookup_profile_by_external_login(provider, login, external_id=external_id_str) if login else None
@@ -35,7 +39,8 @@ def _repo(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
 def _mentioned_profile_ids(provider: str, text: str) -> list[str]:
     profile_ids: list[str] = []
     seen: set[str] = set()
-    for login in _MENTION_RE.findall(text or ""):
+    for raw_login in _MENTION_RE.findall(text or ""):
+        login = _login(raw_login)
         profile_id = queries.lookup_profile_by_external_login(provider, login)
         if profile_id and profile_id not in seen:
             profile_ids.append(profile_id)
@@ -136,7 +141,11 @@ def _normalize_issue_comment(provider: str, raw: dict[str, Any]) -> dict[str, An
         "action": "created",
         "occurred_at": comment.get("created_at"),
         "project_root": repo.get("project_root"),
-        "comment": {"body": comment.get("body") or "", "html_url": comment.get("html_url") or ""},
+        "comment": {
+            "id": comment.get("id"),
+            "body": comment.get("body") or "",
+            "html_url": comment.get("html_url") or "",
+        },
         "issue": {"number": issue.get("number"), "title": issue.get("title") or ""},
         "repo": repo,
         "actor": _actor(provider, raw),

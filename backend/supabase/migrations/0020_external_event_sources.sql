@@ -7,6 +7,9 @@ create extension if not exists pgcrypto;
 alter table public.events
     add column if not exists payload_fingerprint text;
 
+comment on column public.events.payload_fingerprint is
+    'Nullable by design: webhook upserts use this guard for redelivery idempotency; turn-source rows from on_turn_to_event keep NULL and continue using existing payload_version trigger semantics.';
+
 create table if not exists public.external_identities (
     id             uuid primary key default gen_random_uuid(),
     profile_id     uuid not null references public.profiles(id) on delete cascade,

@@ -174,16 +174,21 @@ unique (source, source_id)
 
 2.0a adds two new `source` values: `github` and `gitea`.
 
-`source_id` shape per provider:
+`source_id` is a stable resource identity, not the webhook
+delivery uuid. Delivery ids are stored only in
+`external_webhook_deliveries`.
 
-| Provider | source_id format | Example |
-|----------|------------------|---------|
-| github   | `{event_type}:{delivery_id}` | `pull_request:abc123-uuid` |
-| gitea    | `{event_type}:{delivery_id}` | `pull_request:def456-uuid` |
+| Event type | source_id format | Example |
+|------------|------------------|---------|
+| pull_request | `pull_request:{repo_full_name}:{pr_number}` | `pull_request:billc8128/vibelive:42` |
+| push | `push:{repo_full_name}:{ref}:{after_sha}` | `push:billc8128/vibelive:refs/heads/main:abc123` |
+| release | `release:{repo_full_name}:{tag}` | `release:billc8128/vibelive:v1.2.3` |
+| issue_comment | `issue_comment:{repo_full_name}:{comment_id}` | `issue_comment:billc8128/vibelive:98765` |
 
-Both providers send a unique delivery uuid in webhook headers
-(`X-GitHub-Delivery` / `X-Gitea-Delivery`); we use that as the
-source_id suffix.
+This preserves the events table contract: one row per external
+resource/update identity. A pull request opened, synchronized,
+and merged updates the same `events` row instead of creating one
+row per webhook delivery.
 
 **Idempotency contract** (CRITICAL — see plan §3.4 for SQL):
 GitHub and Gitea routinely re-deliver webhooks on receiver
@@ -193,13 +198,15 @@ byte-identical re-delivery. If it did, every re-delivery would
 re-enter `events_needing_decision` and produce duplicate
 investigations / notifications.
 
-The upsert uses a `payload_fingerprint` md5 over the
-**normalised** payload (excluding volatile timestamp fields the
-provider regenerates per delivery). Same fingerprint → no-op.
-Different fingerprint (e.g. PR description was edited and the
-event re-ingested) → bump `payload_version`, re-enter
-needs-decision. This mirrors 1.0c's late-summary semantics for
-turn events.
+The upsert uses a `payload_fingerprint` md5 over the stable parts
+of the **normalised** payload. It excludes top-level delivery
+noise and DB lookup outputs (`project_root`, `actor.profile_id`,
+`repo.project_root`, `mentioned_profile_ids`) so rebinding an
+identity or repo mapping does not re-notify old webhook events.
+Same fingerprint → no-op. Different fingerprint (e.g. PR
+description was edited and the event re-ingested) → bump
+`payload_version`, re-enter needs-decision. This mirrors 1.0c's
+late-summary semantics for turn events.
 
 `payload` jsonb contents per webhook event type — see §4.
 
@@ -334,6 +341,12 @@ Each route reads a per-provider HMAC secret from environment:
 Mismatched signature → 401 with no body. Missing secret →
 500 with log line; the route fails closed.
 
+Body limits are enforced before signature verification:
+`Content-Length` is required, non-numeric values return 400,
+missing values return 411, and values over 2MB return 413. The
+route also checks actual bytes after reading. This avoids
+chunked requests bypassing the declared body cap.
+
 ### 4.3 Event types we ingest in 2.0a
 
 For each event type we extract a stable shape into
@@ -426,7 +439,7 @@ boundary.
 {
   "event_type": "issue_comment",
   "action": "created",
-  "comment": { "body": "...", "html_url": "..." },
+  "comment": { "id": 98765, "body": "...", "html_url": "..." },
   "issue": { "number": 567, "title": "..." },
   "repo": { ... },
   "actor": { ... },
@@ -817,8 +830,8 @@ Concrete e2e scripts the implementation must pass:
 
 ### 9.6 Idempotent re-delivery
 
-1. GitHub re-delivers the same delivery uuid (simulated by
-   POSTing the same webhook twice)
+1. GitHub re-delivers the same delivery uuid, or sends another
+   delivery for the same PR/resource with changed payload
 2. Second POST: events row's `(source, source_id)` unique
    constraint kicks in; ON CONFLICT DO UPDATE rewrites payload
    if changed

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,12 +39,19 @@ def _github_pr_payload(**overrides):
 def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch):
     from external import normalizer
 
+    lookups: list[tuple[str, str, str | None]] = []
+
+    payload = _github_pr_payload()
+    payload["sender"] = {"login": "HelloBit", "id": 12345}
+
+    def fake_lookup(provider, login, external_id=None):
+        lookups.append((provider, login, external_id))
+        return "profile-hellobit" if (provider, login, external_id) == ("github", "hellobit", "12345") else None
+
     monkeypatch.setattr(
         normalizer.queries,
         "lookup_profile_by_external_login",
-        lambda provider, login, external_id=None: "profile-hellobit"
-        if (provider, login, external_id) == ("github", "hellobit", "12345")
-        else None,
+        fake_lookup,
     )
     monkeypatch.setattr(
         normalizer.queries,
@@ -51,7 +61,7 @@ def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch
         else None,
     )
 
-    normalized = normalizer.normalize_github("pull_request", _github_pr_payload())
+    normalized = normalizer.normalize_github("pull_request", payload)
 
     assert normalized["event_type"] == "pull_request"
     assert normalized["action"] == "merged"
@@ -65,6 +75,7 @@ def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch
         "id": "12345",
         "profile_id": "profile-hellobit",
     }
+    assert ("github", "hellobit", "12345") in lookups
     assert "raw" not in normalized
 
 
@@ -84,7 +95,7 @@ def test_issue_comment_normalizer_resolves_at_mentions(monkeypatch):
         {
             "action": "created",
             "comment": {
-                "body": "cc @hellobit and @ghost-user",
+                "body": "cc @HelloBit and @ghost-user",
                 "html_url": "https://github.com/billc8128/vibelive/issues/1#issuecomment-1",
                 "created_at": "2026-05-06T08:00:00Z",
             },
@@ -256,13 +267,93 @@ def test_ingest_upserts_event_and_links_archive(monkeypatch):
     assert calls[1][0] == "upsert"
     upsert = calls[1][1]
     assert upsert["source"] == "github"
-    assert upsert["source_id"] == "pull_request:delivery-2"
+    assert upsert["source_id"] == "pull_request:billc8128/vibelive:42"
     assert upsert["project_root"] == "/repo/vibelive"
     assert upsert["payload"]["event_type"] == "pull_request"
     assert calls[2] == ("link", (7, 99))
 
 
-def test_stable_payload_fingerprint_ignores_delivery_only_fields():
+def test_ingest_uses_resource_stable_source_id_across_deliveries(monkeypatch):
+    from external import ingest, normalizer
+
+    upserts: list[dict[str, object]] = []
+
+    monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", lambda *args, **kwargs: None)
+    monkeypatch.setattr(normalizer.queries, "lookup_project_root_for_repo", lambda *args, **kwargs: "/repo/vibelive")
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            return 7
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            upserts.append(kwargs)
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            return None
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+
+    for delivery_id, title in [("delivery-a", "First title"), ("delivery-b", "Edited title")]:
+        payload = _github_pr_payload()
+        payload["pull_request"]["title"] = title
+        asyncio.run(
+            ingest.ingest_external_event(
+                provider="github",
+                event_type="pull_request",
+                delivery_id=delivery_id,
+                payload=payload,
+                raw_bytes=b"{}",
+                headers={},
+            )
+        )
+
+    assert [row["source_id"] for row in upserts] == [
+        "pull_request:billc8128/vibelive:42",
+        "pull_request:billc8128/vibelive:42",
+    ]
+
+
+def test_source_id_for_external_events_uses_resource_identity_not_delivery():
+    from external.ingest import source_id_for_event
+
+    assert (
+        source_id_for_event(
+            {
+                "event_type": "push",
+                "repo": {"full_name": "billc8128/vibelive"},
+                "ref": "refs/heads/main",
+                "after": "abc123",
+            }
+        )
+        == "push:billc8128/vibelive:refs/heads/main:abc123"
+    )
+    assert (
+        source_id_for_event(
+            {
+                "event_type": "release",
+                "repo": {"full_name": "billc8128/vibelive"},
+                "release": {"tag_name": "v1.2.3"},
+            }
+        )
+        == "release:billc8128/vibelive:v1.2.3"
+    )
+    assert (
+        source_id_for_event(
+            {
+                "event_type": "issue_comment",
+                "repo": {"full_name": "billc8128/vibelive"},
+                "comment": {"id": 98765},
+            }
+        )
+        == "issue_comment:billc8128/vibelive:98765"
+    )
+
+
+def test_stable_payload_fingerprint_ignores_delivery_and_lookup_fields():
     from external.ingest import payload_fingerprint
 
     base = {
@@ -270,13 +361,156 @@ def test_stable_payload_fingerprint_ignores_delivery_only_fields():
         "occurred_at": "2026-05-06T06:30:00Z",
         "ingested_at": "2026-05-06T06:31:00Z",
         "delivery_id": "a",
+        "project_root": "/repo/vibelive",
+        "mentioned_profile_ids": ["profile-a"],
         "pr": {"number": 42, "title": "A"},
+        "repo": {"full_name": "billc8128/vibelive", "project_root": "/repo/vibelive"},
+        "actor": {"login": "hellobit", "id": "12345", "profile_id": "profile-a"},
     }
-    redelivery = {**base, "ingested_at": "2026-05-06T07:00:00Z", "delivery_id": "b"}
+    redelivery = {
+        **base,
+        "ingested_at": "2026-05-06T07:00:00Z",
+        "delivery_id": "b",
+        "project_root": "/repo/vibelive-new",
+        "mentioned_profile_ids": ["profile-b"],
+        "repo": {"full_name": "billc8128/vibelive", "project_root": "/repo/vibelive-new"},
+        "actor": {"login": "hellobit", "id": "12345", "profile_id": "profile-b"},
+    }
     changed = {**base, "pr": {"number": 42, "title": "B"}}
 
     assert payload_fingerprint(base) == payload_fingerprint(redelivery)
     assert payload_fingerprint(base) != payload_fingerprint(changed)
+
+
+def test_link_external_identity_normalizes_login_before_write(monkeypatch):
+    from db import queries
+
+    class FakeTable:
+        def __init__(self, name: str):
+            self.name = name
+            self.filters: list[tuple[str, object]] = []
+            self.upsert_row: dict[str, object] | None = None
+
+        def select(self, *_args):
+            return self
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def maybe_single(self):
+            return self
+
+        def upsert(self, row, on_conflict=None):
+            self.upsert_row = row
+            return self
+
+        def execute(self):
+            if self.upsert_row is not None:
+                return SimpleNamespace(data=[self.upsert_row])
+            return SimpleNamespace(data=None)
+
+    tables: list[FakeTable] = []
+
+    class FakeClient:
+        def table(self, name):
+            table = FakeTable(name)
+            tables.append(table)
+            return table
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: FakeClient())
+
+    row = queries.link_external_identity("profile-1", "GitHub", "HelloBit", external_id=12345)
+
+    assert row["provider"] == "github"
+    assert row["external_login"] == "hellobit"
+    assert ("external_login", "hellobit") in tables[0].filters
+
+
+class _FakeRequest:
+    def __init__(self, headers: dict[str, str], body: bytes):
+        self.headers = headers
+        self._body = body
+        self.body_read = False
+
+    async def body(self):
+        self.body_read = True
+        return self._body
+
+
+def test_webhook_rejects_missing_content_length_without_reading_body(monkeypatch):
+    from external import webhooks
+
+    monkeypatch.setattr(webhooks.settings, "github_webhook_secret", "secret")
+    body = json.dumps(_github_pr_payload()).encode("utf-8")
+    signature = "sha256=" + hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+    request = _FakeRequest(
+        {
+            "x-hub-signature-256": signature,
+            "x-github-event": "pull_request",
+            "x-github-delivery": "delivery-1",
+        },
+        body,
+    )
+
+    response = asyncio.run(webhooks._handle_webhook(request, "github"))
+
+    assert response.status_code == 411
+    assert request.body_read is False
+
+
+def test_webhook_rejects_invalid_content_length_as_bad_request(monkeypatch):
+    from external import webhooks
+
+    monkeypatch.setattr(webhooks.settings, "github_webhook_secret", "secret")
+    request = _FakeRequest(
+        {
+            "content-length": "not-a-number",
+            "x-hub-signature-256": "sha256=abc",
+            "x-github-event": "pull_request",
+            "x-github-delivery": "delivery-1",
+        },
+        b"{}",
+    )
+
+    response = asyncio.run(webhooks._handle_webhook(request, "github"))
+
+    assert response.status_code == 400
+    assert request.body_read is False
+
+
+def test_webhook_missing_secret_fails_before_signature_verification(monkeypatch):
+    from external import webhooks
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("signature verifier should not run without a configured secret")
+
+    monkeypatch.setattr(webhooks.settings, "github_webhook_secret", "")
+    monkeypatch.setattr(webhooks, "_verify_github_signature", fail_if_called)
+    body = json.dumps(_github_pr_payload()).encode("utf-8")
+    request = _FakeRequest(
+        {
+            "content-length": str(len(body)),
+            "x-hub-signature-256": "sha256=abc",
+            "x-github-event": "pull_request",
+            "x-github-delivery": "delivery-1",
+        },
+        body,
+    )
+
+    response = asyncio.run(webhooks._handle_webhook(request, "github"))
+
+    assert response.status_code == 500
+
+
+def test_gitea_signature_accepts_optional_sha256_prefix():
+    from external.webhooks import _verify_gitea_signature
+
+    body = b'{"ok":true}'
+    digest = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+
+    assert _verify_gitea_signature(body, digest, "secret") is True
+    assert _verify_gitea_signature(body, f"sha256={digest}", "secret") is True
 
 
 def test_meta_tools_do_not_expose_unverified_external_identity_self_claim():
@@ -350,6 +584,7 @@ def test_migration_0020_defines_external_sources_contracts():
     assert "extid_id_unique" in sql
     assert "where external_id is not null" in sql
     assert "webhook_delivery_unique unique (provider, delivery_id)" in sql
+    assert "Nullable by design" in sql
     assert "excluded.payload_fingerprint is not null" in sql
     assert "enable row level security" in sql.lower()
     assert "grant all on public.external_webhook_deliveries to service_role" in sql

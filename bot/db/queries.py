@@ -311,7 +311,7 @@ def link_external_identity(
     external_id: str | None = None,
 ) -> dict[str, Any]:
     provider = provider.strip().lower()
-    login = external_login.strip()
+    login = external_login.strip().lower()
     existing = (
         sb_admin()
         .table("external_identities")
@@ -368,7 +368,7 @@ def lookup_profile_by_external_login(provider: str, external_login: str, externa
         )
         if row:
             return row.get("profile_id")
-    login = (external_login or "").strip()
+    login = (external_login or "").strip().lower()
     if not login:
         return None
     row = (

@@ -56,8 +56,12 @@ Creates:
 - `external_resource_cache` table per spec §6.2 for fetched
   PR diffs and similar.
 - **`events.payload_fingerprint` column** (text, nullable) —
-  webhook events compute md5 over the normalised payload
-  (excluding volatile timestamps) and write it on insert.
+  webhook events compute md5 over the stable normalised payload
+  and write it on insert. The hash excludes top-level delivery
+  noise plus DB lookup outputs (`project_root`,
+  `actor.profile_id`, `repo.project_root`,
+  `mentioned_profile_ids`) so identity/repo rebinding does not
+  re-notify old webhook events.
   **Turn events**: 0020 does NOT extend `on_turn_to_event` to
   populate this column. Rationale:
   - 1.0c's existing on_turn_to_event computes a local fingerprint
@@ -206,7 +210,13 @@ async def github_webhook(request: Request) -> Response:
     # 1. Body size cap BEFORE reading body — protects against
     #    DoS via giant POST. GitHub PR bodies max ~150KB in
     #    practice; 2MB is generous.
-    content_length = int(request.headers.get("content-length") or 0)
+    content_length_raw = request.headers.get("content-length")
+    if not content_length_raw:
+        return Response(status_code=411)  # Length Required
+    try:
+        content_length = int(content_length_raw)
+    except ValueError:
+        return Response(status_code=400)
     if content_length > _MAX_WEBHOOK_BODY_BYTES:
         return Response(status_code=413)  # Payload Too Large
     raw_body = await request.body()
@@ -214,9 +224,11 @@ async def github_webhook(request: Request) -> Response:
         # body() ignores Content-Length, double-check on actual bytes
         return Response(status_code=413)
 
-    # 2. Signature first, error responses second. Don't parse JSON
+    # 2. Secret and signature first, error responses second. Don't parse JSON
     #    until signature passes — prevents wasting CPU on attacker
     #    bodies.
+    if not settings.github_webhook_secret:
+        return Response(status_code=500)
     signature = request.headers.get("x-hub-signature-256", "")
     if not _verify_github_signature(raw_body, signature,
                                      settings.github_webhook_secret):
@@ -260,6 +272,7 @@ async def github_webhook(request: Request) -> Response:
 |--------|--------|
 | 200 | webhook accepted (whether or not it produced an `events` row — duplicate redelivery still 200) |
 | 400 | malformed JSON / missing required headers |
+| 411 | missing `Content-Length`; chunked uploads are rejected |
 | 401 | signature missing or wrong |
 | 413 | body exceeds 2MB cap |
 | 500 | internal error (logged, no body returned) — GitHub will retry |
@@ -279,8 +292,8 @@ def _verify_github_signature(body: bytes, header: str,
     return hmac.compare_digest(expected, header)
 ```
 
-Same shape for Gitea (HMAC-SHA256 of raw body, no `sha256=`
-prefix in Gitea's case).
+Same shape for Gitea (HMAC-SHA256 of raw body). Accept both bare
+hex signatures and a `sha256=` prefix for newer Gitea versions.
 
 Both secrets live in env: `GITHUB_WEBHOOK_SECRET` /
 `GITEA_WEBHOOK_SECRET`. Add to Railway and Vercel env vars
@@ -419,12 +432,17 @@ async def ingest_external_event(
         return  # event type ignored — raw still archived
 
     # 3. Upsert into events with the compact normalised shape.
-    #    Idempotency via payload_fingerprint (computed inside
-    #    upsert_event from a stable subset of the normalised
-    #    payload — see helper contract in §2). Returns event_id.
+    #    source_id is a resource-stable identity, not delivery_id:
+    #    PR: pull_request:{repo}:{number}
+    #    push: push:{repo}:{ref}:{after}
+    #    release: release:{repo}:{tag}
+    #    comment: issue_comment:{repo}:{comment_id}
+    #    Idempotency via payload_fingerprint (computed from a
+    #    stable subset of the normalised payload — see helper
+    #    contract in §2). Returns event_id.
     event_id = queries.upsert_event(
         source=provider,
-        source_id=f"{event_type}:{delivery_id}",
+        source_id=source_id_for_event(normalized),
         user_id=normalized.get("actor", {}).get("profile_id"),
         project_root=normalized.get("repo", {}).get("project_root"),
         occurred_at=normalized["occurred_at"],
@@ -493,11 +511,13 @@ returning id;
 `payload_fingerprint` is a new nullable column on `events` (added
 in plan §1's migration if not already present). For webhook
 events: `md5(stable_json(normalised_payload_minus_volatile_fields))`
-where volatile fields are timestamps the source generates per
-delivery. For turn events: leave this column NULL in 2.0a. Turn
-events continue through the existing `on_turn_to_event` trigger
-and its `payload_version` semantics; webhook redelivery is the
-only path that needs the persisted fingerprint guard.
+where the stable subset excludes delivery noise and DB lookup
+outputs (`project_root`, `actor.profile_id`, `repo.project_root`,
+`mentioned_profile_ids`). For turn events: leave this column NULL
+in 2.0a. Turn events continue through the existing
+`on_turn_to_event` trigger and its `payload_version` semantics;
+webhook redelivery is the only path that needs the persisted
+fingerprint guard.
 
 **Why this matters for re-delivery**: GitHub's webhook delivery
 retries are common (any 5xx from our side triggers redelivery).
@@ -528,11 +548,12 @@ arriving late in 1.0c).
   source='github', payload normalised correctly,
   payload_version=1
 - Same delivery_id POSTed AGAIN with byte-identical body → still
-  ONE events row, **payload_version still 1**
+  ONE archive row and ONE events row, **payload_version still 1**
   (fingerprint-equal → no-op). Critically: events_needing_decision
   view does NOT re-include this row.
-- Same delivery_id POSTed with body content edited (e.g. PR title
-  changed) → still ONE events row, payload_version=2,
+- A different delivery for the same resource-stable source_id
+  (e.g. same PR number with edited title) → still ONE events row,
+  payload_version=2,
   events_needing_decision DOES re-include this row.
 - POST with bad signature → 401, no events row written and no
   external_webhook_deliveries entry.

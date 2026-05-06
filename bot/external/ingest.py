@@ -7,20 +7,62 @@ from typing import Any
 from db import queries
 from external.normalizer import normalize_github, normalize_gitea
 
-_VOLATILE_FINGERPRINT_FIELDS = {"delivery_id", "ingested_at", "received_at"}
+_TOP_LEVEL_FINGERPRINT_EXCLUDES = {
+    "delivery_id",
+    "ingested_at",
+    "received_at",
+    "project_root",
+    "mentioned_profile_ids",
+}
 _SENSITIVE_HEADER_PARTS = ("signature", "authorization", "token", "secret")
 
 
-def _stable_payload(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            k: _stable_payload(v)
-            for k, v in sorted(value.items())
-            if k not in _VOLATILE_FINGERPRINT_FIELDS
-        }
-    if isinstance(value, list):
-        return [_stable_payload(v) for v in value]
-    return value
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _stable_payload(value: dict[str, Any]) -> dict[str, Any]:
+    stable = {
+        k: v
+        for k, v in value.items()
+        if k not in _TOP_LEVEL_FINGERPRINT_EXCLUDES
+    }
+    actor = stable.get("actor")
+    if isinstance(actor, dict):
+        stable["actor"] = {k: v for k, v in actor.items() if k != "profile_id"}
+    repo = stable.get("repo")
+    if isinstance(repo, dict):
+        stable["repo"] = {k: v for k, v in repo.items() if k != "project_root"}
+    return stable
+
+
+def source_id_for_event(normalized: dict[str, Any]) -> str | None:
+    event_type = _text(normalized.get("event_type"))
+    repo_name = _text(_as_dict(normalized.get("repo")).get("full_name"))
+    if not event_type or not repo_name:
+        return None
+
+    if event_type == "pull_request":
+        pr_number = _text(_as_dict(normalized.get("pr")).get("number"))
+        return f"pull_request:{repo_name}:{pr_number}" if pr_number else None
+    if event_type == "push":
+        ref = _text(normalized.get("ref"))
+        after = _text(normalized.get("after"))
+        return f"push:{repo_name}:{ref}:{after}" if ref and after else None
+    if event_type == "release":
+        tag = _text(_as_dict(normalized.get("release")).get("tag_name"))
+        return f"release:{repo_name}:{tag}" if tag else None
+    if event_type == "issue_comment":
+        comment_id = _text(_as_dict(normalized.get("comment")).get("id"))
+        return f"issue_comment:{repo_name}:{comment_id}" if comment_id else None
+    return None
 
 
 def payload_fingerprint(payload: dict[str, Any]) -> str:
@@ -64,9 +106,13 @@ async def ingest_external_event(
     if normalized is None:
         return
 
+    source_id = source_id_for_event(normalized)
+    if source_id is None:
+        return
+
     event_id = queries.upsert_event(
         source=provider,
-        source_id=f"{event_type}:{delivery_id}",
+        source_id=source_id,
         user_id=(normalized.get("actor") or {}).get("profile_id"),
         project_root=normalized.get("project_root") or (normalized.get("repo") or {}).get("project_root"),
         occurred_at=normalized.get("occurred_at"),
