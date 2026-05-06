@@ -20,7 +20,7 @@ def _github_pr_payload(**overrides):
             "html_url": "https://github.com/billc8128/vibelive/pull/42",
             "diff_url": "https://github.com/billc8128/vibelive/pull/42.diff",
             "base": {"ref": "main"},
-            "head": {"ref": "rtc-media-check"},
+            "head": {"ref": "rtc-media-check", "sha": "head-sha-42"},
             "merged": True,
             "merged_at": "2026-05-06T06:30:00Z",
             "created_at": "2026-05-06T05:00:00Z",
@@ -75,6 +75,7 @@ def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch
         "login": "hellobit",
         "id": "12345",
         "profile_id": "profile-hellobit",
+        "is_bot": False,
     }
     assert ("github", "hellobit", "12345") in lookups
     assert "raw" not in normalized
@@ -107,6 +108,57 @@ def test_issue_comment_normalizer_resolves_at_mentions(monkeypatch):
     )
 
     assert normalized["mentioned_profile_ids"] == ["profile-hellobit"]
+
+
+def test_bot_actor_pull_request_is_ignored_before_event_upsert(monkeypatch):
+    from external import ingest, normalizer
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", lambda *args, **kwargs: None)
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            calls.append(("archive", kwargs))
+            return 7
+
+        @staticmethod
+        def mark_archive_ignored(archive_id, reason):
+            calls.append(("ignored", (archive_id, reason)))
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            calls.append(("upsert", kwargs))
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            calls.append(("link", args))
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+    payload = _github_pr_payload(sender={"login": "dependabot[bot]", "id": 49699333, "type": "Bot"})
+
+    asyncio.run(
+        ingest.ingest_external_event(
+            provider="github",
+            event_type="pull_request",
+            delivery_id="delivery-bot",
+            payload=payload,
+            raw_bytes=b"{}",
+            headers={},
+        )
+    )
+
+    assert calls == [
+        ("archive", {
+            "provider": "github",
+            "delivery_id": "delivery-bot",
+            "event_type": "pull_request",
+            "raw_body": payload,
+            "raw_headers": {},
+        }),
+        ("ignored", (7, "bot_actor")),
+    ]
 
 
 def test_build_judge_event_for_pull_request_projection():
@@ -201,6 +253,10 @@ def test_ingest_archives_ignored_event_without_upserting(monkeypatch):
         def link_archive_to_event(*args):
             calls.append(("link", args))
 
+        @staticmethod
+        def mark_archive_ignored(archive_id, reason):
+            calls.append(("ignored", (archive_id, reason)))
+
     monkeypatch.setattr(ingest, "queries", FakeQueries)
 
     asyncio.run(
@@ -224,7 +280,8 @@ def test_ingest_archives_ignored_event_without_upserting(monkeypatch):
                 "raw_body": {"action": "completed"},
                 "raw_headers": {"x-github-delivery": "delivery-1"},
             },
-        )
+        ),
+        ("ignored", (7, "unsupported_event_type")),
     ]
 
 
@@ -250,6 +307,10 @@ def test_ingest_upserts_event_and_links_archive(monkeypatch):
         @staticmethod
         def link_archive_to_event(*args):
             calls.append(("link", args))
+
+        @staticmethod
+        def mark_archive_ignored(archive_id, reason):
+            calls.append(("ignored", (archive_id, reason)))
 
     monkeypatch.setattr(ingest, "queries", FakeQueries)
 
@@ -298,6 +359,10 @@ def test_ingest_uses_resource_stable_source_id_across_deliveries(monkeypatch):
         def link_archive_to_event(*args):
             return None
 
+        @staticmethod
+        def mark_archive_ignored(*args):
+            raise AssertionError("valid resource events should not be marked ignored")
+
     monkeypatch.setattr(ingest, "queries", FakeQueries)
 
     for delivery_id, title in [("delivery-a", "First title"), ("delivery-b", "Edited title")]:
@@ -318,6 +383,51 @@ def test_ingest_uses_resource_stable_source_id_across_deliveries(monkeypatch):
         "pull_request:billc8128/vibelive:42",
         "pull_request:billc8128/vibelive:42",
     ]
+
+
+def test_ingest_marks_archive_ignored_when_resource_identity_is_missing(monkeypatch):
+    from external import ingest, normalizer
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", lambda *args, **kwargs: None)
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            calls.append(("archive", kwargs))
+            return 7
+
+        @staticmethod
+        def mark_archive_ignored(archive_id, reason):
+            calls.append(("ignored", (archive_id, reason)))
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            calls.append(("upsert", kwargs))
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            calls.append(("link", args))
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+    payload = _github_pr_payload()
+    payload["pull_request"].pop("number")
+
+    asyncio.run(
+        ingest.ingest_external_event(
+            provider="github",
+            event_type="pull_request",
+            delivery_id="delivery-missing-pr-number",
+            payload=payload,
+            raw_bytes=b"{}",
+            headers={},
+        )
+    )
+
+    assert calls[0][0] == "archive"
+    assert calls[1] == ("ignored", (7, "missing_source_identity"))
+    assert [call[0] for call in calls] == ["archive", "ignored"]
 
 
 def test_source_id_for_external_events_uses_resource_identity_not_delivery():
@@ -420,6 +530,43 @@ def test_archive_external_delivery_uses_ignore_duplicates_to_preserve_raw_body(m
     ) == 77
     assert table.upsert_kwargs["on_conflict"] == "provider,delivery_id"
     assert table.upsert_kwargs["ignore_duplicates"] is True
+
+
+def test_mark_archive_ignored_writes_audit_reason(monkeypatch):
+    from db import queries
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeTable:
+        def update(self, row):
+            calls.append(("update", row))
+            return self
+
+        def eq(self, key, value):
+            calls.append(("eq", (key, value)))
+            return self
+
+        def is_(self, key, value):
+            calls.append(("is", (key, value)))
+            return self
+
+        def execute(self):
+            calls.append(("execute", None))
+            return SimpleNamespace(data=None)
+
+    class FakeClient:
+        def table(self, name):
+            assert name == "external_webhook_deliveries"
+            return FakeTable()
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: FakeClient())
+
+    queries.mark_archive_ignored(7, "missing_source_identity")
+
+    assert calls[0][0] == "update"
+    assert calls[0][1]["ignored_reason"] == "missing_source_identity"
+    assert calls[1] == ("eq", ("id", 7))
+    assert calls[2] == ("is", ("event_id", "null"))
 
 
 def test_write_external_resource_reaps_expired_rows_and_rejects_large_content(monkeypatch):
@@ -529,6 +676,52 @@ def test_link_external_identity_normalizes_login_before_write(monkeypatch):
     assert row["provider"] == "github"
     assert row["external_login"] == "hellobit"
     assert ("external_login", "hellobit") in tables[0].filters
+
+
+def test_external_repo_helpers_normalize_repo_full_name(monkeypatch):
+    from db import queries
+
+    class FakeTable:
+        def __init__(self):
+            self.filters: list[tuple[str, object]] = []
+            self.upsert_row: dict[str, object] | None = None
+
+        def select(self, *_args):
+            return self
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def maybe_single(self):
+            return self
+
+        def upsert(self, row, on_conflict=None):
+            self.upsert_row = row
+            return self
+
+        def execute(self):
+            if self.upsert_row is not None:
+                return SimpleNamespace(data=[self.upsert_row])
+            return SimpleNamespace(data={"project_root": "/repo/vibelive"})
+
+    table = FakeTable()
+
+    class FakeClient:
+        def table(self, name):
+            assert name == "external_repos"
+            return table
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: FakeClient())
+
+    row = queries.register_external_repo("GitHub", "BillC8128/VibeLive", "/repo/vibelive")
+    assert row["provider"] == "github"
+    assert row["repo_full_name"] == "billc8128/vibelive"
+
+    table.upsert_row = None
+    assert queries.lookup_project_root_for_repo("GitHub", "BillC8128/VibeLive") == "/repo/vibelive"
+    assert ("provider", "github") in table.filters
+    assert ("repo_full_name", "billc8128/vibelive") in table.filters
 
 
 class _FakeRequest:
@@ -668,6 +861,81 @@ def test_fetch_pr_files_returns_patch_excerpt_not_content_excerpt(monkeypatch):
     assert "content_excerpt" not in result["files"][0]
 
 
+def test_fetch_pr_files_cache_key_includes_head_sha(monkeypatch):
+    from external import fetch
+
+    lookups: list[str] = []
+    writes: list[str] = []
+
+    async def fake_remote(*_args, **_kwargs):
+        return {"files": [], "count": 0}
+
+    monkeypatch.setattr(fetch, "_fetch_pr_files_remote", fake_remote)
+    monkeypatch.setattr(
+        fetch.queries,
+        "lookup_external_resource",
+        lambda provider, kind, key: lookups.append(key) or None,
+    )
+    monkeypatch.setattr(
+        fetch.queries,
+        "write_external_resource",
+        lambda provider, kind, key, content, ttl_seconds=86400: writes.append(key),
+    )
+
+    asyncio.run(fetch.fetch_pr_files("github", "billc8128/vibelive", 42, head_sha="abc123"))
+
+    assert lookups == ["billc8128/vibelive/42/abc123"]
+    assert writes == ["billc8128/vibelive/42/abc123"]
+
+
+def test_fetch_pr_files_remote_retries_transient_http_errors(monkeypatch):
+    from external import fetch
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    class FakeAsyncClient:
+        attempts = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise fetch.httpx.ConnectError("temporary network error")
+            return FakeResponse()
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(fetch.asyncio, "sleep", no_sleep)
+
+    result = asyncio.run(fetch._fetch_pr_files_remote("github", "billc8128/vibelive", 42))
+
+    assert result == {"files": [], "count": 0}
+    assert FakeAsyncClient.attempts == 2
+
+
+def test_investigator_fetch_pr_files_passes_head_sha_from_event(monkeypatch):
+    source = Path("bot/agent/investigator.py").read_text()
+
+    assert "head_sha=payload[\"pr\"].get(\"head_sha\")" in source
+
+
 def test_renderer_mcp_does_not_expose_fetch_pr_files_tool():
     renderer_source = Path("bot/agent/renderer.py").read_text()
 
@@ -692,6 +960,7 @@ def test_migration_0020_defines_external_sources_contracts():
     assert "excluded.payload_fingerprint is not null" in sql
     assert "enable row level security" in sql.lower()
     assert "grant all on public.external_webhook_deliveries to service_role" in sql
+    assert "ignored_reason text" not in sql
 
 
 def test_migration_0021_uses_repo_identifier_project_tokens():
@@ -703,6 +972,17 @@ def test_migration_0021_uses_repo_identifier_project_tokens():
     assert "set search_path = public, pg_temp" in sql
 
 
+def test_migration_0022_adds_delivery_ignore_audit_fields():
+    sql = Path("backend/supabase/migrations/0022_external_delivery_audit.sql").read_text()
+
+    assert "ignored_reason text" in sql
+    assert "ignored_at timestamptz" in sql
+    assert "webhook_deliveries_ignored_idx" in sql
+    assert "set repo_full_name = lower(repo_full_name)" in sql
+    assert "external_repos_repo_full_name_lower" in sql
+    assert "repo_full_name = lower(repo_full_name)" in sql
+
+
 def test_register_external_repos_script_exists_with_dry_run_and_apply_modes():
     script = Path("backend/scripts/register_external_repos.mjs").read_text()
 
@@ -712,3 +992,4 @@ def test_register_external_repos_script_exists_with_dry_run_and_apply_modes():
     assert "dry-run only" in script
     assert "/Users/a/Desktop/vibelive" not in script
     assert "EXTERNAL_REPOS_JSON is required" in script
+    assert "repoFullName = String(row.repo_full_name || row.repo || '').trim().toLowerCase()" in script

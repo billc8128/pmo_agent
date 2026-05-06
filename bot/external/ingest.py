@@ -104,10 +104,17 @@ async def ingest_external_event(
     else:
         return
     if normalized is None:
+        queries.mark_archive_ignored(archive_id, "unsupported_event_type")
+        return
+
+    actor = _as_dict(normalized.get("actor"))
+    if actor.get("is_bot"):
+        queries.mark_archive_ignored(archive_id, "bot_actor")
         return
 
     source_id = source_id_for_event(normalized)
     if source_id is None:
+        queries.mark_archive_ignored(archive_id, "missing_source_identity")
         return
 
     event_id = queries.upsert_event(

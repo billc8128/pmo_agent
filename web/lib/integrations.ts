@@ -19,6 +19,7 @@ export type ExternalDeliveryRow = {
   event_type: string | null;
   received_at: string;
   event_id: number | null;
+  ignored_reason?: string | null;
   raw_body?: unknown;
 };
 
@@ -45,6 +46,7 @@ export type PublicExternalDelivery = {
   eventType: string;
   receivedAt: string;
   linkedToEvent: boolean;
+  ignoredReason: string | null;
   repoFullName: string | null;
 };
 
@@ -58,7 +60,7 @@ export function validateExternalRepoInput(
   projectRoot: string;
 } {
   const provider = normalizeProvider(providerValue);
-  const repoFullName = repoValue.trim();
+  const repoFullName = repoValue.trim().toLowerCase();
   const projectRoot = projectRootValue.trim().replace(/\/+$/, '');
 
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFullName)) {
@@ -88,7 +90,7 @@ export function toPublicExternalRepo(row: ExternalRepoRow): PublicExternalRepo |
   return {
     id: row.id,
     provider,
-    repoFullName: row.repo_full_name,
+    repoFullName: row.repo_full_name.toLowerCase(),
     projectRoot: row.project_root,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -109,6 +111,9 @@ export function toPublicExternalDelivery(
     eventType: row.event_type,
     receivedAt: row.received_at,
     linkedToEvent: row.event_id != null,
+    ignoredReason: typeof row.ignored_reason === 'string' && row.ignored_reason.trim()
+      ? row.ignored_reason.trim()
+      : null,
     repoFullName: repoFullNameFromRawBody(row.raw_body),
   };
 }
@@ -131,7 +136,9 @@ function repoFullNameFromRawBody(rawBody: unknown): string | null {
   if (!repo || typeof repo !== 'object') return null;
   const fullName = (repo as { full_name?: unknown; fullName?: unknown }).full_name
     ?? (repo as { full_name?: unknown; fullName?: unknown }).fullName;
-  return typeof fullName === 'string' && fullName.trim() ? fullName.trim() : null;
+  return typeof fullName === 'string' && fullName.trim()
+    ? fullName.trim().toLowerCase()
+    : null;
 }
 
 function normalizeProfile(

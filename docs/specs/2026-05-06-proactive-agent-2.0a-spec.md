@@ -140,7 +140,7 @@ same numeric id with different logins.
 create table public.external_repos (
     id              uuid primary key default gen_random_uuid(),
     provider        text not null check (provider in ('github', 'gitea')),
-    repo_full_name  text not null,    -- "billc8128/vibelive"
+    repo_full_name  text not null,    -- lowercase "billc8128/vibelive"
     project_root    text not null,    -- admin/display project key;
                                       -- NOT copied into webhook events
     created_by      uuid references public.profiles(id) on delete set null,
@@ -153,10 +153,13 @@ create index repos_project_root_idx
     on public.external_repos (project_root);
 ```
 
-A repo appears once in this registry. `project_root` remains an
-admin/display field for grouping in the UI and scripts; webhook
-events derive their canonical project identity from the repo
-itself (`{provider}:{repo_full_name}`), not from this column.
+A repo appears once in this registry. `repo_full_name` is stored
+lowercase by the UI, admin script, Python helpers, and a database
+CHECK constraint; webhook payloads are lowercased the same way.
+`project_root` remains an admin/display field for grouping in the
+UI and scripts; webhook events derive their canonical project
+identity from the repo itself (`{provider}:{repo_full_name}`),
+not from this column.
 
 ### 3.3 `events` schema unchanged, new source values
 
@@ -188,6 +191,12 @@ This preserves the events table contract: one row per external
 resource/update identity. A pull request opened, synchronized,
 and merged updates the same `events` row instead of creating one
 row per webhook delivery.
+
+If a supported webhook payload lacks the resource identity needed
+to build this `source_id` (PR number, push SHA, release tag, or
+comment id), ingest keeps the archive row and marks it
+`ignored_reason='missing_source_identity'`; it must not silently
+drop the delivery after archive.
 
 **Idempotency contract** (CRITICAL — see plan §3.4 for SQL):
 GitHub and Gitea routinely re-deliver webhooks on receiver
@@ -255,6 +264,8 @@ create table public.external_webhook_deliveries (
     raw_body     jsonb not null,
     raw_headers  jsonb,                     -- minus auth/signing
     event_id     bigint references public.events(id) on delete set null,
+    ignored_reason text,
+    ignored_at   timestamptz,
     constraint webhook_delivery_unique unique (provider, delivery_id)
 );
 
@@ -264,6 +275,10 @@ create index webhook_deliveries_event_idx
 
 create index webhook_deliveries_received_at_idx
     on public.external_webhook_deliveries (received_at desc);
+
+create index webhook_deliveries_ignored_idx
+    on public.external_webhook_deliveries (ignored_at desc)
+    where ignored_reason is not null;
 ```
 
 RLS: service-role only — no policies needed since we use
@@ -277,30 +292,30 @@ This table is NEVER read by the LLM agents. The bot's read tools
 do not expose it. Operators inspect it via direct SQL when
 something looks weird.
 
-**Idempotent archive contract**: `archive_external_delivery` is
-upsert-shaped, NOT a plain INSERT. GitHub/Gitea redelivery
-arrives with the same `(provider, delivery_id)` repeatedly; a
+**Idempotent archive contract**: `archive_external_delivery`
+preserves the first raw body for a `(provider, delivery_id)`.
+GitHub/Gitea redelivery arrives with the same key repeatedly; a
 plain INSERT would raise on the unique constraint and short-
-circuit ingest before `upsert_event` ever runs. The helper:
+circuit ingest before `upsert_event` ever runs, while a normal
+upsert would overwrite immutable evidence. The helper uses
+`ON CONFLICT DO NOTHING` / Supabase `ignore_duplicates=True`,
+then selects the existing row id when the insert was skipped:
 
 ```sql
 insert into external_webhook_deliveries (
     provider, delivery_id, event_type,
     raw_body, raw_headers
 ) values (...)
-on conflict (provider, delivery_id) do update
-    set raw_body = excluded.raw_body,
-        raw_headers = excluded.raw_headers,
-        received_at = now()
+on conflict (provider, delivery_id) do nothing
 returning id;
 ```
 
-The redelivery overwrites raw_body / raw_headers (they may
-differ between deliveries — GitHub regenerates timestamps and
-sometimes signs a slightly different payload). The
-`event_id` column stays untouched on conflict because
-ingest's step 4 (`link_archive_to_event`) writes it after
-`upsert_event` returns.
+The redelivery does not overwrite `raw_body` / `raw_headers`.
+The `event_id` column is linked later by
+`link_archive_to_event`, and ignored archive-only deliveries are
+marked by `mark_archive_ignored(archive_id, reason)` with safe
+reason values such as `unsupported_event_type`, `bot_actor`, and
+`missing_source_identity`.
 
 `link_archive_to_event(archive_id, event_id)` is a thin
 `UPDATE external_webhook_deliveries SET event_id = $event_id
@@ -464,11 +479,15 @@ We deliberately **don't** ingest `pull_request_review`,
 `check_run`, `workflow_run`, `deployment_status`, etc. in 2.0a.
 For ignored event types, we still store the raw delivery in
 `external_webhook_deliveries` for forensic value, but **no row
-is written to `events`** — they don't enter the investigation
-pipeline at all. Adding a typed shape for one of these is a
-small follow-up if usage data shows demand. The investigator
-does NOT have a "fall back to raw" path, by design: raw bodies
-never reach LLM prompts.
+is written to `events`**. The archive row is marked with
+`ignored_reason='unsupported_event_type'` so operators can tell
+the difference between "accepted but intentionally ignored" and
+"accepted but failed to normalise". Bot-authored deliveries are
+also archived-only with `ignored_reason='bot_actor'`. These
+events don't enter the investigation pipeline at all. Adding a
+typed shape for one of these is a small follow-up if usage data
+shows demand. The investigator does NOT have a "fall back to raw"
+path, by design: raw bodies never reach LLM prompts.
 
 ### 4.4 What `events.occurred_at` is set to
 
@@ -547,13 +566,15 @@ normal PMO product permissions.
   They stay in the bot deployment environment.
 - Raw webhook payloads stay service-only in
   `external_webhook_deliveries`; the UI exposes only provider,
-  event type, repo full name, delivery time, and whether an
-  `events` row was created.
+  event type, repo full name, delivery time, whether an `events`
+  row was created, and the safe ignored reason when a delivery was
+  archived-only.
 
 The setup flow is:
 
 1. Open `/integrations`.
 2. Add repo mapping: provider + `owner/repo` + `project_root`.
+   The UI stores `owner/repo` lowercase.
 3. Copy the generated `/webhooks/github` or `/webhooks/gitea`
    endpoint into the provider's repository webhook settings.
 4. Select supported events: pull requests, pushes, releases,
@@ -571,8 +592,11 @@ above.
 
 2.0a keeps identity rows service-role/admin-managed. There is no
 `link_external_identity` chat tool in the agent, because a user
-typing "my GitHub is X" is not proof of ownership. A self-serve
-OAuth/challenge flow can be added later.
+typing "my GitHub is X" is not proof of ownership. The onboarding
+alternative is: connect repos through `/integrations`, then add
+`external_identities` via service-role/admin tooling only when
+actor attribution is needed. A self-serve OAuth/challenge flow
+can be added later.
 
 ---
 
@@ -607,7 +631,11 @@ Implementation:
 - Hit the external GitHub / Gitea API (auth via
   `GITHUB_API_TOKEN` env var, optional Gitea token)
 - Cache results in a new `external_resource_cache` table for 24h
-  to avoid hammering external APIs
+  to avoid hammering external APIs. The cache key includes the PR
+  head SHA when present (`repo/pr_number/head_sha`) so force-push
+  updates do not reuse stale file lists.
+- Retry transient HTTP/network failures with bounded backoff;
+  permanent 4xx responses fail fast.
 
 This tool is added only to the investigator's tool subset. The
 renderer deliberately does not get it; renderer must turn the
@@ -638,6 +666,9 @@ create index resource_cache_expires_idx
 Lookup: `(provider, resource_kind, resource_key)` cache miss →
 fetch from external → write cache → return. Hit → return cached.
 Expired (`expires_at < now()`) → treated as miss.
+`fetch_pr_files` uses `resource_key=repo/pr_number/head_sha` when
+the webhook payload includes `payload.pr.head_sha`, otherwise
+falls back to `repo/pr_number`.
 
 A daily reaper (or `delete from external_resource_cache where
 expires_at < now() - interval '7 days'`) keeps the table small.
@@ -780,6 +811,15 @@ Per-day estimate for a small team:
 Decider call growth proportional to event growth. Investigator
 call growth lower — most webhook events go to the same
 investigation_job per subscription per aggregation window.
+
+Known 2.0a cost limit: there is no separate subject-index
+fast-skip for broad subscriptions like "all my PRs". The
+gatekeeper remains the first semantic filter. Stable
+`source_id` coalesces repeated updates for the same PR into one
+events row, but changed PR payloads still bump `payload_version`
+and can re-enter the gatekeeper. Monitor gatekeeper call volume
+by source/repo after rollout; if webhook volume dominates, 2.0b/c
+should add subscription subject indexing or per-repo rate limits.
 
 Investigator enrichment: each `fetch_pr_files` call is a single
 external API hit + 24h cache. At <5 PRs/day, this is a few

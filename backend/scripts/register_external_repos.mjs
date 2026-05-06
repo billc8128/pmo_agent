@@ -45,7 +45,7 @@ if (dryRun) {
 
 function normalizeRepo(row) {
   const provider = String(row.provider || '').trim().toLowerCase();
-  const repoFullName = String(row.repo_full_name || row.repo || '').trim();
+  const repoFullName = String(row.repo_full_name || row.repo || '').trim().toLowerCase();
   const projectRoot = String(row.project_root || '').trim().replace(/\/+$/, '');
   if (!['github', 'gitea'].includes(provider)) {
     throw new Error(`invalid provider: ${provider}`);

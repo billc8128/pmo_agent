@@ -47,11 +47,17 @@ Creates:
 - `external_repos` table per spec §3.2:
   - `id`, `provider`, `repo_full_name`, `project_root`,
     `created_by`, `created_at`, `updated_at`
+  - `repo_full_name` is canonical lowercase. Migration 0022
+    normalises existing rows and adds a DB CHECK so future
+    bypasses fail loudly.
   - constraint `repo_unique unique (provider, repo_full_name)`
   - index `repos_project_root_idx on (project_root)`
 - `external_webhook_deliveries` table per spec §3.5:
   - service-role-only raw archive of full webhook bodies
   - `(provider, delivery_id)` unique
+  - Migration 0022 adds `ignored_reason` / `ignored_at` plus an
+    ignored-delivery index so archive-only deliveries are
+    operationally visible.
   - 30-day retention (cleanup outside the migration)
 - `external_resource_cache` table per spec §6.2 for fetched
   PR diffs and similar.
@@ -149,7 +155,9 @@ Identity:
 Repos:
 - `register_external_repo(provider, repo_full_name,
   project_root, created_by=None) -> dict` — for admin script /
-  bootstrap.
+  bootstrap. Lowercases `repo_full_name` before write.
+- `lookup_project_root_for_repo(provider, repo_full_name)
+  -> str | None` — lowercases the lookup key.
 - `external_repos_for_project_root(project_root) -> list[dict]`
   — reverse lookup for renderer (e.g. "what repos are in this
   project's universe").
@@ -170,6 +178,10 @@ External ingest:
 - `link_archive_to_event(archive_id, event_id) -> None` — sets
   `external_webhook_deliveries.event_id` only if it is currently
   NULL; never clobbers an existing successful link.
+- `mark_archive_ignored(archive_id, reason) -> None` — writes
+  safe audit reasons like `unsupported_event_type`, `bot_actor`,
+  or `missing_source_identity` for deliveries that were archived
+  but did not become events rows.
 - `upsert_event(source, source_id, user_id, project_root,
   occurred_at, payload) -> int` — computes
   `payload_fingerprint` for webhook events from a stable subset of
@@ -321,6 +333,8 @@ def normalize_github(event_type: str, raw: dict) -> dict | None:
 Each handler:
 - extracts the typed fields per spec §4.3
 - looks up actor profile_id via `lookup_profile_by_external_login`
+  and marks bot senders (`sender.type=Bot`, `login` ending in
+  `[bot]` / `-bot`) so ingest can archive-only those deliveries
 - sets `project_root` to the repo identifier
   `{provider}:{lower(repo_full_name)}`; it does not copy
   `external_repos.project_root` into events
@@ -429,7 +443,19 @@ async def ingest_external_event(
     else:
         return
     if normalized is None:
-        return  # event type ignored — raw still archived
+        queries.mark_archive_ignored(archive_id,
+                                     "unsupported_event_type")
+        return
+
+    if normalized.get("actor", {}).get("is_bot"):
+        queries.mark_archive_ignored(archive_id, "bot_actor")
+        return
+
+    source_id = source_id_for_event(normalized)
+    if source_id is None:
+        queries.mark_archive_ignored(archive_id,
+                                     "missing_source_identity")
+        return
 
     # 3. Upsert into events with the compact normalised shape.
     #    source_id is a resource-stable identity, not delivery_id:
@@ -446,7 +472,7 @@ async def ingest_external_event(
     #    contract in §2). Returns event_id.
     event_id = queries.upsert_event(
         source=provider,
-        source_id=source_id_for_event(normalized),
+        source_id=source_id,
         user_id=None,
         project_root=normalized.get("repo", {}).get("project_root"),
         occurred_at=normalized["occurred_at"],
@@ -578,8 +604,9 @@ flow exists.
 
 **Exit criterion**: admin/service helper can map
 `github:billc8128 → bcc.profile_id`; webhook normalisation sets
-`events.user_id` for actor `billc8128`; `build_meta_tools` does
-not expose `link_external_identity`.
+`payload.actor.profile_id` for actor `billc8128` while
+`events.user_id` remains NULL for webhook events;
+`build_meta_tools` does not expose `link_external_identity`.
 
 ---
 
@@ -615,9 +642,12 @@ opening SQL.
   from `BOT_WEBHOOK_BASE_URL` / `NEXT_PUBLIC_BOT_WEBHOOK_BASE_URL`.
 - Raw webhook payloads are never exposed; recent deliveries only
   show provider, event type, repo full name, received_at, and
-  whether an `events` row was created.
+  whether an `events` row was created. Archive-only deliveries
+  may show safe ignored reasons such as `bot_actor`.
 - Optional `external_identities` remains an actor-attribution
   feature for "my PRs" semantics, not the source-access flow.
+- Repo full names entered in the UI are lowercased before write
+  to match webhook normalisation.
 
 **Exit criterion**:
 - `/integrations` renders GitHub and Gitea provider blocks.
@@ -642,9 +672,13 @@ bulk updates.
 # bot/external/fetch.py
 async def fetch_pr_files(provider: str, repo_full_name: str,
                           pr_number: int,
-                          paths_filter: list[str] | None = None) -> dict:
+                          paths_filter: list[str] | None = None,
+                          head_sha: str | None = None) -> dict:
     """Returns up to 30 files with paths + first 200 chars of patch_excerpt."""
-    cache_key = f"{repo_full_name}/{pr_number}"
+    cache_key = (
+        f"{repo_full_name}/{pr_number}/{head_sha}"
+        if head_sha else f"{repo_full_name}/{pr_number}"
+    )
     cached = queries.lookup_external_resource(
         provider, "pr_files", cache_key
     )
@@ -672,7 +706,10 @@ async def fetch_pr_files(provider: str, repo_full_name: str,
 30 files. Each file includes path plus `patch_excerpt` from the
 provider's PR files API. It does not fetch full file blobs, so
 the investigator must not describe the result as complete file
-contents.
+contents. Remote calls retry transient network errors and 5xx
+responses with bounded backoff; 4xx responses fail fast. The
+cache key includes `payload.pr.head_sha` when present, so a PR
+force-push does not reuse an old file list.
 
 Add the tool to `bot/agent/investigator.py`'s tool subset:
 
@@ -698,6 +735,7 @@ async def fetch_pr_files_tool(args: dict) -> dict:
         repo_full_name=payload["repo"]["full_name"],
         pr_number=payload["pr"]["number"],
         paths_filter=args.get("paths_filter"),
+        head_sha=payload["pr"].get("head_sha"),
     ))
 ```
 
@@ -717,6 +755,7 @@ notify/suppress decision.
 - Call `fetch_pr_files` with the event_id → returns file list with
   `patch_excerpt`, not `content_excerpt`
 - Repeat call → second call hits cache (no external API call)
+- Same PR number with a different head_sha → different cache key
 - Call with paths_filter=['spec.md'] → only spec.md returned
 
 ---
@@ -847,11 +886,23 @@ repo bootstrap. That's the irreducible 2.0a.
 4. **Webhook flood**. A noisy repo pushing many events could
    blow past 1.0c's gatekeeper budget. Monitor decision_logs
    row growth post-deploy; if a single repo's events dominate,
-   add a per-source rate limiter.
+   add a per-source rate limiter. 2.0a intentionally does not
+   add a subject-index fast-skip layer; broad rules such as
+   "all my PRs" still rely on the gatekeeper as first semantic
+   filter.
 
 5. **Repo mapping drift**. `external_repos.project_root` is no
    longer copied into webhook events, so a bad display/admin
    mapping does not corrupt lockout. Repo rename drift still
    matters for the `/integrations` registry and provider webhook
    setup; document the bootstrap script + run the mapping
-   verification query (see plan §5).
+   verification query (see plan §5). `repo_full_name` is
+   lowercased at every entrypoint and enforced by DB CHECK to
+   avoid case-only mapping misses.
+
+6. **Repeated PR updates**. Stable `source_id` means one PR maps
+   to one events row, but changed payloads still bump
+   `payload_version` and can re-enter the gatekeeper. If this is
+   noisy in production, aggregate by PR/job window before
+   gatekeeper or add subscription subject indexing in a later
+   phase.

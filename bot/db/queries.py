@@ -403,7 +403,7 @@ def lookup_project_root_for_repo(provider: str, repo_full_name: str) -> str | No
         .table("external_repos")
         .select("project_root")
         .eq("provider", provider.strip().lower())
-        .eq("repo_full_name", repo_full_name.strip())
+        .eq("repo_full_name", repo_full_name.strip().lower())
         .maybe_single()
         .execute()
         .data
@@ -419,7 +419,7 @@ def register_external_repo(
 ) -> dict[str, Any]:
     row = {
         "provider": provider.strip().lower(),
-        "repo_full_name": repo_full_name.strip(),
+        "repo_full_name": repo_full_name.strip().lower(),
         "project_root": project_root,
         "created_by": created_by,
         "updated_at": _utc_now_iso(),
@@ -1288,6 +1288,17 @@ def link_archive_to_event(archive_id: int, event_id: int) -> None:
         sb_admin()
         .table("external_webhook_deliveries")
         .update({"event_id": event_id})
+        .eq("id", archive_id)
+        .is_("event_id", "null")
+        .execute()
+    )
+
+
+def mark_archive_ignored(archive_id: int, reason: str) -> None:
+    (
+        sb_admin()
+        .table("external_webhook_deliveries")
+        .update({"ignored_reason": reason, "ignored_at": _utc_now_iso()})
         .eq("id", archive_id)
         .is_("event_id", "null")
         .execute()

@@ -86,7 +86,7 @@ export default async function IntegrationsPage() {
         .order('repo_full_name'),
       admin
         .from('external_webhook_deliveries')
-        .select('provider, delivery_id, event_type, received_at, event_id, raw_body')
+        .select('provider, delivery_id, event_type, received_at, event_id, ignored_reason, raw_body')
         .order('received_at', { ascending: false })
         .limit(20),
     ]);

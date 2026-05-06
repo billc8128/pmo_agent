@@ -173,6 +173,7 @@ def _investigator_mcp(ctx: RequestContext):
                     payload["repo"]["full_name"],
                     int(payload["pr"]["number"]),
                     paths_filter=args.get("paths_filter") or None,
+                    head_sha=payload["pr"].get("head_sha"),
                 )
             )
         except Exception as e:

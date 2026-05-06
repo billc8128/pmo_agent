@@ -209,7 +209,11 @@ export function IntegrationsPanel({
                 <div className="text-left text-xs text-zinc-500 dark:text-zinc-500 sm:text-right">
                   <p>{formatDate(delivery.receivedAt)}</p>
                   <p className={delivery.linkedToEvent ? 'text-emerald-700 dark:text-emerald-300' : 'text-zinc-400 dark:text-zinc-500'}>
-                    {delivery.linkedToEvent ? 'event created' : 'archived only'}
+                    {delivery.linkedToEvent
+                      ? 'event created'
+                      : delivery.ignoredReason
+                        ? `ignored: ${delivery.ignoredReason}`
+                        : 'archived only'}
                   </p>
                 </div>
               </li>

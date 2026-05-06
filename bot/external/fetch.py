@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -27,7 +28,7 @@ async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: 
     url = f"{base}/repos/{repo_full_name}/pulls/{pr_number}/files"
     headers = _auth_headers(provider)
     async with httpx.AsyncClient(timeout=20) as client:
-        res = await client.get(url, headers=headers, params={"per_page": 30})
+        res = await _get_with_retries(client, url, headers=headers, params={"per_page": 30})
         res.raise_for_status()
         rows = res.json()
     files = []
@@ -46,13 +47,32 @@ async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: 
     return {"files": files, "count": len(files)}
 
 
+async def _get_with_retries(client: httpx.AsyncClient, url: str, **kwargs: Any) -> httpx.Response:
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            res = await client.get(url, **kwargs)
+            if int(getattr(res, "status_code", 200)) < 500:
+                return res
+            res.raise_for_status()
+        except httpx.HTTPError as e:
+            last_error = e
+            if attempt == 2:
+                raise
+            await asyncio.sleep(0.5 * (2 ** attempt))
+    if last_error:
+        raise last_error
+    raise RuntimeError("unreachable retry state")
+
+
 async def fetch_pr_files(
     provider: str,
     repo_full_name: str,
     pr_number: int,
     paths_filter: list[str] | None = None,
+    head_sha: str | None = None,
 ) -> dict[str, Any]:
-    cache_key = f"{repo_full_name}/{pr_number}"
+    cache_key = f"{repo_full_name}/{pr_number}/{head_sha}" if head_sha else f"{repo_full_name}/{pr_number}"
     cached = queries.lookup_external_resource(provider, "pr_files", cache_key)
     if cached:
         result = cached["content"]

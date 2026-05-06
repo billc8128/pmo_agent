@@ -16,6 +16,10 @@ def _login(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _is_bot_login(login: str) -> bool:
+    return login.endswith("[bot]") or login.endswith("-bot")
+
+
 def _repo_identifier(provider: str, full_name: str) -> str | None:
     repo = full_name.strip().lower()
     return f"{provider}:{repo}" if repo else None
@@ -27,7 +31,13 @@ def _actor(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
     external_id = sender.get("id")
     external_id_str = str(external_id) if external_id is not None else None
     profile_id = queries.lookup_profile_by_external_login(provider, login, external_id=external_id_str) if login else None
-    return {"login": login, "id": external_id_str, "profile_id": profile_id}
+    sender_type = str(sender.get("type") or sender.get("login_type") or "").strip().lower()
+    return {
+        "login": login,
+        "id": external_id_str,
+        "profile_id": profile_id,
+        "is_bot": sender_type == "bot" or _is_bot_login(login),
+    }
 
 
 def _repo(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -83,6 +93,7 @@ def _normalize_pull_request(provider: str, raw: dict[str, Any]) -> dict[str, Any
             "diff_url": pr.get("diff_url") or "",
             "base_branch": (_as_dict(pr.get("base")).get("ref") or ""),
             "head_branch": (_as_dict(pr.get("head")).get("ref") or ""),
+            "head_sha": (_as_dict(pr.get("head")).get("sha") or ""),
             "merged": merged,
             "merged_at": pr.get("merged_at"),
             "files_changed_count": pr.get("changed_files") or pr.get("files_changed"),
