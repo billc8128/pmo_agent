@@ -78,9 +78,12 @@ Creates:
     OR opened_at < now() - make_interval(mins => p_window_minutes))`.
     Flips to status='investigating', stamps claim_id + claimed_at.
     Returns rows joined with subscription jsonb and an event_payloads
-    jsonb array (each element is `{id, payload, payload_version,
-    occurred_at, project_root}` for one seed event, in
-    seed_event_ids order). Python wrapper passes
+    jsonb array (each element is `{id, user_id, payload,
+    payload_version, occurred_at, project_root}` for one seed
+    event, in seed_event_ids order). `user_id` is the events table's
+    top-level column (NOT inside payload jsonb), needed by the
+    investigator to populate brief.subject_user_ids without an
+    extra query. Python wrapper passes
     `settings.aggregation_window_minutes`.
   - `create_notification_for_investigation_job(...)` — single
     atomic RPC that writes the notification row AND flips the job
@@ -155,22 +158,30 @@ insert into subscriptions (...) values (...) returning id;  -- s
    '{"notify": false, "reason": "test"}')` → 1 row affected,
    J1.status='suppressed'.
 8. Call same with wrong claim_id → 0 rows, J1 unchanged.
-9. Call `create_notification_for_investigation_job(J2, claim_id,
-   e3, s, version, brief, kind, target)` while J2 is
-   'investigating' → returns notif_id; J2 flipped to 'notified',
-   notifications row exists with `investigation_job_id=J2`,
-   `payload_snapshot=brief`.
-10. Call same after J2 is already notified → returns null (lease
-    re-check fails).
-11. **Concurrency stress** (skip if hard to set up in single
+9. Make J2 eligible-and-claimed for the create_notification step:
+   ```sql
+   update investigation_jobs
+      set opened_at = now() - interval '31 min'
+    where id = J2;
+   ```
+   then call `claim_investigatable_jobs(claim_id_2, 5)` → returns
+   J2; status='investigating'; capture this as `j2_claim`.
+10. Call `create_notification_for_investigation_job(J2, j2_claim,
+    e3, s, version, brief, kind, target, null, null)` while J2 is
+    'investigating' → returns notif_id; J2 flipped to 'notified',
+    notifications row exists with `investigation_job_id=J2`,
+    `payload_snapshot=brief`, `decided_payload_version=version`.
+11. Call same after J2 is already notified → returns null (lease
+    re-check fails because status is no longer 'investigating').
+12. **Concurrency stress** (skip if hard to set up in single
     txn): two parallel transactions both call `append_to_or_open_…
     (s, eX, ...)` for a fresh subscription with no open jobs.
     Expect exactly ONE new job created (advisory lock serialises),
     second call appends to the first.
-12. ACL: with anon key, call any of these RPCs → permission
+13. ACL: with anon key, call any of these RPCs → permission
     denied.
 
-**Exit criterion**: all 12 smoke tests pass; ROLLBACK leaves DB
+**Exit criterion**: all 13 smoke tests pass; ROLLBACK leaves DB
 clean.
 
 ---
@@ -218,8 +229,12 @@ New dataclass `InvestigatableJobBundle`:
 class InvestigatableJobBundle:
     job: InvestigationJob
     subscription: Subscription
-    events: list[dict]  # event payload dicts with id+payload+
-                        # payload_version+occurred_at+project_root
+    events: list[dict]  # each = {id, user_id, payload,
+                        # payload_version, occurred_at,
+                        # project_root}. user_id is required so
+                        # the investigator's brief can populate
+                        # subject_user_ids and renderer can
+                        # @-mention via resolve_subject_mention.
     recent_notifications_for_subscription: list[dict]
 ```
 
@@ -233,6 +248,167 @@ subscription recently".
 **Exit criterion**: smoke from Python REPL — call `append_to_or_…`
 twice with same sub/different events, then `claim_investigatable_…`,
 verify shapes match dataclasses.
+
+---
+
+## 2.5 Project-name lockout module (~45 min)
+
+This is the chunk that delivers spec §4.1.1's deterministic
+project lockout — the central anti-misfire mechanism for 1.0c.
+
+**Files**:
+
+- `bot/agent/lockout.py` (new). Exports:
+  - `known_project_tokens() -> tuple[set[str], str]` — 60s in-memory
+    TTL cache of `(K, k_hash)`. Backed by
+    `queries.distinct_project_roots()`.
+  - `_LONG_TOKEN_MIN_LEN = 4` — long/short threshold.
+  - `_short_token_in_project_context(token, desc_lower) -> bool` —
+    regex-based explicit-context detector (spec §4.1.1).
+  - `matched_projects_for(description, K) -> list[str]` —
+    long tokens via `\bword\b`, short tokens via context regex.
+  - `is_project_mismatch(event, sub) -> bool` —
+    looks up cached metadata, recomputes on hash mismatch via
+    `queries.write_subscription_metadata(sub.id, {...})`, returns
+    True iff M_sub non-empty AND
+    `last_segment(event.project_root).lower() ∉ M_sub`.
+
+- `bot/db/queries.py` add helpers:
+  - `distinct_project_roots() -> list[str]` — `select distinct
+    project_root from events where project_root is not null`.
+  - `write_subscription_metadata(subscription_id, metadata: dict)`
+    — small UPDATE that merges into `subscriptions.metadata` jsonb.
+    Used by both lockout's lazy recompute and add_subscription's
+    synchronous initial write.
+
+- `bot/agent/tools_meta.py::add_subscription` — after the row is
+  inserted via `queries.add_subscription(...)`, immediately call:
+  ```python
+  K, k_hash = lockout.known_project_tokens()
+  matched = lockout.matched_projects_for(description, K)
+  queries.write_subscription_metadata(sub_id, {
+      "matched_projects": matched,
+      "project_tokens_hash": k_hash,
+      "indexed_at": now_iso(),
+  })
+  ```
+  Same call from the web rules panel's `createNotificationRule`
+  server action — see §2.5.1 below.
+
+- `web/app/notifications/rules/actions.ts::createNotificationRule`
+  — after the insert, the server action must populate
+  `metadata.matched_projects` synchronously. Two implementation
+  options:
+  1. Add a server-side helper `lib/lockout.ts` that mirrors
+     `bot/agent/lockout.py`'s logic in TypeScript (long/short
+     boundary rules + the regex set). Run it inline.
+  2. Add a service-role-only RPC `index_subscription_metadata(
+     p_subscription_id)` that does the same work in PL/pgSQL:
+     reads description, reads `select distinct project_root from
+     events`, writes metadata. Web action calls the RPC.
+  
+  **Pick option 2** for 1.0c — keeps the matching logic in one
+  place (SQL) and avoids JS/Python drift. See §2.5.1.
+
+### 2.5.1 `index_subscription_metadata` SQL function
+
+Add to migration 0017:
+
+```sql
+create function public.index_subscription_metadata(
+    p_subscription_id uuid
+) returns void
+language plpgsql
+security definer
+as $$
+declare
+    sub record;
+    desc_lower text;
+    k_array text[];
+    k_hash text;
+    matched text[];
+    tok text;
+begin
+    select id, description into sub
+      from public.subscriptions where id = p_subscription_id;
+    if not found then return; end if;
+    desc_lower := lower(coalesce(sub.description, ''));
+
+    -- K = distinct last-segment of events.project_root, lowercased.
+    select coalesce(array_agg(distinct lower(
+               regexp_replace(project_root, '^.*/', '')
+           )), array[]::text[])
+      into k_array
+      from public.events
+     where project_root is not null and project_root <> '';
+
+    -- k_hash = first 16 chars of sha256(sorted(K) joined by '|')
+    k_hash := substr(
+        encode(digest(array_to_string(
+            (select array_agg(t order by t) from unnest(k_array) t),
+            '|'
+        ), 'sha256'), 'hex'),
+        1, 16
+    );
+
+    -- Match: long tokens via word boundary, short tokens via
+    -- explicit project-context patterns (project X / 项目 X / `X` /
+    -- /X/ / "X").
+    matched := array[]::text[];
+    foreach tok in array k_array loop
+        if length(tok) >= 4 then
+            if desc_lower ~ ('\m' || tok || '\M') then
+                matched := matched || tok;
+            end if;
+        else
+            if desc_lower ~ ('\bproject[\s\-_:]*' || tok || '\b')
+               or desc_lower ~ ('项目[\s\-_:''`"]*' || tok || '($|[\s''`"])')
+               or desc_lower ~ ('`' || tok || '`')
+               or desc_lower ~ ('/' || tok || '(/|$|[^a-z0-9])')
+               or desc_lower ~ ('"' || tok || '"')
+            then
+                matched := matched || tok;
+            end if;
+        end if;
+    end loop;
+
+    update public.subscriptions
+       set metadata = coalesce(metadata, '{}'::jsonb) ||
+                      jsonb_build_object(
+                          'matched_projects', to_jsonb(
+                              (select array_agg(t order by t)
+                                 from unnest(matched) t)),
+                          'project_tokens_hash', k_hash,
+                          'indexed_at', now()::text
+                      )
+     where id = p_subscription_id;
+end $$;
+```
+
+ACL: revoke from public/anon/authenticated, grant to service_role.
+search_path pinned to `public, pg_temp`.
+
+The bot's `lockout.py` and web's server action both call
+`sb_admin().rpc("index_subscription_metadata", ...)` after every
+add_subscription. The bot also calls it on lazy recompute (cache
+miss / hash mismatch in `is_project_mismatch`).
+
+**Unit tests** (mirroring spec §7.1's regression list):
+- `test_long_token_word_boundary` — both Python `lockout.py` and
+  the SQL function via psql harness.
+- `test_short_token_requires_project_context` — likewise.
+- `test_short_token_does_not_misfire_on_unrelated_description` —
+  bcc / again / ai cases.
+- `test_index_subscription_metadata_idempotent` — calling the SQL
+  function twice yields the same metadata.
+- `test_index_subscription_metadata_no_events` — when events table
+  is empty, matched_projects=[], k_hash is the empty-set digest.
+
+**Exit criterion**: all 5 unit tests pass; one Python REPL trial
+inserting a vibelive event + a sub with description "vibelive 进展
+告诉我" + an unrelated sub "bcc 在干嘛" results in
+`subscriptions.metadata.matched_projects = ["vibelive"]` for the
+first AND `[]` for the second.
 
 ---
 
@@ -251,10 +427,19 @@ verify shapes match dataclasses.
     to decision_logs with `investigation_job_id` set.
   - On `investigate=false`: write decision_log only, no other state
     change.
-  - Hard preconditions BEFORE the LLM call:
-    - subscription enabled+not archived (already in 1.0a)
+  - Hard preconditions BEFORE the LLM call (each fast-skips the
+    pair if it fires; no LLM call, no investigation_jobs row):
+    - subscription enabled + not archived (already in 1.0a)
     - `event.ingested_at >= subscription.created_at` (1.0a forward
       semantics)
+    - **`lockout.is_project_mismatch(event, sub)` from §2.5**.
+      When True, write a decision_log row with sentinel
+      `model='deterministic_project_lockout'`,
+      `judge_output={"investigate": false, "reason":
+      "project_root_lockout"}`, `input_tokens=null,
+      output_tokens=null, latency_ms=0`, then `continue` to the
+      next pair. This is the chunk that delivers the wrong-project
+      regression fix; missing this is what made 1.0a misfire.
   - Remove all references to `upsert_notification_row` from the
     decider's call path.
 
@@ -364,13 +549,15 @@ async def process_once(limit: int = 5) -> int:
                 )
         except asyncio.CancelledError:
             raise
-        except DecisionParseError:
+        except DecisionParseError as e:
             # Track parse failures via investigation_jobs.error +
             # decision_logs entries. After 3 consecutive parse
             # failures across investigator runs of the same job,
             # mark the job suppressed with notify=false,
             # reason='investigator_parse_error' and settle.
-            queries.bump_investigation_parse_failure(bundle.job.id, claim_id)
+            queries.bump_investigation_parse_failure(
+                bundle.job.id, claim_id, str(e)[:500]
+            )
             failures = queries.investigation_parse_failure_count(bundle.job.id)
             if failures >= 3:
                 queries.mark_job_suppressed_if_claimed(
@@ -384,11 +571,40 @@ async def process_once(limit: int = 5) -> int:
                 queries.release_job_claim(bundle.job.id, claim_id)
         except TransientInvestigatorError:
             queries.release_job_claim(bundle.job.id, claim_id)
+        except asyncio.TimeoutError:
+            # 90s investigator timeout. Treated like a parse
+            # failure: bump attempt_count, retry until budget
+            # exhausted, then settle as suppressed/timeout. Don't
+            # mark_failed on first timeout — a slow LLM call
+            # shouldn't permanently terminate the job.
+            queries.bump_investigation_parse_failure(
+                bundle.job.id, claim_id, "investigator timeout (>90s)"
+            )
+            failures = queries.investigation_parse_failure_count(
+                bundle.job.id
+            )
+            if failures >= 3:
+                queries.mark_job_suppressed_if_claimed(
+                    bundle.job.id, claim_id,
+                    {"notify": False,
+                     "suppressed_by": "investigator_timeout",
+                     "reason": "investigator timed out 3 times"},
+                    input_tokens=None, output_tokens=None,
+                )
+            else:
+                queries.release_job_claim(bundle.job.id, claim_id)
         except Exception as e:
+            # True crash (network panic, etc.) — terminal.
             logger.exception("investigator crashed for job=%s", bundle.job.id)
             queries.mark_job_failed_if_claimed(bundle.job.id, claim_id, str(e))
     return len(bundles)
 ```
+
+Note: `attempt_count` is shared between parse failures and
+timeout failures. Both are "the investigator didn't complete
+successfully on this attempt"; either way 3 strikes settles the
+pair as suppressed. The `last_error` column distinguishes the
+specific cause for audit.
 
 `investigate(bundle)` is the LLM agent call. Same machinery as the
 renderer's one-shot agent (see `bot/agent/renderer.py` for pattern):
@@ -410,10 +626,12 @@ renderer's one-shot agent (see `bot/agent/renderer.py` for pattern):
 §3.1 create table, listed above in plan §1's column set) hold the
 budget state.
 
-`bump_investigation_parse_failure(job_id, claim_id)` is a small
-RPC that increments `attempt_count`, stores the latest parse
-error in `last_error` / `last_error_at`. Lease-checked (only fires
-if `claim_id = p_claim_id AND status = 'investigating'`).
+`bump_investigation_parse_failure(job_id, claim_id, error)` is a
+small RPC that increments `attempt_count`, stores the latest
+error message in `last_error` / `last_error_at`. Lease-checked
+(only fires if `claim_id = p_claim_id AND status =
+'investigating'`). The Python wrapper truncates `error` to 500
+chars before passing — full LLM output stays in decision_logs.
 `investigation_parse_failure_count(job_id)` is a plain read of
 `attempt_count`.
 

@@ -233,9 +233,24 @@ For each (event, candidate subscription) pair:
         cached in memory for 60s). This is the universe of real
         project names this deployment has actually seen.
      2. For each subscription, the set of "mentioned tokens" M_sub
-        = `K ∩ {tokens that case-insensitively appear in
-        subscription.description}`. Computed once and cached on
-        `subscriptions.metadata.matched_projects`.
+        = `K ∩ {tokens that the description names as a project}`.
+        "Names as a project" is NOT a naive substring match —
+        short tokens (≤3 chars like `c`, `go`, `ai`) would
+        otherwise misfire inside words like `bcc`, `again`,
+        `campaign`. The matching rules:
+
+        - **Long tokens (≥4 chars, e.g. `vibelive`, `oneship`,
+          `pmo_agent`, `feishu`)**: word-boundary match
+          (`\bvibelive\b`). Substring-inside-word doesn't hit.
+        - **Short tokens (≤3 chars)**: only match when in an
+          explicit project-context phrase: `project c`,
+          `project-c`, `项目 C`, `项目"C"`, `项目\`c\``, ``\`c\```
+          (backtick literal), `"c"` (quoted), or `/c/`/`/c`
+          (path segment). Pure occurrence of the letter inside
+          another word is NOT a match.
+
+        Implementation in `matched_projects_for(description, K)`
+        below. Cached on `subscriptions.metadata.matched_projects`.
 
      Lockout rule: if `M_sub` is non-empty AND
      `event.project_root.last_segment.lower() ∉ M_sub`, skip with
@@ -324,9 +339,53 @@ def known_project_tokens() -> tuple[set[str], str]:
     _cache_hash = sha256("|".join(sorted(_cache_K)).encode()).hexdigest()[:16]
     return _cache_K, _cache_hash
 
+_LONG_TOKEN_MIN_LEN = 4   # "vibelive" / "oneship" / "pmo_agent" / "feishu" all qualify
+
+# Explicit project-context patterns that anchor a short token to
+# something the user clearly meant as a project name. We're
+# deliberately conservative — a positive match here means we'll
+# enforce hard lockout, so false positives (matching when user
+# didn't mean a project) are worse than false negatives (missing
+# a match → just falls through to the LLM gatekeeper).
+def _short_token_in_project_context(token: str, desc_lower: str) -> bool:
+    # Each pattern requires the token to appear adjacent to an
+    # explicit "project" cue. \b is a word boundary in the regex
+    # sense (non-word ↔ word transition). We also accept Chinese
+    # 项目 X / 项目-X / 项目"X" / 项目`X`.
+    import re
+    t = re.escape(token)
+    patterns = [
+        rf"\bproject[\s\-_:]*{t}\b",         # "project c" / "project-c"
+        rf"项目[\s\-_:'`\"]*{t}(?:[\b\s'`\"]|$)",  # "项目 C" / "项目`c`"
+        rf"`{t}`",                            # backticked
+        rf"/{t}(?:/|\b|$)",                   # path-segment "/c/"
+        rf"\"{t}\"",                          # quoted
+    ]
+    return any(re.search(p, desc_lower) for p in patterns)
+
+
 def matched_projects_for(description: str, K: set[str]) -> list[str]:
+    """Returns the subset of K that the description "names" as a
+    project. Long tokens (≥4 chars) match by word boundary; short
+    tokens (≤3 chars, e.g. 'c', 'go', 'ai') only match when they
+    appear in an explicit project-context phrasing. This avoids
+    misfiring on e.g. 'bcc' containing 'c'.
+    """
+    import re
     desc_lower = description.lower()
-    return sorted(t for t in K if t in desc_lower)
+    out: list[str] = []
+    for t in K:
+        if len(t) >= _LONG_TOKEN_MIN_LEN:
+            # Word-boundary match — won't fire on substrings like
+            # 'vibelive' inside 'vibelivexyz' (none of which exist
+            # in real project_roots anyway, but be safe).
+            if re.search(rf"\b{re.escape(t)}\b", desc_lower):
+                out.append(t)
+        else:
+            # Short token: require explicit project-context phrasing.
+            if _short_token_in_project_context(t, desc_lower):
+                out.append(t)
+    return sorted(out)
 
 def is_project_mismatch(event, sub) -> bool:
     K, k_hash = known_project_tokens()
@@ -678,7 +737,11 @@ Cost: ~1-1.5k input + 50 output tokens. Same model as 1.0a judge
 输入：
 - subscription.description: 订阅的原始自然语言
 - subscription.created_at: 订阅创建时间（早于此的事件不要算证据）
-- seed_events: 触发这次调查的事件列表（已经 plausibly 相关）
+- seed_events: 触发这次调查的事件列表（已经 plausibly 相关）。
+  每条 event 都带 user_id（pmo_agent profile UUID），投资人写 brief
+  时要把当事人的 user_id 放进 subject_user_ids，渲染器才能 @ 到对应
+  飞书人。如果 user_id 为 null（事件主体未绑定），就不要加进
+  subject_user_ids，让渲染器降级为文字 @handle。
 - recent_notifications_for_this_subscription: 这条订阅最近发过的
   通知（避免短时间内重复发同主题）
 
@@ -821,7 +884,7 @@ defeats the test's purpose. The test goes in
 Supabase + the real ARK Coding Plan LLM, OR it's a manual check
 in the §8 deploy validation script.
 
-Two unit tests are still useful as a faster signal:
+Unit tests are still useful as a faster signal:
 - `test_lockout_fires_when_metadata_has_project` — given a
   subscription row with `metadata.matched_projects=["vibelive"]`
   and an event with `project_root='/Users/.../oneship'`, the
@@ -830,9 +893,28 @@ Two unit tests are still useful as a faster signal:
 - `test_lockout_does_not_fire_when_metadata_empty` — given
   `metadata.matched_projects=[]`, precondition function lets the
   event through to the gatekeeper (which is then mocked).
+- `test_long_token_word_boundary` — K={"vibelive"}; descriptions
+  "vibelive 进展告诉我", "/Users/.../vibelive 项目", "I built
+  vibelive" all match; descriptions "vibelivexyz progress" and
+  "anti-vibelivectomy" do NOT match (would require `\b` violation).
+- `test_short_token_requires_project_context` —
+  K={"c", "go", "ai"};
+  - "项目 C 不要发了" → matched_projects=["c"]
+  - "project c notes" → matched_projects=["c"]
+  - "/Users/.../c 改了 README" → matched_projects=["c"] (path)
+  - "`go` rewrite" → matched_projects=["go"] (backtick)
+  - "bcc 在做啥" → matched_projects=[] (no project context for "c")
+  - "again 测试" → matched_projects=[] (no project context for "go")
+  - "ai 助手" → matched_projects=[] (no project context for "ai")
+- `test_short_token_does_not_misfire_on_unrelated_description` —
+  K={"c"}; subscription "bcc 在做啥" → matched_projects=[]; an
+  event with `project_root='/Users/.../oneship'` arrives → lockout
+  does NOT fire (M_sub empty); event passes to LLM gatekeeper.
 
-These unit tests prove the code path; the e2e test proves the
-indexing actually populates `matched_projects` correctly.
+These unit tests prove the code path AND specifically guard
+against the bcc/c, again/go, ai-misfire regressions; the e2e test
+proves the indexing actually populates `matched_projects`
+correctly against real data.
 
 ### 7.2 Narrative subscription positive path
 
