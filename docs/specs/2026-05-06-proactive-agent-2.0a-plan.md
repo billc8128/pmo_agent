@@ -158,6 +158,24 @@ Resource cache:
 - `write_external_resource(provider, resource_kind,
   resource_key, content, ttl_seconds=86400) -> None`.
 
+External ingest:
+- `archive_external_delivery(provider, delivery_id, event_type,
+  raw_body, raw_headers) -> int` — idempotent archive helper.
+  Uses `INSERT ... ON CONFLICT (provider, delivery_id) DO UPDATE`
+  and returns the archive row id; duplicate redeliveries must not
+  raise before `upsert_event` can run.
+- `link_archive_to_event(archive_id, event_id) -> None` — sets
+  `external_webhook_deliveries.event_id` only if it is currently
+  NULL; never clobbers an existing successful link.
+- `upsert_event(source, source_id, user_id, project_root,
+  occurred_at, payload) -> int` — computes
+  `payload_fingerprint` for webhook events from a stable subset of
+  the normalised payload, then runs the idempotent
+  `(source, source_id)` upsert from §3.4. Same fingerprint is a
+  no-op; changed fingerprint bumps `payload_version`.
+- `get_event(event_id) -> dict | None` — used by `fetch_pr_files`
+  to verify the event source/type and extract PR metadata.
+
 **Dataclasses**: add `ExternalIdentity`, `ExternalRepo` mirroring
 the table columns. Both are simple `@dataclass` with
 `_dataclass_from_row`.
@@ -376,7 +394,11 @@ async def ingest_external_event(
     #    forensic trail for events we ignore today and might
     #    decide to ingest later. Per spec §3.5, this table is
     #    service-role-only; LLMs never read it.
-    queries.archive_external_delivery(
+    # archive_external_delivery is upsert-shaped; same delivery
+    # redelivery returns the existing row id without raising on
+    # the (provider, delivery_id) unique constraint. Returns the
+    # archive row's id so we can write event_id back at the end.
+    archive_id = queries.archive_external_delivery(
         provider=provider,
         delivery_id=delivery_id,
         event_type=event_type,
@@ -396,8 +418,10 @@ async def ingest_external_event(
         return  # event type ignored — raw still archived
 
     # 3. Upsert into events with the compact normalised shape.
-    #    Idempotency via payload_fingerprint — see below.
-    queries.upsert_event(
+    #    Idempotency via payload_fingerprint (computed inside
+    #    upsert_event from a stable subset of the normalised
+    #    payload — see helper contract in §2). Returns event_id.
+    event_id = queries.upsert_event(
         source=provider,
         source_id=f"{event_type}:{delivery_id}",
         user_id=normalized.get("actor", {}).get("profile_id"),
@@ -405,6 +429,11 @@ async def ingest_external_event(
         occurred_at=normalized["occurred_at"],
         payload=normalized,
     )
+
+    # 4. Cross-link the archive row to the event row so audit
+    #    queries can hop "raw → normalized → notification".
+    if event_id is not None:
+        queries.link_archive_to_event(archive_id, event_id)
 
 
 def _safe_headers(headers: dict) -> dict:
@@ -460,13 +489,14 @@ on conflict (source, source_id) do update
 returning id;
 ```
 
-`payload_fingerprint` is a new column on `events` (added in plan
-§1's migration if not already present from 1.0c). For webhook
+`payload_fingerprint` is a new nullable column on `events` (added
+in plan §1's migration if not already present). For webhook
 events: `md5(stable_json(normalised_payload_minus_volatile_fields))`
 where volatile fields are timestamps the source generates per
-delivery. For turn events: same fingerprint is computed in the
-trigger from §1.0c's existing fingerprint logic, mapped to this
-column.
+delivery. For turn events: leave this column NULL in 2.0a. Turn
+events continue through the existing `on_turn_to_event` trigger
+and its `payload_version` semantics; webhook redelivery is the
+only path that needs the persisted fingerprint guard.
 
 **Why this matters for re-delivery**: GitHub's webhook delivery
 retries are common (any 5xx from our side triggers redelivery).

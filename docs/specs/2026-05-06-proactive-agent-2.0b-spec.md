@@ -70,8 +70,10 @@ Out of scope (explicitly):
 - Org/team-level routing — separate problem (future 2.x or 3.0)
 - Rule-discovery permissions ("who can SEE this rule") — for now
   keep all chat-owned rules visible to all chat members
-- OAuth-style consent flows for "let X DM Y" — using mutual
-  binding + shared chat as proof of relationship instead
+- OAuth-style consent flows for "let X DM Y" — use
+  bot-mediated explicit consent for user-owned cross-user rules,
+  and chat-owned anchor membership only when the rule is created
+  inside that specific chat
 
 ---
 
@@ -194,19 +196,10 @@ Revoke is `UPDATE ... SET revoked_at = now()`. Re-grant is
 `UPDATE ... SET revoked_at = null, granted_at = now()` on the
 SAME row. The table never accumulates two rows per pair —
 that's why the constraint is `(target_user_id, source_user_id)`
-without status. The corresponding helper:
+without status.
 
-```python
-def add_target_consent(target_user_id, source_user_id):
-    sb_admin().table("target_consents").upsert({
-        "target_user_id": target_user_id,
-        "source_user_id": source_user_id,
-        "revoked_at": None,
-        "granted_at": "now()",
-    }, on_conflict="target_user_id,source_user_id").execute()
-```
-
-Or in pure SQL terms:
+Implement this via a SQL helper / RPC, not by passing the string
+`"now()"` through a PostgREST JSON upsert. In SQL terms:
 
 ```sql
 insert into target_consents (target_user_id, source_user_id)
@@ -443,12 +436,14 @@ Specifically, at the moment of delivery (in
   - Log it for audit
   - Disable the subscription so future events stop trying
 
-The recheck is cached per `consent_anchor` for 6 hours.
+Only chat-anchor membership rechecks are cached for 6 hours.
+Explicit consent rechecks are single-row DB reads and are NOT
+positively cached, because `revoke_target_consent` must take
+effect on the next delivery attempt. For chat anchors,
 `chats/{CHAT_ID}/members` is the only Feishu API call we need
 here, and we already need it at creation time. Cache scope is
-keyed on `(consent_anchor, target_user_id)` so revoking one
-target's consent doesn't invalidate other targets in the same
-anchor chat.
+keyed on `chat_id` (membership snapshot), so one lookup covers all
+targets anchored to the same chat.
 
 ### 4.4 Revocation paths
 

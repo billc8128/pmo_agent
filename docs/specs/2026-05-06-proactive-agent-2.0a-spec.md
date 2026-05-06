@@ -260,6 +260,36 @@ This table is NEVER read by the LLM agents. The bot's read tools
 do not expose it. Operators inspect it via direct SQL when
 something looks weird.
 
+**Idempotent archive contract**: `archive_external_delivery` is
+upsert-shaped, NOT a plain INSERT. GitHub/Gitea redelivery
+arrives with the same `(provider, delivery_id)` repeatedly; a
+plain INSERT would raise on the unique constraint and short-
+circuit ingest before `upsert_event` ever runs. The helper:
+
+```sql
+insert into external_webhook_deliveries (
+    provider, delivery_id, event_type,
+    raw_body, raw_headers
+) values (...)
+on conflict (provider, delivery_id) do update
+    set raw_body = excluded.raw_body,
+        raw_headers = excluded.raw_headers,
+        received_at = now()
+returning id;
+```
+
+The redelivery overwrites raw_body / raw_headers (they may
+differ between deliveries — GitHub regenerates timestamps and
+sometimes signs a slightly different payload). The
+`event_id` column stays untouched on conflict because
+ingest's step 4 (`link_archive_to_event`) writes it after
+`upsert_event` returns.
+
+`link_archive_to_event(archive_id, event_id)` is a thin
+`UPDATE external_webhook_deliveries SET event_id = $event_id
+WHERE id = $archive_id AND event_id IS NULL` — only writes
+once, doesn't clobber an earlier successful link.
+
 ### 3.4 No changes to `subscriptions`, `notifications`,
    `investigation_jobs`, `decision_logs`
 

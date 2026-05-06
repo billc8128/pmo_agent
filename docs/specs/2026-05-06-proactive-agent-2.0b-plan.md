@@ -189,7 +189,14 @@ Single function `check_target_allowed`:
 @dataclass
 class PermissionResult:
     allowed: bool
-    reason: str  # human-readable, surfaced in tool errors
+    reason: str                       # human-readable, surfaced in tool errors
+    consent_anchor: str | None = None # populated on `allowed=True`
+                                      # ONLY when cross-user permission
+                                      # was actually granted. None for
+                                      # trivial-allow cases (target=owner,
+                                      # chat-target=own chat) and on deny.
+                                      # Format: 'explicit:{consent_uuid}'
+                                      #        | 'chat:{chat_id}'
 
 def check_target_allowed(
     *,
@@ -200,21 +207,82 @@ def check_target_allowed(
     target_user_open_id: str | None,
     requesting_profile_id: str,  # for chat-owned, the asker
 ) -> PermissionResult:
-    """Implements spec §4. Returns (allowed, reason)."""
+    """Implements spec §4. Returns (allowed, reason, consent_anchor).
+
+    consent_anchor wiring:
+      target=owner trivial allow              → None
+      chat target = owning chat               → None
+      cross-user user_dm via target_consents  → 'explicit:{consent_id}'
+      cross-user mention_in_chat via consents → 'explicit:{consent_id}'
+      chat-owned cross-user via chat anchor   → 'chat:{anchor_chat_id}'
+
+    The caller (add_subscription / update_subscription /
+    createNotificationRule) MUST persist the returned
+    consent_anchor onto the subscription row alongside the
+    target_* columns. Without it, the delivery-time recheck path
+    in plan §7 has no way to know what to verify and falls back
+    to "allow" (the consent_anchor IS NULL branch in
+    _delivery_for_subscription).
+    """
 ```
 
-Cases per spec §4.1 / §4.2 in order:
+Cases per spec §4.1 / §4.2 in order, with the consent_anchor each
+case must return on success:
 
-1. Trivial allow: target = owner (user_dm to self, chat to self)
-2. Cross-DM with consent
-3. Cross-DM with shared chat
-4. Chat target = owning chat
-5. Mention-in-chat where target user is in the chat
-6. Default deny with reason
+1. target = owner (user_dm to self, chat to self) → allowed,
+   anchor=None
+2. user-owned cross-DM with explicit `target_consents` row →
+   allowed, anchor=`explicit:{consent_id}`
+3. user-owned cross-DM without explicit consent → DENIED (no
+   shared-chat path for user-owned rules — see spec §4.1 round-3
+   fix)
+4. chat target = owning chat → allowed, anchor=None
+5. chat-owned user_dm to a current member of the anchor chat →
+   allowed, anchor=`chat:{anchor_chat_id}`
+6. chat-owned user_dm to a non-member of the anchor chat →
+   DENIED (or requires explicit consent, in which case
+   anchor=`explicit:{consent_id}`)
+7. user-owned mention_in_chat where target is current chat member
+   AND target ≠ owner → allowed only with explicit consent,
+   anchor=`explicit:{consent_id}` (the @-mention DMs the target
+   via Feishu, so explicit consent is required just like
+   user_dm cross-user)
+8. chat-owned mention_in_chat where target is a current member of
+   the owning chat → allowed, anchor=None (visible in-chat,
+   target membership is checked at creation; if membership later
+   changes, the chat delivery path handles Feishu mention failure)
+9. mention_in_chat to self → allowed, anchor=None
+10. default deny with reason
 
-**Exit criterion**: 8+ unit tests covering each case, including
-explicit deny cases (cross-DM no consent + no shared chat;
-cross-chat target not allowed; mention non-member denied).
+**Caller wiring** (in `bot/agent/tools_meta.py::add_subscription`
+and `web/app/notifications/rules/actions.ts::createNotificationRule`):
+
+```python
+result = permissions.check_target_allowed(...)
+if not result.allowed:
+    return err(result.reason)
+sub_row = queries.add_subscription(
+    scope_kind=scope_kind, scope_id=scope_id,
+    description=description,
+    target_kind=target_kind, target_id=target_id,
+    target_user_open_id=target_user_open_id,
+    consent_anchor=result.consent_anchor,   # MUST persist
+    created_by=ctx.asker_user_id,
+)
+```
+
+`update_subscription` follows the same pattern when target is
+modified — re-run the check, persist the new consent_anchor.
+
+**Exit criterion**: 10+ unit tests covering each case from above,
+plus three explicitly verifying that consent_anchor is set
+correctly:
+- `test_explicit_consent_returns_explicit_anchor` — granted
+  user_dm cross-user → consent_anchor starts with `explicit:`
+- `test_chat_anchor_returns_chat_anchor` — chat-owned cross-user
+  → consent_anchor starts with `chat:`
+- `test_trivial_allow_returns_null_anchor` — target=owner →
+  consent_anchor is None
 
 ---
 
@@ -259,12 +327,21 @@ Returned rows include the new target columns so the user can
 see where their rules deliver, not just what they say.
 
 **Exit criterion**: from chat —
-- "vibelive 进展告诉 albert" → asker creates user_dm target =
-  albert; if albert is in shared chat, allowed; if not,
-  consent prompt path
-- "我都订了什么" → bot lists rules with target column
-- "albert 同意 bcc 给他发消息" (from albert's chat) — grants
-  consent
+- "vibelive 进展告诉 albert" issued from a private DM with the
+  bot → asker creates user_dm target = albert; if explicit
+  `target_consents(target=albert, source=asker)` row exists,
+  allowed with consent_anchor=`explicit:{id}`; otherwise the
+  tool returns "albert hasn't granted you permission. Want to
+  ask?" and offers the consent-prompt path
+- "vibelive 进展告诉 albert" issued from a group chat where both
+  asker and albert are members → asker creates user_dm target
+  with consent_anchor=`chat:{group_id}` (chat anchor is OK for
+  chat-owned rules)
+- "我都订了什么" → bot lists rules with target column AND
+  consent_anchor (so user can see why the rule was permitted)
+- "albert 同意 bcc 给他发消息" (from albert's DM, replying to a
+  pending consent prompt) — grants consent and inserts/upserts
+  target_consents row
 
 ---
 
@@ -545,7 +622,8 @@ alter table public.notifications
     add column if not exists mention_open_id text;
 ```
 
-This is a small alter that goes into 0019 alongside the rest.
+This is a small alter that goes into migration 0021 alongside
+the rest of 2.0b.
 
 **Exit criterion**: a mention_in_chat subscription generates a
 notification that, when sent to Feishu, includes the @-mention.
@@ -602,8 +680,15 @@ Mark 2.0b done in roadmap §2.0:
 Decompose subscription scope into rule owner (who can edit) vs
 delivery target (where notifications land). Three target kinds:
 user_dm, chat, mention_in_chat. Permission gates so cross-DM
-routing requires either explicit consent (target_consents table)
-or shared Feishu chat — no surprise spam.
+routing requires:
+- For user-owned rules: explicit `target_consents` row, granted
+  via the bot-mediated consent prompt with parent_message_id
+  binding (no bare-pattern-match consent grants).
+- For chat-owned rules: both parties currently members of the
+  rule's anchor chat, verified via Feishu's chats/{id}/members
+  API at creation and rechecked at delivery (6h cache).
+Recorded as `consent_anchor` on each subscription so
+delivery-time recheck knows what to verify.
 
 See docs/specs/2026-05-06-proactive-agent-2.0b-spec.md for full
 behavior contract; this commit implements §3 schema, §4 perms,
@@ -648,10 +733,11 @@ core "owner ≠ target" use cases.
    verifies permission denials.
 
 2. **Feishu chat membership lookups can rate-limit**. The
-   shared-chat permission check requires Feishu API calls.
-   Mitigation: 6h cache per (user_a, user_b) pair. Worst case:
-   degraded permission resolution falls back to "deny by
-   default" (fail closed).
+   chat-anchor recheck (consent_anchor=`chat:{id}`) requires
+   `chats/{id}/members` API calls. Mitigation: 6h cache per
+   chat_id (NOT per pair — one membership snapshot covers all
+   pairs in that chat). Worst case: degraded permission
+   resolution falls back to "deny by default" (fail closed).
 
 3. **Group rules become noisy**. Chats with 50+ members where
    anyone can add rules → potential rule-explosion. Mitigation:
