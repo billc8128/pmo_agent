@@ -245,26 +245,67 @@ The permission check runs in `add_subscription` /
 owner, the tool returns an error with a friendly message
 explaining what consent or chat membership is missing.
 
-Permissions are NOT re-checked at delivery time. Once a
-subscription is created with a valid target, deliveries proceed
-as long as the subscription is enabled. If users want to revoke,
-they archive the subscription OR (for inbound-spam protection)
-revoke `target_consents`.
+**Delivery-time re-check is REQUIRED for cross-user targets.**
+The original draft of this spec said permissions are not
+re-checked at delivery — that's wrong. It would mean: A and B
+share group #vibelive, A sets a rule "ping B's DM about merges,"
+B leaves #vibelive a month later, A's rule keeps DMing B
+forever. That's the stalker-channel scenario the spec is
+supposed to prevent.
 
-### 4.4 Revocation
+Specifically, at the moment of delivery (in
+`bot/agent/delivery_loop.py`'s `_delivery_for_subscription`):
 
-`target_consents` revocation **invalidates all subscriptions
-that depend on it**. Mechanism: a daily cleanup job (or trigger
-on revoke) finds subscriptions where:
+- For target_kind in `('user_dm', 'mention_in_chat')` AND
+  cross-user (target identity ≠ owner identity), call
+  `permissions.check_target_allowed(...)` again with current
+  state.
+- If the permission no longer holds (target left shared chat
+  AND no explicit consent → permission denied), do NOT deliver.
+  Instead:
+  - Mark the notification `status = 'suppressed'` with
+    `suppressed_by = 'permission_revoked'`
+  - Log it for audit
+  - Disable the subscription so future events stop trying
 
-- target_kind = 'user_dm'
-- target_id ≠ scope_id (owner ≠ target)
-- there is no shared-chat backup
+The recheck is cached per (owner_id, target_id) for 6 hours via
+the same shared-chat membership cache used at creation time —
+so it doesn't add a Feishu API call to every delivery, just to
+the first delivery in any 6h window for a given pair.
+
+### 4.4 Revocation paths (two)
+
+**Explicit revoke via `revoke_target_consent`**: target user
+removes a `target_consents` row → trigger fires (or daily
+cleanup) finds subscriptions where:
+
+- target_kind in ('user_dm', 'mention_in_chat')
+- target identity ≠ owner identity
 - target_consents row revoked
+- AND no shared-chat backup (verified via cache)
 
-…and either disables them or marks them archived. Choice is
-disabled (so target can re-grant and re-enable, vs forcing
-re-creation).
+…and disables them. (Disabled, not archived — target can
+re-grant and re-enable.)
+
+**Implicit revoke via leaving shared chat**: target user leaves
+the only chat they shared with the rule's owner. There's no
+direct event for this — Feishu doesn't push "user X left chat Y"
+to the bot. The recheck path in §4.3 is what catches this:
+when the cache expires (6h max) and the next delivery is about
+to fire, the shared-chat check returns false, the delivery is
+suppressed, and the subscription is disabled the same way as
+explicit revoke.
+
+This means there's an at-most-6-hour window where a
+just-departed user could still receive a DM. Acceptable
+trade-off:
+- Without the recheck (the original draft): unbounded window,
+  permanently broken consent.
+- With the recheck on every delivery (no cache): every
+  cross-user delivery triggers a Feishu API call → rate-limit
+  exposure + latency.
+- With 6h cache (this design): bounded staleness, bounded API
+  cost, eventual consistency.
 
 ---
 
@@ -411,20 +452,38 @@ These pieces of 1.0c need adjustment for target_kind ≠ scope:
   `bot/agent/delivery_loop.py`) currently derives delivery from
   scope. 2.0b changes it to derive from target:
   ```python
-  def _delivery_for_subscription(sub) -> tuple[str, str]:
+  def _delivery_for_subscription(sub) -> tuple[str, str, str | None]:
+      """Returns (delivery_kind, delivery_target, mention_open_id).
+      delivery_kind only ever takes two values in 1.0c+2.0b:
+      'feishu_user' (DM) or 'feishu_chat' (chat post). The
+      mention_in_chat target kind reuses 'feishu_chat' delivery
+      kind plus a non-null mention_open_id field — there is NOT
+      a third 'feishu_chat_mention' delivery kind."""
       if sub.target_kind == "user_dm":
           link = feishu_link_for_user_id(sub.target_id)
-          return "feishu_user", link.open_id
+          return "feishu_user", link.open_id, None
       if sub.target_kind == "chat":
-          return "feishu_chat", sub.target_id
+          return "feishu_chat", sub.target_id, None
       if sub.target_kind == "mention_in_chat":
-          return "feishu_chat_mention", sub.target_id
-          # delivery loop uses target_user_open_id for the @
+          # Same delivery_kind as plain chat; renderer detects the
+          # mention via mention_open_id being non-null.
+          return "feishu_chat", sub.target_id, sub.target_user_open_id
   ```
 
-- Renderer must learn to handle `mention_in_chat` — when
-  delivery_kind is 'feishu_chat' AND notification has a target
-  user open_id, render with `<at user_id="ou_xxx">` mention.
+- Renderer behavior:
+  - delivery_kind = 'feishu_chat' AND mention_open_id IS NULL →
+    plain chat post (1.0c semantics)
+  - delivery_kind = 'feishu_chat' AND mention_open_id non-null →
+    chat post with `<at user_id="ou_xxx">` prepended to the
+    rendered text. The mention target MUST be a member of the
+    chat (validated at subscription creation time per §4.1; if
+    membership lapses, the delivery-time recheck in §4.3 either
+    suppresses or downgrades to text @handle).
+- Notification table extension: add `mention_open_id text` column
+  (nullable). Set at notification-creation time from
+  `_delivery_for_subscription`'s third return value. Cleared
+  when a 1.0a/c-style turn-source notification is created
+  (legacy path doesn't set it).
 
 ---
 
@@ -452,7 +511,7 @@ Storage:
 
 1. Existing 1.0c subscription "vibelive 进展告诉我" with
    scope_kind='user', scope_id=bcc.profile_id
-2. Run migration 0019; verify subscription row gains
+2. Run migration 0021; verify subscription row gains
    target_kind='user_dm', target_id=bcc.profile_id
 3. Trigger an event that matches; verify notification still
    reaches bcc's DM

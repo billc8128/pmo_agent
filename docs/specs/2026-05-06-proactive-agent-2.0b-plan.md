@@ -19,7 +19,8 @@ truth for **build order**.
 ## 0. Pre-flight (~10 min)
 
 - [ ] Confirm 1.0c is in production AND end-to-end working
-- [ ] Confirm latest migration is 0017 (1.0c) or 0018 (2.0a)
+- [ ] Confirm latest migration is 0019 (1.0c series done) or
+      0020 (2.0a applied). 2.0b uses **0021**.
 - [ ] Audit existing subscription rows for any non-default
       delivery — should be zero pre-2.0b. If any exist, they
       need explicit migration handling (none expected).
@@ -30,12 +31,12 @@ truth for **build order**.
 
 ---
 
-## 1. Migration 0019 (or 0020 if 0019 = 2.0a) (~30 min)
+## 1. Migration 0021 (~30 min)
 
-**File**: `backend/supabase/migrations/0019_subscription_routing.sql`
+**File**: `backend/supabase/migrations/0021_subscription_routing.sql`
 
-(Number adjusts based on whether 2.0a shipped first — pick the
-next free number.)
+(Numbering assumes 2.0a shipped 0020. If 2.0b ships first,
+renumber to 0020 and update 2.0a's plan to 0021.)
 
 Creates:
 
@@ -289,7 +290,7 @@ description and asks again.
 
 ---
 
-## 7. Delivery loop adjustments (~30 min)
+## 7. Delivery loop adjustments (~45 min)
 
 **File**: `bot/agent/delivery_loop.py`
 
@@ -298,19 +299,75 @@ description and asks again.
 ```python
 def _delivery_for_subscription(sub: Subscription) -> tuple[
     str, str, str | None
-]:
-    """Returns (delivery_kind, delivery_target, mention_open_id).
-    The third is non-None only for mention_in_chat."""
+] | None:
+    """Returns (delivery_kind, delivery_target, mention_open_id),
+    or None when permission has been revoked (caller should mark
+    the notification suppressed and disable the subscription).
+
+    Per spec §4.3, cross-user targets get a delivery-time
+    permission re-check so a target user leaving a shared chat
+    eventually stops receiving the source user's pings.
+    """
     if sub.target_kind == "user_dm":
+        if _is_cross_user(sub) and not _consent_still_valid(sub):
+            return None
         link = queries.feishu_link_for_user_id(sub.target_id)
         if not link or not link.feishu_open_id:
-            return "feishu_user", "", None  # fallback empty
+            return "feishu_user", "", None  # delivery will fail
         return "feishu_user", link.feishu_open_id, None
     if sub.target_kind == "chat":
         return "feishu_chat", sub.target_id, None
     if sub.target_kind == "mention_in_chat":
+        if not _consent_still_valid(sub):
+            return None
         return "feishu_chat", sub.target_id, sub.target_user_open_id
     raise ValueError(f"unknown target_kind: {sub.target_kind}")
+
+
+def _is_cross_user(sub: Subscription) -> bool:
+    return (
+        sub.scope_kind == "user"
+        and sub.target_kind in ("user_dm", "mention_in_chat")
+        and sub.target_id != sub.scope_id
+    )
+
+
+def _consent_still_valid(sub: Subscription) -> bool:
+    """Re-checks permission via the same logic as creation time,
+    cached 6h per (owner, target) pair."""
+    cache_key = (sub.scope_id, sub.target_id, sub.target_kind)
+    cached = _consent_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = permissions.check_target_allowed(
+        owner_kind=sub.scope_kind, owner_id=sub.scope_id,
+        target_kind=sub.target_kind, target_id=sub.target_id,
+        target_user_open_id=sub.target_user_open_id,
+        requesting_profile_id=sub.created_by or sub.scope_id,
+    )
+    _consent_cache_put(cache_key, result.allowed, ttl_seconds=6 * 3600)
+    return result.allowed
+```
+
+**Caller** (the delivery loop's `process_pending` per 1.0c
+§4.4) handles the None return:
+
+```python
+delivery = _delivery_for_subscription(sub)
+if delivery is None:
+    queries.mark_notification_suppressed(
+        notif.id, suppressed_by="permission_revoked"
+    )
+    queries.update_subscription(
+        subscription_id=sub.id,
+        scope_kind=sub.scope_kind, scope_id=sub.scope_id,
+        enabled=False,
+    )
+    logger.warning(
+        "permission_revoked: disabled sub=%s (owner=%s target=%s)",
+        sub.id, sub.scope_id, sub.target_id,
+    )
+    continue
 ```
 
 Notification row gains an additional optional column

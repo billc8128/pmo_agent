@@ -19,7 +19,8 @@ truth for **build order**.
 
 - [ ] Confirm 1.0c is in production; one e2e turn → notification
       flow works end-to-end
-- [ ] Confirm latest migration is 0017 (1.0c)
+- [ ] Confirm latest migration on production is 0019
+      (`project_path_tokens_for_lockout`). 2.0a uses **0020**.
 - [ ] Confirm pmo-bot is healthy on Railway
 - [ ] Confirm at least one user has bound feishu_links (so
       identity claim has something to attach to)
@@ -28,24 +29,37 @@ truth for **build order**.
 
 ---
 
-## 1. Migration 0018 (~30 min)
+## 1. Migration 0020 (~30 min)
 
-**File**: `backend/supabase/migrations/0018_external_event_sources.sql`
+**File**: `backend/supabase/migrations/0020_external_event_sources.sql`
 
 Creates:
 
 - `external_identities` table per spec §3.1 with full column set:
   - `id`, `profile_id`, `provider`, `external_login`,
     `external_id`, `created_at`, `updated_at`
-  - constraint `extid_unique unique (provider, external_login)`
+  - constraint `extid_login_unique unique (provider, external_login)`
+  - **partial unique index** `extid_id_unique on
+    (provider, external_id) where external_id is not null` —
+    prevents two profiles from claiming the same numeric id with
+    different logins after a GitHub rename
   - index `extid_profile_idx on (profile_id)`
 - `external_repos` table per spec §3.2:
   - `id`, `provider`, `repo_full_name`, `project_root`,
     `created_by`, `created_at`, `updated_at`
   - constraint `repo_unique unique (provider, repo_full_name)`
   - index `repos_project_root_idx on (project_root)`
+- `external_webhook_deliveries` table per spec §3.5:
+  - service-role-only raw archive of full webhook bodies
+  - `(provider, delivery_id)` unique
+  - 30-day retention (cleanup outside the migration)
 - `external_resource_cache` table per spec §6.2 for fetched
   PR diffs and similar.
+- **`events.payload_fingerprint` column** (text) — webhook
+  events compute md5 over the normalised payload (excluding
+  volatile timestamps); turn events compute the same field via
+  the existing 1.0c trigger fingerprint. Used by the webhook
+  upsert to skip no-op redeliveries (plan §3.4).
 - RLS:
   - `external_identities` enabled. Policy: owner can read their
     own row (`auth.uid() = profile_id`); inserts/updates only via
@@ -53,27 +67,41 @@ Creates:
     leaking other users' claims.
   - `external_repos` enabled, no policies (service-role only —
     repo mapping is admin-managed).
+  - `external_webhook_deliveries` enabled, no policies
+    (service-role only — never read by LLMs).
   - `external_resource_cache` enabled, no policies (service-role
     only — cache is internal).
 
 **Apply path**: via Supabase Management API (same pattern as
-0005-0017).
+0005-0019).
 
 **Smoke tests** (in transaction, ROLLBACK at end):
 
 1. Insert a fake profile (or use existing one). Insert into
    `external_identities` with provider='github',
    external_login='test_user'; verify row exists. Insert again
-   with same (provider, external_login) — expect unique
-   constraint violation.
-2. Same uniqueness check for `external_repos.(provider,
-   repo_full_name)`.
-3. With anon key: select from each new table → 0 rows / RLS
+   with same (provider, external_login) — expect
+   `extid_login_unique` violation.
+2. Two profiles, both insert with provider='github',
+   external_id='12345' and DIFFERENT logins → second insert
+   raises `extid_id_unique` violation. Same with both rows
+   external_id IS NULL → both succeed (partial index skips
+   NULLs).
+3. `external_repos.(provider, repo_full_name)` uniqueness check
+   (insert duplicate raises).
+4. `external_webhook_deliveries.(provider, delivery_id)`
+   uniqueness check.
+5. Insert events row with payload_fingerprint='abc'; insert
+   another with same (source, source_id) and fingerprint='abc' →
+   ON CONFLICT no-op path verified by checking payload_version
+   stays 1. Insert again with fingerprint='def' → version=2,
+   ingested_at fresh. (See plan §3.4 SQL.)
+6. With anon key: select from each new table → 0 rows / RLS
    denies (depending on table). Auth-as-fake-user select from
    `external_identities` → only own row visible.
-4. With service-role: full access works.
+7. With service-role: full access works on all four new tables.
 
-**Exit criterion**: all 4 smoke tests pass; ROLLBACK leaves DB
+**Exit criterion**: all 7 smoke tests pass; ROLLBACK leaves DB
 clean.
 
 ---
@@ -199,10 +227,68 @@ Each handler:
 - looks up actor profile_id via `lookup_profile_by_external_login`
 - looks up project_root via `lookup_project_root_for_repo`
 - determines `occurred_at` per the table in spec §4.4
-- preserves the raw body in `payload.raw`
+- **does NOT** copy the entire raw body into `events.payload`.
+  Per spec §4.3 raw goes to a service-only
+  `external_webhook_deliveries` table (added in plan §1's
+  migration); `events.payload` carries only the compact
+  normalised shape so token / DB sizes stay bounded.
 
 Gitea has the same structure; the normalizer functions should be
 parameterized by provider where the field names differ.
+
+### 3.3.1 Source-aware judge projection
+
+Per spec §7.1, `bot/agent/decider.py::build_judge_event` is
+turn-only today and returns all-None for webhook payloads.
+That means the gatekeeper LLM sees no event_type / actor / repo
+and almost certainly fails to match subscriptions like
+"vibelive merge 告诉我". This is a hard prerequisite for 2.0a
+to work — it's not a polish step.
+
+**File**: `bot/agent/decider.py`
+
+Replace `build_judge_event` with a dispatcher keyed on
+`payload.event_type`:
+
+```python
+def build_judge_event(payload: dict[str, Any]) -> dict[str, Any]:
+    et = payload.get("event_type") or "turn"
+    if et == "turn":               return _judge_event_for_turn(payload)
+    if et == "pull_request":       return _judge_event_for_pr(payload)
+    if et == "push":               return _judge_event_for_push(payload)
+    if et == "release":            return _judge_event_for_release(payload)
+    if et == "issue_comment":      return _judge_event_for_issue_comment(payload)
+    return {"event_type": et, "summary": "(unknown source)"}
+```
+
+Each `_judge_event_for_*` returns the contract from spec §7.1:
+`event_type`, `headline`, `body_excerpt`, `actor_handle`,
+`project_root`, `occurred_at`, plus a few source-specific keys
+the gatekeeper might key off (e.g. `merged: true`, `pr_number`,
+`tag_name`). Truncate body_excerpt to ~400 chars to keep the
+gatekeeper budget bounded.
+
+`_judge_event_for_turn` is the existing 1.0c behavior renamed.
+
+Investigator's bundle construction (`InvestigatableJobBundle.events`
+list in queries.py's `claim_investigatable_jobs` wrapper) ALSO
+runs each event payload through `build_judge_event` before
+including it in the prompt. Investigator gets the same compact
+shape. If investigator wants more (e.g. file diffs), it calls
+`fetch_pr_files` (§6).
+
+**Unit tests** (in `bot/tests/test_proactive_2_0a.py`):
+- `test_judge_event_for_pr_extracts_merge_signal` — payload has
+  action='closed' + merged=true, projection returns merged=true,
+  event_type='pull_request', headline includes PR title.
+- `test_judge_event_for_turn_unchanged` — passing a 1.0c-shape
+  payload through the new dispatcher yields exactly the previous
+  output (regression guard).
+- `test_judge_event_for_unknown_event_type_fallback` — payload
+  with event_type='workflow_run' returns the generic
+  "(unknown source)" projection rather than raising.
+- `test_judge_event_excludes_raw` — confirms `payload.raw` (if
+  present) is not included in projection output.
 
 ### 3.4 Ingest function
 
@@ -237,19 +323,68 @@ Note `queries.upsert_event` is **a new helper** — current 1.0a
 trigger writes events directly via the SQL trigger on `turns`.
 For external events there's no turn row to trigger from, so we
 write events directly via service-role, using the same
-`(source, source_id)` unique constraint for idempotency. The
-function simply does:
+`(source, source_id)` unique constraint for idempotency.
+
+**Idempotency contract (CRITICAL)**: GitHub and Gitea will
+re-deliver the same `delivery_id` on receiver errors. A naive
+"on conflict do update set payload_version + 1" would bump the
+version and re-enter `events_needing_decision`, causing duplicate
+investigations and notifications. Instead:
 
 ```sql
 insert into events (source, source_id, user_id, project_root,
-                    occurred_at, payload, payload_version)
+                    occurred_at, payload, payload_version,
+                    payload_fingerprint)
 values (...)
-on conflict (source, source_id) do update set
-    payload = excluded.payload,
-    payload_version = events.payload_version + 1,
-    ingested_at = now()
+on conflict (source, source_id) do update
+    -- Only bump payload_version when the *normalised* payload
+    -- actually changed (computed via fingerprint, NOT raw equality
+    -- — the raw body has timestamps that drift between
+    -- redeliveries). Most redeliveries are byte-identical
+    -- normalised; they end up as no-op updates and DO NOT
+    -- re-enter events_needing_decision.
+    set payload = case
+            when excluded.payload_fingerprint
+                 is distinct from events.payload_fingerprint
+            then excluded.payload
+            else events.payload
+        end,
+        payload_fingerprint = excluded.payload_fingerprint,
+        payload_version = case
+            when excluded.payload_fingerprint
+                 is distinct from events.payload_fingerprint
+            then events.payload_version + 1
+            else events.payload_version
+        end,
+        ingested_at = case
+            when excluded.payload_fingerprint
+                 is distinct from events.payload_fingerprint
+            then now()
+            else events.ingested_at
+        end
 returning id;
 ```
+
+`payload_fingerprint` is a new column on `events` (added in plan
+§1's migration if not already present from 1.0c). For webhook
+events: `md5(stable_json(normalised_payload_minus_volatile_fields))`
+where volatile fields are timestamps the source generates per
+delivery. For turn events: same fingerprint is computed in the
+trigger from §1.0c's existing fingerprint logic, mapped to this
+column.
+
+**Why this matters for re-delivery**: GitHub's webhook delivery
+retries are common (any 5xx from our side triggers redelivery).
+We MUST NOT treat them as new events. The fingerprint guard
+ensures retries are no-ops.
+
+**Why we DON'T just `do nothing`**: a webhook content can
+legitimately change between deliveries — e.g. PR description
+edited triggers a new `synchronize` event with new content but
+sometimes the same delivery_id depending on configuration. The
+fingerprint approach handles both: identical retries are no-ops,
+content changes bump version (same as turn agent_summary
+arriving late in 1.0c).
 
 ### 3.5 Files touched in this chunk
 
@@ -264,10 +399,17 @@ returning id;
 **Exit criterion**:
 - POST a synthetic GitHub `pull_request` payload (with valid
   signature) to `/webhooks/github` — events row appears with
-  source='github', payload normalised correctly
-- Same payload posted twice → only one events row,
-  payload_version=2 on the second
-- POST with bad signature → 401, no events row
+  source='github', payload normalised correctly,
+  payload_version=1
+- Same delivery_id POSTed AGAIN with byte-identical body → still
+  ONE events row, **payload_version still 1**
+  (fingerprint-equal → no-op). Critically: events_needing_decision
+  view does NOT re-include this row.
+- Same delivery_id POSTed with body content edited (e.g. PR title
+  changed) → still ONE events row, payload_version=2,
+  events_needing_decision DOES re-include this row.
+- POST with bad signature → 401, no events row written and no
+  external_webhook_deliveries entry.
 
 ---
 

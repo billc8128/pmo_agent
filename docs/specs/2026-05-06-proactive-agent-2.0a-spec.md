@@ -97,8 +97,19 @@ create table public.external_identities (
                                               -- change but ids don't)
     created_at   timestamptz not null default now(),
     updated_at   timestamptz not null default now(),
-    constraint extid_unique unique (provider, external_login)
+    constraint extid_login_unique unique (provider, external_login)
 );
+
+-- Stable id uniqueness: a numeric external_id is the persistent
+-- identity, login can drift. Without this constraint, after a
+-- login rename the new login could be claimed by a second profile
+-- → both rows have different logins but the same external_id,
+-- which gives webhook actor lookup ambiguous results. Partial
+-- unique index (skips NULLs) so legacy rows without external_id
+-- aren't blocked.
+create unique index extid_id_unique
+    on public.external_identities (provider, external_id)
+    where external_id is not null;
 
 create index extid_profile_idx
     on public.external_identities (profile_id);
@@ -112,11 +123,14 @@ Why both `external_login` and `external_id`:
   fall back to login otherwise.
 - For self-claim (initial UX), the user types their login.
   Background reconciliation later resolves to id when we make
-  authenticated API calls.
+  authenticated API calls — at that point the
+  `extid_id_unique` partial index activates.
 
 A profile can have multiple identities (one per provider).
-External logins are unique per provider — two profiles can't
-both claim "billc8128" on github.
+Both external_login AND (when present) external_id are unique
+per provider — two profiles can't both claim "billc8128" on
+github, and after a rename two profiles can't both claim the
+same numeric id with different logins.
 
 ### 3.2 `external_repos` — map external repo to project_root
 
@@ -167,9 +181,23 @@ unique (source, source_id)
 
 Both providers send a unique delivery uuid in webhook headers
 (`X-GitHub-Delivery` / `X-Gitea-Delivery`); we use that as the
-source_id suffix to make idempotency trivial. If a webhook
-re-delivers the same delivery uuid, the existing
-`(source, source_id)` unique constraint dedupes.
+source_id suffix.
+
+**Idempotency contract** (CRITICAL — see plan §3.4 for SQL):
+GitHub and Gitea routinely re-deliver webhooks on receiver
+errors. The `(source, source_id)` unique constraint dedupes the
+ROW, but the upsert must NOT bump `payload_version` on
+byte-identical re-delivery. If it did, every re-delivery would
+re-enter `events_needing_decision` and produce duplicate
+investigations / notifications.
+
+The upsert uses a `payload_fingerprint` md5 over the
+**normalised** payload (excluding volatile timestamp fields the
+provider regenerates per delivery). Same fingerprint → no-op.
+Different fingerprint (e.g. PR description was edited and the
+event re-ingested) → bump `payload_version`, re-enter
+needs-decision. This mirrors 1.0c's late-summary semantics for
+turn events.
 
 `payload` jsonb contents per webhook event type — see §4.
 
@@ -182,6 +210,55 @@ the external_login from payload directly).
 `external_repos.project_root`. NULL otherwise (still ingested,
 but the project lockout in 1.0c won't filter it — it falls
 through to the gatekeeper LLM as a "no project context" event).
+
+### 3.5 `external_webhook_deliveries` — service-only raw archive
+
+The raw webhook bodies are kept for debugging / replay /
+audit-of-payload-edits, but they are NOT in `events.payload`.
+Rationale:
+
+- Raw GitHub PR payloads can run 50-200KB. Putting them on
+  `events.payload` bloats the events table, multiplies decider /
+  investigator prompts (every gatekeeper call would carry a
+  full PR body), and risks shipping uninvolved fields (CI logs,
+  review comments) to the LLM.
+- The normalised compact `events.payload` (per §4) has
+  everything the gatekeeper / investigator / renderer actually
+  need.
+- For rare deeper forensic inspection, the raw is a
+  service-role-only side table.
+
+```sql
+create table public.external_webhook_deliveries (
+    id           bigserial primary key,
+    provider     text not null check (provider in ('github', 'gitea')),
+    delivery_id  text not null,             -- X-{Provider}-Delivery
+    event_type   text not null,
+    received_at  timestamptz not null default now(),
+    raw_body     jsonb not null,
+    raw_headers  jsonb,                     -- minus auth/signing
+    event_id     bigint references public.events(id) on delete set null,
+    constraint webhook_delivery_unique unique (provider, delivery_id)
+);
+
+create index webhook_deliveries_event_idx
+    on public.external_webhook_deliveries (event_id)
+    where event_id is not null;
+
+create index webhook_deliveries_received_at_idx
+    on public.external_webhook_deliveries (received_at desc);
+```
+
+RLS: service-role only — no policies needed since we use
+service-role for all reads.
+
+Retention: a daily cleanup job deletes rows where `received_at <
+now() - interval '30 days'`. Useful debugging window without
+forever-growth.
+
+This table is NEVER read by the LLM agents. The bot's read tools
+do not expose it. Operators inspect it via direct SQL when
+something looks weird.
 
 ### 3.4 No changes to `subscriptions`, `notifications`,
    `investigation_jobs`, `decision_logs`
@@ -260,7 +337,7 @@ For each event type we extract a stable shape into
     "id": "123456",                  // numeric, when present
     "profile_id": "uuid-or-null"     // resolved during ingest
   },
-  "raw": { /* original webhook body */ }
+  // raw NOT included — see external_webhook_deliveries (§3.5)
 }
 ```
 
@@ -278,7 +355,7 @@ For each event type we extract a stable shape into
   ],   // truncated to ~20 commits
   "repo": { ... },
   "actor": { ... },
-  "raw": { ... }
+  // raw NOT included — see external_webhook_deliveries (§3.5)
 }
 ```
 
@@ -296,7 +373,7 @@ For each event type we extract a stable shape into
   },
   "repo": { ... },
   "actor": { ... },
-  "raw": { ... }
+  // raw NOT included — see external_webhook_deliveries (§3.5)
 }
 ```
 
@@ -313,7 +390,7 @@ For each event type we extract a stable shape into
   "mentioned_profile_ids": ["uuid", ...],   // resolved during
                                             // ingest from comment
                                             // body @-mentions
-  "raw": { ... }
+  // raw NOT included — see external_webhook_deliveries (§3.5)
 }
 ```
 
@@ -537,31 +614,106 @@ fetched files actually contain — same 1.0c invariant.
 
 ## 7. Coupling with 1.0c
 
-These pieces of 1.0c are reused unchanged:
+The 1.0c **pipeline orchestration** is reused unchanged
+(gatekeeper loop, investigator loop, renderer loop, delivery
+loop, all the RPCs). But the **payload projection** the
+gatekeeper LLM actually sees IS turn-specific today and needs a
+source-aware extension. Without that, a github PR event reaches
+the gatekeeper as a bag of None fields and the LLM has nothing
+to reason about.
 
-- `events` ingestion path — we just add new source values
-- gatekeeper (decider) — reads `events.payload` opaquely; the
-  project lockout works on `events.project_root` populated by
-  repo mapping
-- investigator — reads payload opaquely; same prompt
-- renderer — reads payload opaquely; same prompt + new optional
-  tool
+### 7.1 Source-aware payload projection (REQUIRED)
+
+`bot/agent/decider.py::build_judge_event(payload)` currently
+extracts only turn fields (`turn_id`, `agent`, `user_message`,
+`agent_summary`, `agent_response_full`, `project_path`,
+`project_root`, `user_message_at`). For webhook events those are
+all None.
+
+2.0a replaces it with a dispatcher keyed on `payload.event_type`
+(present in every webhook normalisation; defaults to "turn"
+when absent for backward compat with 1.0c-shape payloads):
+
+```python
+def build_judge_event(payload: dict[str, Any]) -> dict[str, Any]:
+    event_type = payload.get("event_type") or "turn"
+    if event_type == "turn":
+        return _judge_event_for_turn(payload)
+    if event_type == "pull_request":
+        return _judge_event_for_pull_request(payload)
+    if event_type == "push":
+        return _judge_event_for_push(payload)
+    if event_type == "release":
+        return _judge_event_for_release(payload)
+    if event_type == "issue_comment":
+        return _judge_event_for_issue_comment(payload)
+    return {"event_type": event_type, "summary": "(unrecognised event source)"}
+```
+
+Each per-source projection returns the same shape contract for
+the gatekeeper:
+
+```python
+{
+    "event_type": "pull_request" | "push" | "release" | ...,
+    "headline": "<short user-facing one-liner>",
+    "body_excerpt": "<200-400 chars of what happened>",
+    "actor_handle": "<external_login or pmo handle>",
+    "project_root": "<from event row>",
+    "occurred_at": "<ISO>",
+    # source-specific fields preserved from payload, e.g.:
+    "pr_number": 1234, "merged": true,
+    # ... (only fields gatekeeper might match against subscription
+    #      descriptions; not the full raw body)
+}
+```
+
+The shape is intentionally compact (~500-800 tokens including
+the existing `headline` / `body_excerpt` truncation) so the
+gatekeeper budget §8 holds.
+
+Implementation lives next to the trigger code in plan §3.3
+("Event payload normalisation"). Each per-source projection is
+a small pure function with a unit test.
+
+### 7.2 Investigator and renderer also need the projection
+
+Investigator currently sees the full event payload via
+`InvestigatableJobBundle.events`. With raw GitHub bodies these
+are too big — the projection above gives the investigator the
+same compact shape. **The full normalised payload (per spec §4)
+remains on `events.payload`** for cases where the investigator
+deliberately wants more detail (via the `fetch_pr_files` tool
+in §6 or by reading payload directly through the read tools);
+it just isn't dumped wholesale into the prompt.
+
+Renderer reads investigator brief output — already prompt-shaped,
+no projection needed there.
+
+### 7.3 Things that are actually unchanged
+
+- `events` row identity and the `(source, source_id)` unique
+  constraint — extends naturally
+- gatekeeper system prompt — reads from `build_judge_event`
+  output, doesn't care what source produced it
+- investigator system prompt — reads bundle.events list
+  shape-by-shape; bundle entries get the §7.1 projection
 - delivery loop — unchanged
+- Lockout's `last_segment(event.project_root)` — webhook events
+  populate project_root from `external_repos` mapping, same
+  path format. ✅ checked: matches.
 
-These pieces of 1.0c need small adaptations for non-turn events:
+### 7.4 What this means for "fields the gatekeeper sees"
 
-- The `agent_summary` field in payload is turn-specific. For
-  webhook events, the renderer's "fallback heuristic" of
-  "subject_summary = rendered_text OR agent_summary OR
-  user_message" needs to also consider PR title / commit
-  summary / release name. Implementation: when seeding
-  `recent_notifications_for_scope`, derive subject_summary from
-  the source-appropriate field. See plan §3.
+Sample subscription descriptions and what the projection
+exposes:
 
-- Lockout's `last_segment(event.project_root)` works for
-  paths but webhook events have project_root populated from
-  the `external_repos` table — same path format, no special
-  case needed. ✅ checked: matches.
+| Subscription | Event source | Fields gatekeeper matches against |
+|--------------|--------------|-----------------------------------|
+| "vibelive merge 告诉我" | github pull_request, merged=true | `event_type=pull_request`, `merged=true`, `project_root=.../vibelive`, `headline="albert merged PR #42 ..."` |
+| "albert 的 PR 提我" | github pull_request | `actor_handle=albert`, `event_type=pull_request` |
+| "release 标签出来" | github release | `event_type=release`, `release.tag_name` |
+| "vibelive 进展" | turn | original 1.0c fields |
 
 ---
 
