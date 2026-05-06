@@ -166,8 +166,15 @@ create index notif_investigation_job_idx
 single event's payload at decision time. In 1.0c it is the
 **investigation_decision jsonb** — the structured brief. Renderer
 reads this. Old 1.0a notifications keep their old `payload_snapshot`
-shape; renderer detects shape via presence of `notify`/`headline`
-keys and falls back to 1.0a rendering for legacy rows.
+shape; renderer detects 1.0c shape via the conjunction
+`"headline" in payload_snapshot AND "key_facts" in payload_snapshot
+AND isinstance(payload_snapshot["key_facts"], list)` (the
+canonical predicate, mirrored 1:1 in plan §5's
+`_is_1_0c_brief`). Anything else is treated as a legacy 1.0a
+payload and rendered with the 1.0a prompt. Using both `headline`
+AND `key_facts` (not either-or) avoids false positives on 1.0a
+payloads that happen to contain a `headline` field for some
+unrelated reason.
 
 ### 3.3 Changes to `decision_logs`
 
@@ -341,29 +348,46 @@ def known_project_tokens() -> tuple[set[str], str]:
     _cache_hash = sha256("|".join(sorted(_cache_K)).encode()).hexdigest()[:16]
     return _cache_K, _cache_hash
 
-def is_project_mismatch(event, sub) -> bool:
-    """Lockout check. The matching logic itself is NOT in Python —
-    it lives in PL/pgSQL function `index_subscription_metadata`
-    (plan §2.5.1), which is the single source of truth for the
-    long/short boundary rules and the project-context regex set.
-    Python only reads cached metadata and triggers a re-index on
-    cache miss / hash mismatch.
+def last_segment(project_root: str | None) -> str:
+    """Rightmost path segment, lowercased. Returns '' when input is
+    None / empty / has empty trailing segment (e.g. trailing /).
+    Always-empty inputs let the lockout fall through to the
+    gatekeeper LLM rather than treating them as mismatch.
     """
-    K, k_hash = known_project_tokens()
+    if not project_root:
+        return ""
+    parts = [p for p in project_root.strip().split("/") if p]
+    return parts[-1].lower() if parts else ""
+
+
+def is_project_mismatch(event, sub) -> bool:
+    """Lockout check. Matching logic lives in PL/pgSQL function
+    `index_subscription_metadata` (plan §2.5.1), the single source
+    of truth. Python only reads cached metadata, triggers re-index
+    on cache miss / hash mismatch, and applies the membership test.
+    """
+    # Defensive: events.project_root is nullable. If we don't know
+    # what project the event belongs to, we can't apply the lockout
+    # — let the gatekeeper LLM judge based on payload content.
+    event_token = last_segment(getattr(event, "project_root", None))
+    if not event_token:
+        return False
+
+    _K, k_hash = known_project_tokens()
     cached = sub.metadata.get("matched_projects")
     cached_hash = sub.metadata.get("project_tokens_hash")
     # Recompute when:
     #  - metadata never written (cached is None)
     #  - K has changed since metadata was written (hash mismatch)
-    # In both cases we call the SQL RPC and refetch — we do NOT
-    # have a parallel Python implementation.
+    # In both cases we call the SQL RPC and refetch — there is NO
+    # parallel Python matching implementation.
     if cached is None or cached_hash != k_hash:
         queries.index_subscription_metadata(sub.id)
         sub = queries.get_subscription(sub.id)  # refetch
         cached = sub.metadata.get("matched_projects") or []
     if not cached:
         return False
-    return last_segment(event.project_root).lower() not in set(cached)
+    return event_token not in set(cached)
 ```
 
 **Single source of truth for matching**: The long token / short

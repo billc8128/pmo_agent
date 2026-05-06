@@ -77,14 +77,21 @@ Creates:
     `status='open' AND (array_length(seed_event_ids, 1) >= 5
     OR opened_at < now() - make_interval(mins => p_window_minutes))`.
     Flips to status='investigating', stamps claim_id + claimed_at.
-    Returns rows joined with subscription jsonb and an event_payloads
-    jsonb array (each element is `{id, user_id, payload,
-    payload_version, occurred_at, project_root}` for one seed
-    event, in seed_event_ids order). `user_id` is the events table's
-    top-level column (NOT inside payload jsonb), needed by the
-    investigator to populate brief.subject_user_ids without an
-    extra query. Python wrapper passes
-    `settings.aggregation_window_minutes`.
+    Returns each row as 3 jsonb columns plus the event payloads:
+    - `investigation_job` jsonb — the job row (post-claim, so
+      status='investigating', claim_id set)
+    - `subscription` jsonb — the joined subscription
+    - `event_payloads` jsonb array — each element is `{id, user_id,
+      payload, payload_version, occurred_at, project_root}` for
+      one seed event, in seed_event_ids order. `user_id` is the
+      events table's top-level column (NOT inside payload jsonb),
+      needed by the investigator to populate brief.subject_user_ids
+      without an extra query.
+    Python wrapper passes `settings.aggregation_window_minutes`
+    and deserialises each row into an `InvestigatableJobBundle`
+    dataclass with `.job`, `.subscription`, `.events` attributes
+    (rename in the dataclass: `events` field corresponds to the
+    SQL column `event_payloads`).
   - `create_notification_for_investigation_job(...)` — single
     atomic RPC that writes the notification row AND flips the job
     to 'notified'. Re-checks lease (`claim_id == p_claim_id AND
@@ -148,12 +155,13 @@ insert into subscriptions (...) values (...) returning id;  -- s
    returned because J2 has only 1 event AND opened_at=now() <
    now()-30min. Verify J2.status is still 'open' afterwards.
    Assert the J1 returned row has:
-   - `notification` jsonb (the job row, with status now
+   - `investigation_job` jsonb (the job row, with status now
      'investigating' and claim_id set)
    - `subscription` jsonb
-   - `event_payloads` jsonb array — length 2 with e1+e2's
-     payload jsonb in seed_event_ids order
-   - status flipped to 'investigating' in DB
+   - `event_payloads` jsonb array — length 2 with each entry
+     `{id, user_id, payload, payload_version, occurred_at,
+     project_root}`, in seed_event_ids order (e1 first, e2 second)
+   - status flipped to 'investigating' in the DB row
 7. Call `mark_job_suppressed_if_claimed(J1, right_claim_id,
    '{"notify": false, "reason": "test"}')` → 1 row affected,
    J1.status='suppressed'.
@@ -258,36 +266,68 @@ project lockout — the central anti-misfire mechanism for 1.0c.
 
 **Files**:
 
-- `bot/agent/lockout.py` (new). Exports:
+- `bot/agent/lockout.py` (new). Exports ONLY these three things —
+  no matching logic of any kind:
   - `known_project_tokens() -> tuple[set[str], str]` — 60s in-memory
     TTL cache of `(K, k_hash)`. Backed by
-    `queries.distinct_project_roots()`.
-  - `_LONG_TOKEN_MIN_LEN = 4` — long/short threshold.
-  - `_short_token_in_project_context(token, desc_lower) -> bool` —
-    regex-based explicit-context detector (spec §4.1.1).
-  - `matched_projects_for(description, K) -> list[str]` —
-    long tokens via `\bword\b`, short tokens via context regex.
-  - `is_project_mismatch(event, sub) -> bool` —
-    looks up cached metadata, recomputes on hash mismatch via
-    `queries.write_subscription_metadata(sub.id, {...})`, returns
-    True iff M_sub non-empty AND
-    `last_segment(event.project_root).lower() ∉ M_sub`.
+    `queries.distinct_project_root_tokens()`. Computed in Python
+    purely so the decider loop avoids re-issuing the cheap query
+    once per (event, sub) pair. The hash is computed the same way
+    as the SQL function, see "hash equivalence" below.
+  - `last_segment(project_root: str | None) -> str` — small
+    helper, returns the rightmost path segment lowercased, or `""`
+    if input is None / empty / has empty trailing segment.
+  - `is_project_mismatch(event, sub) -> bool` — reads cached
+    metadata; on cache miss / hash mismatch, calls
+    `queries.index_subscription_metadata(sub.id)` and refetches.
+    Returns True iff cached `matched_projects` non-empty AND
+    `last_segment(event.project_root) ∉ set(cached)`. If
+    `last_segment(event.project_root) == ""` returns False (let
+    the gatekeeper LLM judge).
+
+  **No exports for matching**: there is no
+  `_short_token_in_project_context`, no `matched_projects_for`,
+  no `_LONG_TOKEN_MIN_LEN` constant in Python. Those live only
+  in the SQL function `index_subscription_metadata` (§2.5.1).
+  Anyone reaching for those names in Python is wrong.
 
 - `bot/db/queries.py` add helpers:
-  - `distinct_project_roots() -> list[str]` — `select distinct
-    project_root from events where project_root is not null`.
-  - `write_subscription_metadata(subscription_id, metadata: dict)`
-    — small UPDATE that merges into `subscriptions.metadata` jsonb.
-    Used by both lockout's lazy recompute and add_subscription's
-    synchronous initial write.
+  - `distinct_project_root_tokens() -> list[str]` — query:
+    ```sql
+    with seg as (
+        select distinct lower(regexp_replace(project_root, '^.*/', '')) as t
+          from public.events
+         where project_root is not null and project_root <> ''
+    )
+    select t from seg where t <> '' order by t;
+    ```
+    Identical to the K computation inside
+    `index_subscription_metadata` (§2.5.1) — both must filter
+    empty trailing segments to avoid empty tokens producing
+    spurious matches in the regex loop.
+  - `get_subscription(subscription_id: str) -> Subscription | None`
+    — global get, NOT scope-restricted (the existing
+    `get_subscription_in_scope` is scope-restricted and the
+    lockout's lazy recompute path doesn't have a scope handy).
+    Used after `index_subscription_metadata` to refetch metadata.
+  - `index_subscription_metadata(subscription_id: str) -> None` —
+    one-line `sb_admin().rpc(...)` wrapper around the §2.5.1 RPC.
 
-**Single source of truth**: the SQL function
+**Hash equivalence**: Python's `known_project_tokens` and the SQL
+function compute the same k_hash. Recipe (BOTH sides must follow
+exactly): take the unique lowercased last-segments of all non-empty
+`events.project_root`, sort them lexicographically, join with `|`,
+sha256-hex, take first 16 chars. Empty-K case: input string is
+`""`, sha256(`""`) → fixed value. The hash equivalence test must
+pass: insert known events, compare Python and SQL hashes byte-for-byte.
+
+**Single source of truth for matching**: the SQL function
 `index_subscription_metadata(subscription_id)` (§2.5.1) is the
 ONLY place the long/short boundary matching logic lives. Both
 the bot and the web call it via `sb_admin().rpc(...)` after any
-description-touching mutation. The Python `bot/agent/lockout.py`
-module does NOT re-implement matching — it only reads cached
-metadata and triggers the RPC on cache miss / hash mismatch.
+description-touching mutation. Python `bot/agent/lockout.py` does
+NOT re-implement matching — only reads cached metadata and triggers
+the RPC on cache miss / hash mismatch.
 
 Call sites that MUST invoke `index_subscription_metadata` after
 their write:
@@ -366,13 +406,20 @@ begin
     desc_lower := lower(coalesce(sub.description, ''));
 
     -- K = distinct last-segment of events.project_root, lowercased.
-    -- coalesce → empty array if no events yet (fresh deployment).
-    select coalesce(array_agg(distinct lower(
-               regexp_replace(project_root, '^.*/', '')
-           )), array[]::text[])
+    -- Compute last_segment first in a CTE so we can filter out
+    -- empties (e.g. when project_root ends with '/' the regex
+    -- replace yields ''), then aggregate. Without this filter, an
+    -- empty token would enter the regex loop below and produce
+    -- nonsense matches. coalesce → empty array if no events yet.
+    with seg as (
+        select distinct lower(regexp_replace(project_root, '^.*/', '')) as t
+          from public.events
+         where project_root is not null and project_root <> ''
+    )
+    select coalesce(array_agg(t), array[]::text[])
       into k_array
-      from public.events
-     where project_root is not null and project_root <> '';
+      from seg
+     where t <> '';
 
     -- k_hash = first 16 chars of sha256 of sorted-and-joined K.
     -- coalesce(..., '') guards against the empty-K case where
@@ -482,8 +529,23 @@ test harness, since the matching is now SQL-only):
   "oneship 进展", verify update_subscription / updateNotificationRule
   re-call index_subscription_metadata so metadata becomes
   `["oneship"]`, NOT stuck at `["vibelive"]`.
+- `test_empty_last_segment_filtered` — insert events with these
+  project_roots: `'/Users/.../vibelive'`, `'/Users/.../'` (trailing
+  slash), `'/'`, `''` (empty), and `null`. Assert K computed by
+  `index_subscription_metadata` and `distinct_project_root_tokens`
+  contains exactly `["vibelive"]` — no empty string token.
+- `test_event_with_null_project_root_skips_lockout` — Python-side
+  test: `is_project_mismatch(event_with_null_project_root, sub)`
+  returns False even when `sub.metadata.matched_projects` is
+  non-empty. The event passes through to the gatekeeper LLM
+  rather than being hard-skipped.
+- `test_python_sql_hash_equivalence` — call
+  `lockout.known_project_tokens()` and the SQL function on the
+  same data; assert k_hash byte-equals between Python and SQL.
+  Catches drift in the hash recipe (sort order, separator,
+  algorithm, hex prefix length, empty-K handling).
 
-**Exit criterion**: all 7 unit tests pass; one Python REPL trial
+**Exit criterion**: all 10 unit tests pass; one Python REPL trial
 inserting a vibelive event + a sub with description "vibelive 进展
 告诉我" + an unrelated sub "bcc 在干嘛" results in
 `subscriptions.metadata.matched_projects = ["vibelive"]` for the
