@@ -281,34 +281,65 @@ project lockout — the central anti-misfire mechanism for 1.0c.
     Used by both lockout's lazy recompute and add_subscription's
     synchronous initial write.
 
-- `bot/agent/tools_meta.py::add_subscription` — after the row is
-  inserted via `queries.add_subscription(...)`, immediately call:
-  ```python
-  K, k_hash = lockout.known_project_tokens()
-  matched = lockout.matched_projects_for(description, K)
-  queries.write_subscription_metadata(sub_id, {
-      "matched_projects": matched,
-      "project_tokens_hash": k_hash,
-      "indexed_at": now_iso(),
-  })
-  ```
-  Same call from the web rules panel's `createNotificationRule`
-  server action — see §2.5.1 below.
+**Single source of truth**: the SQL function
+`index_subscription_metadata(subscription_id)` (§2.5.1) is the
+ONLY place the long/short boundary matching logic lives. Both
+the bot and the web call it via `sb_admin().rpc(...)` after any
+description-touching mutation. The Python `bot/agent/lockout.py`
+module does NOT re-implement matching — it only reads cached
+metadata and triggers the RPC on cache miss / hash mismatch.
 
+Call sites that MUST invoke `index_subscription_metadata` after
+their write:
+
+- `bot/agent/tools_meta.py::add_subscription` — after the row is
+  inserted via `queries.add_subscription(...)`.
+- `bot/agent/tools_meta.py::update_subscription` — only if
+  `description` is in the updated fields. Other field changes
+  (enabled, etc.) don't affect the lockout match.
 - `web/app/notifications/rules/actions.ts::createNotificationRule`
-  — after the insert, the server action must populate
-  `metadata.matched_projects` synchronously. Two implementation
-  options:
-  1. Add a server-side helper `lib/lockout.ts` that mirrors
-     `bot/agent/lockout.py`'s logic in TypeScript (long/short
-     boundary rules + the regex set). Run it inline.
-  2. Add a service-role-only RPC `index_subscription_metadata(
-     p_subscription_id)` that does the same work in PL/pgSQL:
-     reads description, reads `select distinct project_root from
-     events`, writes metadata. Web action calls the RPC.
-  
-  **Pick option 2** for 1.0c — keeps the matching logic in one
-  place (SQL) and avoids JS/Python drift. See §2.5.1.
+  — after the insert.
+- `web/app/notifications/rules/actions.ts::updateNotificationRule`
+  — after a successful description update. (The `enabled` toggle
+  and the archive action don't touch description and skip
+  reindex.)
+
+```python
+# bot/db/queries.py
+def index_subscription_metadata(subscription_id: str) -> None:
+    sb_admin().rpc("index_subscription_metadata", {
+        "p_subscription_id": subscription_id,
+    }).execute()
+```
+
+```ts
+// web/app/notifications/rules/actions.ts
+await admin.rpc('index_subscription_metadata',
+                { p_subscription_id: id });
+```
+
+The lazy-recompute path in `bot/agent/lockout.py::is_project_mismatch`
+also calls this RPC (NOT a parallel Python implementation):
+
+```python
+def is_project_mismatch(event, sub) -> bool:
+    K, k_hash = known_project_tokens()
+    cached = sub.metadata.get("matched_projects")
+    cached_hash = sub.metadata.get("project_tokens_hash")
+    if cached is None or cached_hash != k_hash:
+        # SQL is authoritative — call the RPC, then re-read.
+        queries.index_subscription_metadata(sub.id)
+        sub = queries.get_subscription(sub.id)  # refetch metadata
+        cached = sub.metadata.get("matched_projects") or []
+    if not cached:
+        return False
+    return last_segment(event.project_root).lower() not in set(cached)
+```
+
+This means **zero parallel matching code**: the long/short
+boundary rules, the regex set, the hash, all live exclusively in
+the PL/pgSQL function. Python and TypeScript are reduced to RPC
+clients.
 
 ### 2.5.1 `index_subscription_metadata` SQL function
 
@@ -335,6 +366,7 @@ begin
     desc_lower := lower(coalesce(sub.description, ''));
 
     -- K = distinct last-segment of events.project_root, lowercased.
+    -- coalesce → empty array if no events yet (fresh deployment).
     select coalesce(array_agg(distinct lower(
                regexp_replace(project_root, '^.*/', '')
            )), array[]::text[])
@@ -342,42 +374,69 @@ begin
       from public.events
      where project_root is not null and project_root <> '';
 
-    -- k_hash = first 16 chars of sha256(sorted(K) joined by '|')
+    -- k_hash = first 16 chars of sha256 of sorted-and-joined K.
+    -- coalesce(..., '') guards against the empty-K case where
+    -- array_to_string returns null and digest(null) is null.
+    -- Empty K → consistent empty-K hash, NOT null.
     k_hash := substr(
-        encode(digest(array_to_string(
+        encode(digest(coalesce(array_to_string(
             (select array_agg(t order by t) from unnest(k_array) t),
             '|'
-        ), 'sha256'), 'hex'),
+        ), ''), 'sha256'), 'hex'),
         1, 16
     );
 
     -- Match: long tokens via word boundary, short tokens via
     -- explicit project-context patterns (project X / 项目 X / `X` /
-    -- /X/ / "X").
+    -- /X/ / "X"). Each token is regex-escaped before composition;
+    -- a project_root last-segment can legitimately contain '.', '+',
+    -- '(', etc., and we MUST NOT let those be interpreted as regex
+    -- metacharacters (would either misfire or raise).
     matched := array[]::text[];
-    foreach tok in array k_array loop
-        if length(tok) >= 4 then
-            if desc_lower ~ ('\m' || tok || '\M') then
-                matched := matched || tok;
+    declare
+        tok_re text;
+    begin
+        foreach tok in array k_array loop
+            -- Escape Postgres POSIX-regex metacharacters: \ ^ $ . | ?
+            -- * + ( ) [ ] { }. The \\\\ is intentional — we're
+            -- inside SQL string literal that becomes the regex source.
+            tok_re := regexp_replace(tok,
+                '([\\\^\$\.\|\?\*\+\(\)\[\]\{\}])',
+                '\\\1', 'g');
+            if length(tok) >= 4 then
+                -- \m and \M are POSIX word-start / word-end anchors.
+                if desc_lower ~ ('\m' || tok_re || '\M') then
+                    matched := matched || tok;
+                end if;
+            else
+                -- Short token: only match in explicit project context.
+                if desc_lower ~ ('\mproject[\s\-_:]*' || tok_re || '\M')
+                   or desc_lower ~ ('项目[\s\-_:''`"]*' || tok_re ||
+                                     '($|[\s''`"])')
+                   or desc_lower ~ ('`' || tok_re || '`')
+                   or desc_lower ~ ('/' || tok_re || '(/|$|[^a-z0-9])')
+                   or desc_lower ~ ('"' || tok_re || '"')
+                then
+                    matched := matched || tok;
+                end if;
             end if;
-        else
-            if desc_lower ~ ('\bproject[\s\-_:]*' || tok || '\b')
-               or desc_lower ~ ('项目[\s\-_:''`"]*' || tok || '($|[\s''`"])')
-               or desc_lower ~ ('`' || tok || '`')
-               or desc_lower ~ ('/' || tok || '(/|$|[^a-z0-9])')
-               or desc_lower ~ ('"' || tok || '"')
-            then
-                matched := matched || tok;
-            end if;
-        end if;
-    end loop;
+        end loop;
+    end;
 
+    -- Always write a JSON array (even if empty) and a real hash
+    -- string (even for empty K). `matched_projects = null` would
+    -- be read as Python None and trigger lazy recompute every
+    -- decider iteration; `[]` is the correct "I checked, nothing
+    -- matched" signal.
     update public.subscriptions
        set metadata = coalesce(metadata, '{}'::jsonb) ||
                       jsonb_build_object(
-                          'matched_projects', to_jsonb(
-                              (select array_agg(t order by t)
-                                 from unnest(matched) t)),
+                          'matched_projects',
+                              coalesce(
+                                  (select to_jsonb(array_agg(t order by t))
+                                     from unnest(matched) t),
+                                  '[]'::jsonb
+                              ),
                           'project_tokens_hash', k_hash,
                           'indexed_at', now()::text
                       )
@@ -393,18 +452,38 @@ The bot's `lockout.py` and web's server action both call
 add_subscription. The bot also calls it on lazy recompute (cache
 miss / hash mismatch in `is_project_mismatch`).
 
-**Unit tests** (mirroring spec §7.1's regression list):
-- `test_long_token_word_boundary` — both Python `lockout.py` and
-  the SQL function via psql harness.
-- `test_short_token_requires_project_context` — likewise.
+**Unit tests** (run against the SQL function via psql / supabase
+test harness, since the matching is now SQL-only):
+- `test_long_token_word_boundary` — K={"vibelive"}; descriptions
+  `vibelive 进展` / `/Users/.../vibelive` / `I built vibelive`
+  match; `vibelivexyz` and `pre-vibelivectomy` don't.
+- `test_short_token_requires_project_context` —
+  K={"c","go","ai"}; verify `项目 C` / `project c` / `/c/` /
+  ``\`go\``` / `"ai"` match; bare `bcc`, `again`, `ai 助手` don't.
 - `test_short_token_does_not_misfire_on_unrelated_description` —
-  bcc / again / ai cases.
+  K={"c"}, sub "bcc 在做啥" → `matched_projects=[]`. Critical
+  regression: a real user handle must not get hard-skipped.
 - `test_index_subscription_metadata_idempotent` — calling the SQL
   function twice yields the same metadata.
-- `test_index_subscription_metadata_no_events` — when events table
-  is empty, matched_projects=[], k_hash is the empty-set digest.
+- `test_index_subscription_metadata_no_events` — when events
+  table is empty: `matched_projects=[]` (JSON array, NOT null),
+  `project_tokens_hash` is a real 16-char hex string (NOT null).
+  Reading metadata from Python: `cached is not None`, so lazy
+  recompute does NOT re-fire on every decider iteration.
+- `test_token_with_regex_metacharacters` — insert a fake event
+  with `project_root='/Users/.../c++.proj'` (period + plus signs
+  in the last segment). K contains `c++.proj`. Subscription
+  `c++.proj 进展告诉我` should match; subscription `cxx-proj
+  进展` should NOT match. Without the regex escape, `+` and `.`
+  would corrupt the regex and either raise or misfire.
+- `test_description_update_reindexes` — create sub with
+  description "vibelive 进展", verify metadata has
+  `matched_projects=["vibelive"]`. Update description to
+  "oneship 进展", verify update_subscription / updateNotificationRule
+  re-call index_subscription_metadata so metadata becomes
+  `["oneship"]`, NOT stuck at `["vibelive"]`.
 
-**Exit criterion**: all 5 unit tests pass; one Python REPL trial
+**Exit criterion**: all 7 unit tests pass; one Python REPL trial
 inserting a vibelive event + a sub with description "vibelive 进展
 告诉我" + an unrelated sub "bcc 在干嘛" results in
 `subscriptions.metadata.matched_projects = ["vibelive"]` for the

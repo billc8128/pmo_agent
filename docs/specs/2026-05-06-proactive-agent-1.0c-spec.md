@@ -249,7 +249,9 @@ For each (event, candidate subscription) pair:
           (path segment). Pure occurrence of the letter inside
           another word is NOT a match.
 
-        Implementation in `matched_projects_for(description, K)`
+        Implementation in PL/pgSQL function
+        `index_subscription_metadata` (plan §2.5.1) — single source
+        of truth, called from both bot and web
         below. Cached on `subscriptions.metadata.matched_projects`.
 
      Lockout rule: if `M_sub` is non-empty AND
@@ -339,98 +341,65 @@ def known_project_tokens() -> tuple[set[str], str]:
     _cache_hash = sha256("|".join(sorted(_cache_K)).encode()).hexdigest()[:16]
     return _cache_K, _cache_hash
 
-_LONG_TOKEN_MIN_LEN = 4   # "vibelive" / "oneship" / "pmo_agent" / "feishu" all qualify
-
-# Explicit project-context patterns that anchor a short token to
-# something the user clearly meant as a project name. We're
-# deliberately conservative — a positive match here means we'll
-# enforce hard lockout, so false positives (matching when user
-# didn't mean a project) are worse than false negatives (missing
-# a match → just falls through to the LLM gatekeeper).
-def _short_token_in_project_context(token: str, desc_lower: str) -> bool:
-    # Each pattern requires the token to appear adjacent to an
-    # explicit "project" cue. \b is a word boundary in the regex
-    # sense (non-word ↔ word transition). We also accept Chinese
-    # 项目 X / 项目-X / 项目"X" / 项目`X`.
-    import re
-    t = re.escape(token)
-    patterns = [
-        rf"\bproject[\s\-_:]*{t}\b",         # "project c" / "project-c"
-        rf"项目[\s\-_:'`\"]*{t}(?:[\b\s'`\"]|$)",  # "项目 C" / "项目`c`"
-        rf"`{t}`",                            # backticked
-        rf"/{t}(?:/|\b|$)",                   # path-segment "/c/"
-        rf"\"{t}\"",                          # quoted
-    ]
-    return any(re.search(p, desc_lower) for p in patterns)
-
-
-def matched_projects_for(description: str, K: set[str]) -> list[str]:
-    """Returns the subset of K that the description "names" as a
-    project. Long tokens (≥4 chars) match by word boundary; short
-    tokens (≤3 chars, e.g. 'c', 'go', 'ai') only match when they
-    appear in an explicit project-context phrasing. This avoids
-    misfiring on e.g. 'bcc' containing 'c'.
-    """
-    import re
-    desc_lower = description.lower()
-    out: list[str] = []
-    for t in K:
-        if len(t) >= _LONG_TOKEN_MIN_LEN:
-            # Word-boundary match — won't fire on substrings like
-            # 'vibelive' inside 'vibelivexyz' (none of which exist
-            # in real project_roots anyway, but be safe).
-            if re.search(rf"\b{re.escape(t)}\b", desc_lower):
-                out.append(t)
-        else:
-            # Short token: require explicit project-context phrasing.
-            if _short_token_in_project_context(t, desc_lower):
-                out.append(t)
-    return sorted(out)
-
 def is_project_mismatch(event, sub) -> bool:
+    """Lockout check. The matching logic itself is NOT in Python —
+    it lives in PL/pgSQL function `index_subscription_metadata`
+    (plan §2.5.1), which is the single source of truth for the
+    long/short boundary rules and the project-context regex set.
+    Python only reads cached metadata and triggers a re-index on
+    cache miss / hash mismatch.
+    """
     K, k_hash = known_project_tokens()
     cached = sub.metadata.get("matched_projects")
     cached_hash = sub.metadata.get("project_tokens_hash")
     # Recompute when:
     #  - metadata never written (cached is None)
     #  - K has changed since metadata was written (hash mismatch)
-    # The second case is what lets a subscription with stale
-    # matched_projects=[] pick up a new project token after it
-    # appears in events.
+    # In both cases we call the SQL RPC and refetch — we do NOT
+    # have a parallel Python implementation.
     if cached is None or cached_hash != k_hash:
-        matched = matched_projects_for(sub.description, K)
-        write_metadata_async(sub.id, {
-            "matched_projects": matched,
-            "project_tokens_hash": k_hash,
-            "indexed_at": now_iso(),
-        })
-        cached = matched
+        queries.index_subscription_metadata(sub.id)
+        sub = queries.get_subscription(sub.id)  # refetch
+        cached = sub.metadata.get("matched_projects") or []
     if not cached:
         return False
     return last_segment(event.project_root).lower() not in set(cached)
 ```
 
-`add_subscription` (web rules panel + chat tools) populates
-`metadata.matched_projects` AND `metadata.project_tokens_hash`
-synchronously by calling
-`matched_projects_for(description, known_project_tokens())` before
-inserting. If the K cache is empty (e.g. fresh deployment with
-zero events), `matched_projects=[]` and `project_tokens_hash` is
-the empty-set hash; lockout doesn't fire — but in that state
-there are no events to misfire against either, so the safety
-property holds vacuously.
+**Single source of truth for matching**: The long token / short
+token boundary rules described above in §4.1 step 1 are
+implemented in **one place only**: the PL/pgSQL function
+`index_subscription_metadata` defined in plan §2.5.1. Python's
+`bot/agent/lockout.py` reads cached metadata; web's
+`createNotificationRule` server action calls the RPC; both go
+through the same SQL. There is no parallel Python or TypeScript
+matching implementation — drift is impossible because there's
+only one implementation.
+
+**Reindex triggers** (every site that mutates `description`):
+- `add_subscription` (chat tool + web rules panel) — call
+  `index_subscription_metadata` after the insert
+- `update_subscription` (chat tool + web rules panel) — call
+  `index_subscription_metadata` after a successful description
+  update. `enabled` toggle and `archived_at` set don't change
+  description and skip the reindex
+- Lazy recompute in `is_project_mismatch` — when K's hash has
+  shifted underneath an existing subscription
 
 **Subscription is fully active the moment it's inserted**. No
 "async indexing window" during which lockout doesn't apply.
+If the K cache is empty (fresh deployment with zero events),
+`matched_projects=[]` and lockout doesn't fire — but in that
+state there are no events to misfire against, so the safety
+property holds vacuously.
 
 **Stale-cache handling**: when a new `project_root` first appears
-in events, the 60s K cache expires, K's hash changes, and every
+in events, the 60s K cache expires, k_hash changes, every
 subscription's metadata becomes "stale" (hash mismatch). On the
-next decider iteration that sees each subscription, the lockout
-re-runs `matched_projects_for(description, K)` against the new K
-and writes back the fresh hash. Subscriptions whose description
-contains the new token gain lockout protection within at most
-one decider iteration of the new project_root showing up.
+next decider iteration that sees each subscription, lockout calls
+the RPC against the new K and refetches. Subscriptions whose
+description contains the new token gain lockout protection within
+at most one decider iteration of the new project_root showing up.
 
 ### 4.2 Aggregation window — when to share a job
 
@@ -560,15 +529,21 @@ security definer
 as $$
 declare
     new_notif_id bigint;
+    locked_job_id bigint;
 begin
-    -- Lease re-check: if another investigator already finished
-    -- this job (notified/suppressed/failed), abort cleanly.
-    if not exists (
-        select 1 from public.investigation_jobs
-         where id = p_job_id
-           and claim_id = p_claim_id
-           and status = 'investigating'
-    ) then
+    -- Lease acquisition + row lock in one step. SELECT FOR UPDATE
+    -- on the job row guarantees that between this check and the
+    -- final UPDATE below, no concurrent reaper / claim / suppress
+    -- can flip the row underneath us. If we don't get the row
+    -- (lease lost OR row reaped to pending), return null cleanly
+    -- without writing any notification.
+    select id into locked_job_id
+      from public.investigation_jobs
+     where id = p_job_id
+       and claim_id = p_claim_id
+       and status = 'investigating'
+     for update;
+    if not found then
         return null;
     end if;
 
