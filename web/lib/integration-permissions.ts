@@ -9,9 +9,7 @@ export function canManageIntegrations(viewer: IntegrationViewer | null): boolean
   const allowedHandles = splitEnvList(process.env.PMO_INTEGRATION_ADMIN_HANDLES)
     .map((h) => h.replace(/^@/, '').toLowerCase());
 
-  // Internal default for 2.0a: any signed-in PMO user can maintain repo
-  // mappings. Deployments that need stricter control can set either env var.
-  if (allowedIds.length === 0 && allowedHandles.length === 0) return true;
+  if (allowedIds.length === 0 && allowedHandles.length === 0) return false;
   return (
     allowedIds.includes(viewer.id) ||
     Boolean(viewer.handle && allowedHandles.includes(viewer.handle.toLowerCase()))

@@ -156,7 +156,7 @@ def _investigator_mcp(ctx: RequestContext):
 
     @tool(
         "fetch_pr_files",
-        "Fetch files changed in a GitHub or Gitea PR event. Use sparingly when a subscription explicitly needs file/spec/plan details.",
+        "Fetch files changed in a GitHub or Gitea PR event, including patch_excerpt snippets. Use sparingly when a subscription explicitly needs file/spec/plan change details.",
         {"event_id": int, "paths_filter": list},
     )
     async def fetch_pr_files_tool(args: dict) -> dict[str, Any]:

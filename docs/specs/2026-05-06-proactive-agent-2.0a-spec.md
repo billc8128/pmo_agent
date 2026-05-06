@@ -52,13 +52,13 @@ In scope:
   → profile_id
 - `external_repos` table mapping (provider, repo full_name)
   → project_root
-- Renderer enrichment: when a brief's evidence references a
-  GitHub PR / commit, the renderer can read PR diff / mentioned
-  files via a small fetch helper
+- Investigator enrichment: when a candidate job references a
+  GitHub/Gitea PR, the investigator can read changed-file
+  metadata and patch excerpts via a small fetch helper
 - `/integrations` UI for viewing provider status, managing repo
   mappings, copying webhook URLs, and checking recent deliveries
-- Optional self-claim UX in chat ("我的 GitHub 是 billc8128") for
-  actor attribution
+- Optional service-role/admin-managed actor attribution via
+  `external_identities`
 - Decider's project lockout (1.0c §4.1) keeps working — webhook
   events feed the same `project_root` field used by lockout
 
@@ -66,8 +66,8 @@ Out of scope (explicitly):
 
 - Linear, Jira, Slack, Feishu Calendar, Feishu Doc — separate
   future axes
-- OAuth-based identity claim — 2.0a uses self-claim only; OAuth
-  is 2.0a-followup if needed
+- OAuth-based identity claim / self-serve account claiming —
+  2.0a does not let users self-assert external account ownership
 - Bot writing back to GitHub (commenting on PR, adding labels,
   etc.) — 2.0 invariant: no auto-actions
 - Repo discovery / auto-mapping without explicit configuration —
@@ -123,10 +123,10 @@ Why both `external_login` and `external_id`:
   the numeric id doesn't.
 - Webhook payloads include both — we match on id when present,
   fall back to login otherwise.
-- For self-claim (initial UX), the user types their login.
-  Background reconciliation later resolves to id when we make
-  authenticated API calls — at that point the
-  `extid_id_unique` partial index activates.
+- 2.0a does not expose a self-claim chat tool, because a login
+  string alone does not prove ownership. Rows are service-role /
+  admin-managed until an OAuth or challenge-based verification
+  flow exists.
 
 A profile can have multiple identities (one per provider).
 Both external_login AND (when present) external_id are unique
@@ -341,7 +341,8 @@ For each event type we extract a stable shape into
 `external_webhook_deliveries` (§3.5) for service-only
 debugging. The LLM agents never see raw bodies — they read
 `events.payload` (the normalised shape below), and for richer
-content they explicitly call tools like `fetch_pr_files` (§6).
+content the investigator explicitly calls tools like
+`fetch_pr_files` (§6).
 
 Why no `payload.raw` even though earlier drafts had it: raw
 GitHub PR bodies run 50-200KB, would multiply token cost on
@@ -518,10 +519,9 @@ normal PMO product permissions.
 
 - Everyone can view connected providers, mapped repositories,
   webhook URLs, and recent accepted deliveries.
-- Signed-in PMO maintainers can add/remove repo mappings. In the
-  internal default, any signed-in PMO user can maintain mappings;
-  deployments can restrict this with `PMO_INTEGRATION_ADMIN_USER_IDS`
-  or `PMO_INTEGRATION_ADMIN_HANDLES`.
+- Signed-in PMO maintainers can add/remove repo mappings. The UI
+  fails closed unless `PMO_INTEGRATION_ADMIN_USER_IDS` or
+  `PMO_INTEGRATION_ADMIN_HANDLES` names allowed maintainers.
 - Provider secrets and API tokens are never shown in the browser.
   They stay in the bot deployment environment.
 - Raw webhook payloads stay service-only in
@@ -540,62 +540,39 @@ The setup flow is:
 5. Send a test delivery; `/integrations` should show the accepted
    delivery and whether it linked to an event.
 
-### 5.1 Optional actor attribution via chat tool
+### 5.1 Optional actor attribution
 
-New agent tool `link_external_identity`:
+`external_identities` is optional attribution, not source
+access. It helps subscriptions like "my PRs", "albert 的 merge",
+or "@external_login 的评论" map webhook actors/mentions to PMO
+profiles. Repository access comes from the system integration
+above.
 
-```python
-@tool(
-    "link_external_identity",
-    "Link the asker's GitHub or Gitea login to their pmo_agent "
-    "profile. Required for subscriptions that reference 'my PRs', "
-    "'my commits', or '@<external_login>'. Without this link, "
-    "external events from this user appear as anonymous to the "
-    "decider. \n\n"
-    "Use when the user says things like 'my GitHub is X', "
-    "'我的 gitea 用户名是 Y', '把我和 github billc8128 连起来'.",
-    {"provider": str, "external_login": str},
-)
-async def link_external_identity(args: dict) -> dict:
-    ...
-```
-
-Validations:
-- asker must be a bound pmo_agent user (has feishu_links row)
-- provider in {'github', 'gitea'}
-- external_login matches `^[a-zA-Z0-9-]{1,39}$` (GitHub login
-  rules; gitea is similar)
-- if `(provider, external_login)` already claimed by another
-  profile, return error: "this login is already claimed by
-  another user; if that's a mistake, contact bcc"
-
-The corresponding `unlink_external_identity` tool exists for
-removal. This table is optional attribution, not source access.
-It only helps subscriptions like "my PRs", "albert 的 merge", or
-"@external_login 的评论". Repository access comes from the
-system integration above.
+2.0a keeps identity rows service-role/admin-managed. There is no
+`link_external_identity` chat tool in the agent, because a user
+typing "my GitHub is X" is not proof of ownership. A self-serve
+OAuth/challenge flow can be added later.
 
 ---
 
-## 6. Renderer enrichment
+## 6. Investigator enrichment
 
-When the investigator's brief contains `evidence_event_ids` that
-reference webhook events with `payload.event_type IN
-('pull_request', 'push', 'release')`, the renderer can pull
-additional context to make the message useful:
+When a candidate investigation job references webhook events with
+`payload.event_type='pull_request'`, the investigator can pull
+changed-file metadata and patch excerpts before it decides
+notify/suppress and writes the structured brief:
 
 ### 6.1 PR diff / files reading
 
-For `pull_request` evidence, renderer optionally calls a new
-read-only tool:
+For `pull_request` evidence, the investigator optionally calls a
+new read-only tool:
 
 ```python
 @tool(
     "fetch_pr_files",
     "Fetch the list of files changed in a GitHub or Gitea PR, "
-    "optionally with content of specific files (e.g. spec / "
-    "plan files). Returns up to 30 files with paths + first 200 "
-    "chars of content. \n\n"
+    "optionally narrowed by paths_filter. Returns up to 30 files "
+    "with paths + first 200 chars of patch_excerpt. \n\n"
     "Use when the user's subscription mentions 'send the spec / "
     "plan to X' or when the brief's key_facts cite specific "
     "files. Costs an external API call — use sparingly.",
@@ -611,10 +588,10 @@ Implementation:
 - Cache results in a new `external_resource_cache` table for 24h
   to avoid hammering external APIs
 
-This tool is added to the renderer's tool subset. It's also
-available to the investigator (which is the right place for
-"read enough context" — but in practice we expect investigator
-to pull this only for high-signal cases).
+This tool is added only to the investigator's tool subset. The
+renderer deliberately does not get it; renderer must turn the
+investigator's structured brief into Feishu markdown and must not
+add new facts.
 
 ### 6.2 Cache schema
 
@@ -644,19 +621,19 @@ Expired (`expires_at < now()`) → treated as miss.
 A daily reaper (or `delete from external_resource_cache where
 expires_at < now() - interval '7 days'`) keeps the table small.
 
-### 6.3 Renderer prompt extension
+### 6.3 Investigator / renderer prompt boundary
 
-The 1.0c renderer prompt is extended with a small section for
-events with external content:
+The investigator prompt gets a small section for events with
+external content:
 
 ```
-如果 brief 提到 PR / commit 而你需要补充改动详情，可以调
-fetch_pr_files。**仅当订阅文案明确要求 spec / plan / 文件内容
-时才调用**——大部分情况 brief 自己已经够说清楚了。
+如果 seed event 包含 PR，而订阅文案明确要求 spec / plan /
+文件改动细节，可以调用 fetch_pr_files。该工具返回 patch_excerpt，
+不是完整文件内容；不要把 patch 说成完整 spec/plan。
 ```
 
-Renderer must NOT add facts beyond what the brief and the
-fetched files actually contain — same 1.0c invariant.
+Renderer keeps the 1.0c invariant: it must not call external
+fetch tools, add facts beyond the brief, or expand evidence.
 
 ---
 
@@ -784,7 +761,7 @@ Decider call growth proportional to event growth. Investigator
 call growth lower — most webhook events go to the same
 investigation_job per subscription per aggregation window.
 
-Renderer enrichment: each `fetch_pr_files` call is a single
+Investigator enrichment: each `fetch_pr_files` call is a single
 external API hit + 24h cache. At <5 PRs/day, this is a few
 calls/day at most.
 
@@ -794,9 +771,10 @@ calls/day at most.
 
 Concrete e2e scripts the implementation must pass:
 
-### 9.1 Identity claim → event ingestion
+### 9.1 Identity attribution → event ingestion
 
-1. bcc claims github login `billc8128`
+1. Service-role/admin maps github login `billc8128` to bcc's
+   profile in `external_identities`
 2. A test webhook delivery comes in with `actor.login=billc8128`
 3. Resulting `events` row has `user_id=bcc.profile_id`
 
@@ -820,15 +798,15 @@ Concrete e2e scripts the implementation must pass:
    files_changed=['docs/spec.md', 'docs/plan.md', 'src/foo.ts']
 3. Webhook arrives → events row → gatekeeper opens job →
    investigator runs → calls `fetch_pr_files` with paths_filter
-   for spec/plan → brief includes file contents
-4. bcc's DM has a notification with the spec.md and plan.md
-   excerpts visible
+   for spec/plan → brief includes patch excerpts for those files
+4. bcc's DM has a notification grounded in the changed-file /
+   patch excerpts, without claiming to include full file contents
 
-### 9.4 Identity claim conflict
+### 9.4 Identity attribution conflict
 
-1. bcc claims `billc8128`
-2. albert tries to claim `billc8128` → tool returns error
-   "already claimed"
+1. Admin inserts `billc8128` for bcc
+2. A second insert/upsert attempt for albert violates the
+   uniqueness contract or is rejected by the service helper
 
 ### 9.5 Webhook signature failure
 

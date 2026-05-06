@@ -136,11 +136,11 @@ Three pieces this needs:
    `external_repos` table OR derive it from the daemon's
    `project_root` for existing pmo users.
 
-4. **Renderer enrichments**: when the brief's evidence references
-   a github PR, the renderer can fetch its diff/files (cached)
-   and embed a summary. Most user value here is "include the
-   spec/plan files mentioned in the merge" — which means
-   investigator needs the ability to read PR file contents.
+4. **Investigator enrichments**: when candidate evidence
+   references a github PR, the investigator can fetch changed-file
+   metadata and patch excerpts (cached) before it writes the
+   brief. Renderer only renders the brief and must not fetch new
+   facts after the final notify/suppress decision.
 
 The pipeline downstream is unchanged: existing gatekeeper,
 investigator, renderer, delivery all work because they read

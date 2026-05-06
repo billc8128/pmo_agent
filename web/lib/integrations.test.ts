@@ -9,6 +9,7 @@ const {
   toPublicExternalRepo,
   validateExternalRepoInput,
 } = await import('./integrations.ts');
+const { canManageIntegrations } = await import('./integration-permissions.ts');
 
 test('validates external repo mappings for supported providers', () => {
   assert.deepEqual(
@@ -86,4 +87,32 @@ test('builds provider webhook URLs from configured bot base URL', () => {
     'https://pmo-bot.up.railway.app/webhooks/github',
   );
   assert.equal(buildWebhookUrl('', 'gitea'), '/webhooks/gitea');
+});
+
+test('integration management is fail-closed unless admin env is configured', () => {
+  const previousIds = process.env.PMO_INTEGRATION_ADMIN_USER_IDS;
+  const previousHandles = process.env.PMO_INTEGRATION_ADMIN_HANDLES;
+  delete process.env.PMO_INTEGRATION_ADMIN_USER_IDS;
+  delete process.env.PMO_INTEGRATION_ADMIN_HANDLES;
+  try {
+    assert.equal(canManageIntegrations({ id: 'user-1', handle: 'chenchen' }), false);
+
+    process.env.PMO_INTEGRATION_ADMIN_HANDLES = 'chenchen,@bcc';
+    assert.equal(canManageIntegrations({ id: 'user-1', handle: 'chenchen' }), true);
+    assert.equal(canManageIntegrations({ id: 'user-2', handle: 'other' }), false);
+
+    process.env.PMO_INTEGRATION_ADMIN_USER_IDS = 'user-3';
+    assert.equal(canManageIntegrations({ id: 'user-3', handle: 'other' }), true);
+  } finally {
+    if (previousIds === undefined) {
+      delete process.env.PMO_INTEGRATION_ADMIN_USER_IDS;
+    } else {
+      process.env.PMO_INTEGRATION_ADMIN_USER_IDS = previousIds;
+    }
+    if (previousHandles === undefined) {
+      delete process.env.PMO_INTEGRATION_ADMIN_HANDLES;
+    } else {
+      process.env.PMO_INTEGRATION_ADMIN_HANDLES = previousHandles;
+    }
+  }
 });

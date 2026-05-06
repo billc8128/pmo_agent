@@ -23,7 +23,6 @@ from agent.request_context import RequestContext
 from agent.tool_utils import err, ok
 from config import settings
 from db import queries
-from external.fetch import fetch_pr_files
 
 logger = logging.getLogger(__name__)
 
@@ -154,30 +153,6 @@ def _renderer_mcp(ctx: RequestContext):
         except Exception as e:
             return err(str(e))
 
-    @tool(
-        "fetch_pr_files",
-        "Fetch files changed in a GitHub or Gitea PR event. Only call when the subscription explicitly asks for file/spec/plan details.",
-        {"event_id": int, "paths_filter": list},
-    )
-    async def fetch_pr_files_tool(args: dict) -> dict[str, Any]:
-        try:
-            event = queries.get_event(int(args["event_id"]))
-            if not event or event.get("source") not in ("github", "gitea"):
-                return err("event is not a GitHub/Gitea PR event")
-            payload = event.get("payload") or {}
-            if payload.get("event_type") != "pull_request":
-                return err("event is not a pull_request")
-            return ok(
-                await fetch_pr_files(
-                    event["source"],
-                    payload["repo"]["full_name"],
-                    int(payload["pr"]["number"]),
-                    paths_filter=args.get("paths_filter") or None,
-                )
-            )
-        except Exception as e:
-            return err(str(e))
-
     return create_sdk_mcp_server(
         name="pmo_renderer",
         version="0.1.0",
@@ -189,7 +164,6 @@ def _renderer_mcp(ctx: RequestContext):
             get_activity_stats,
             today_iso,
             resolve_subject_mention,
-            fetch_pr_files_tool,
         ],
     )
 
@@ -211,7 +185,6 @@ async def _render_inner(
             "mcp__pmo_renderer__get_activity_stats",
             "mcp__pmo_renderer__today_iso",
             "mcp__pmo_renderer__resolve_subject_mention",
-            "mcp__pmo_renderer__fetch_pr_files",
         ],
         mcp_servers={"pmo_renderer": _renderer_mcp(ctx)},
         disallowed_tools=[

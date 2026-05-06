@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -33,16 +32,6 @@ def _require_bound_asker(ctx: RequestContext) -> str:
     if not ctx.asker_user_id:
         raise ValueError("你还没在 web 上绑定飞书账号，先去 https://pmo-agent-sigma.vercel.app/me 绑一下")
     return ctx.asker_user_id
-
-
-_EXTERNAL_LOGIN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,78}$")
-
-
-def _provider(value: Any) -> str:
-    provider = str(value or "").strip().lower()
-    if provider not in {"github", "gitea"}:
-        raise ValueError("provider must be github or gitea")
-    return provider
 
 
 def build_meta_tools(ctx: RequestContext):
@@ -359,55 +348,6 @@ def build_meta_tools(ctx: RequestContext):
             return err(str(e))
 
     @tool(
-        "link_external_identity",
-        "Link the asker's GitHub or Gitea login to their pmo_agent profile so external webhook events can map back to them.",
-        {"provider": str, "external_login": str, "external_id": str},
-    )
-    async def link_external_identity(args: dict) -> dict[str, Any]:
-        try:
-            asker_user_id = _require_bound_asker(ctx)
-            provider = _provider(args.get("provider"))
-            login = str(args.get("external_login") or args.get("login") or "").strip()
-            if not _EXTERNAL_LOGIN_RE.match(login):
-                return err("external_login must look like a GitHub/Gitea username")
-            row = queries.link_external_identity(
-                asker_user_id,
-                provider,
-                login,
-                external_id=(str(args.get("external_id")).strip() if args.get("external_id") else None),
-            )
-            return ok({"identity": row})
-        except Exception as e:
-            return err(str(e))
-
-    @tool(
-        "unlink_external_identity",
-        "Unlink the asker's GitHub or Gitea login from their pmo_agent profile.",
-        {"provider": str},
-    )
-    async def unlink_external_identity(args: dict) -> dict[str, Any]:
-        try:
-            asker_user_id = _require_bound_asker(ctx)
-            provider = _provider(args.get("provider"))
-            removed = queries.unlink_external_identity(asker_user_id, provider)
-            return ok({"removed": removed, "provider": provider})
-        except Exception as e:
-            return err(str(e))
-
-    @tool(
-        "list_external_identities",
-        "List the asker's linked GitHub and Gitea identities.",
-        {},
-    )
-    async def list_external_identities(args: dict) -> dict[str, Any]:
-        try:
-            asker_user_id = _require_bound_asker(ctx)
-            rows = queries.external_identities_for_profile(asker_user_id)
-            return ok({"identities": rows, "count": len(rows)})
-        except Exception as e:
-            return err(str(e))
-
-    @tool(
         "why_no_notification",
         "Inspect recent decision logs to explain why a proactive notification did not arrive.",
         {"query": str, "hours": int, "scope_kind": str},
@@ -505,9 +445,6 @@ def build_meta_tools(ctx: RequestContext):
         list_subscriptions,
         update_subscription,
         remove_subscription,
-        link_external_identity,
-        unlink_external_identity,
-        list_external_identities,
         why_no_notification,
         resolve_subject_mention,
     ]

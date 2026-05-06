@@ -40,7 +40,7 @@ async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: 
                 "additions": row.get("additions"),
                 "deletions": row.get("deletions"),
                 "changes": row.get("changes"),
-                "content_excerpt": patch[:200] if patch else "",
+                "patch_excerpt": patch[:200] if patch else "",
             }
         )
     return {"files": files, "count": len(files)}

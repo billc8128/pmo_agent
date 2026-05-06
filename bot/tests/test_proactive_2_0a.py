@@ -68,6 +68,35 @@ def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch
     assert "raw" not in normalized
 
 
+def test_issue_comment_normalizer_resolves_at_mentions(monkeypatch):
+    from external import normalizer
+
+    def fake_lookup(provider, login, external_id=None):
+        if (provider, login) == ("github", "hellobit"):
+            return "profile-hellobit"
+        return None
+
+    monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", fake_lookup)
+    monkeypatch.setattr(normalizer.queries, "lookup_project_root_for_repo", lambda *args, **kwargs: "/repo/vibelive")
+
+    normalized = normalizer.normalize_github(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "body": "cc @hellobit and @ghost-user",
+                "html_url": "https://github.com/billc8128/vibelive/issues/1#issuecomment-1",
+                "created_at": "2026-05-06T08:00:00Z",
+            },
+            "issue": {"number": 1, "title": "RTC check"},
+            "repository": {"full_name": "billc8128/vibelive"},
+            "sender": {"login": "reviewer", "id": 456},
+        },
+    )
+
+    assert normalized["mentioned_profile_ids"] == ["profile-hellobit"]
+
+
 def test_build_judge_event_for_pull_request_projection():
     from agent.decider import build_judge_event
 
@@ -250,13 +279,61 @@ def test_stable_payload_fingerprint_ignores_delivery_only_fields():
     assert payload_fingerprint(base) != payload_fingerprint(changed)
 
 
-def test_meta_tools_include_external_identity_tools():
+def test_meta_tools_do_not_expose_unverified_external_identity_self_claim():
     from agent.request_context import RequestContext
     from agent.tools_meta import build_meta_tools
 
     names = {tool_def.name for tool_def in build_meta_tools(RequestContext(asker_user_id="profile-1"))}
 
-    assert {"link_external_identity", "unlink_external_identity", "list_external_identities"} <= names
+    assert "link_external_identity" not in names
+    assert "unlink_external_identity" not in names
+    assert "list_external_identities" not in names
+
+
+def test_fetch_pr_files_returns_patch_excerpt_not_content_excerpt(monkeypatch):
+    from external import fetch
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "filename": "docs/spec.md",
+                    "status": "modified",
+                    "additions": 3,
+                    "deletions": 1,
+                    "changes": 4,
+                    "patch": "@@ -1 +1 @@\n-old\n+new",
+                }
+            ]
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(fetch._fetch_pr_files_remote("github", "billc8128/vibelive", 42))
+
+    assert result["files"][0]["patch_excerpt"] == "@@ -1 +1 @@\n-old\n+new"
+    assert "content_excerpt" not in result["files"][0]
+
+
+def test_renderer_mcp_does_not_expose_fetch_pr_files_tool():
+    renderer_source = Path("bot/agent/renderer.py").read_text()
+
+    assert "mcp__pmo_renderer__fetch_pr_files" not in renderer_source
 
 
 def test_migration_0020_defines_external_sources_contracts():

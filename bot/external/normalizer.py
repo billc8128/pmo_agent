@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from db import queries
+
+_MENTION_RE = re.compile(r"(?<![\w.-])@([A-Za-z0-9][A-Za-z0-9_.-]{0,78})")
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -27,6 +30,17 @@ def _repo(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
         "default_branch": repo.get("default_branch") or repo.get("default_branch_name"),
         "project_root": project_root,
     }
+
+
+def _mentioned_profile_ids(provider: str, text: str) -> list[str]:
+    profile_ids: list[str] = []
+    seen: set[str] = set()
+    for login in _MENTION_RE.findall(text or ""):
+        profile_id = queries.lookup_profile_by_external_login(provider, login)
+        if profile_id and profile_id not in seen:
+            profile_ids.append(profile_id)
+            seen.add(profile_id)
+    return profile_ids
 
 
 def _normalize_pull_request(provider: str, raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -126,7 +140,7 @@ def _normalize_issue_comment(provider: str, raw: dict[str, Any]) -> dict[str, An
         "issue": {"number": issue.get("number"), "title": issue.get("title") or ""},
         "repo": repo,
         "actor": _actor(provider, raw),
-        "mentioned_profile_ids": [],
+        "mentioned_profile_ids": _mentioned_profile_ids(provider, comment.get("body") or ""),
     }
 
 

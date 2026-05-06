@@ -539,29 +539,22 @@ arriving late in 1.0c).
 
 ---
 
-## 4. Identity claim chat tool (~30 min)
+## 4. Optional actor attribution helpers (~30 min)
 
-**File**: `bot/agent/tools_meta.py`
+**File**: `bot/db/queries.py`
 
-Add three tools (`link_external_identity`,
-`unlink_external_identity`, `list_external_identities`)
-following the pattern of the existing subscription tools.
+Add service-role helpers for `external_identities`:
 
-`link_external_identity` validates:
-- asker is bound (has feishu_links)
-- provider in {'github', 'gitea'}
-- external_login matches `^[a-zA-Z0-9-]{1,39}$`
-- on conflict (already claimed by another), surface a
-  user-readable error including the suggestion "if that's a
-  mistake, contact bcc"
+Do **not** expose a self-claim chat tool in 2.0a. A user typing
+"my GitHub is X" is not proof of ownership. `external_identities`
+is optional actor attribution, not source access, and remains
+service-role/admin-managed until OAuth or another verification
+flow exists.
 
-Tools added to `build_meta_tools(ctx)` list and to runner.py
-SYSTEM_PROMPT (so users know what to ask for).
-
-**Exit criterion**: from Feishu DM with bot, "我的 github 是
-billc8128" → bot calls `link_external_identity` →
-`external_identities` row exists → "我都绑定了哪些外部账号" →
-bot lists them.
+**Exit criterion**: admin/service helper can map
+`github:billc8128 → bcc.profile_id`; webhook normalisation sets
+`events.user_id` for actor `billc8128`; `build_meta_tools` does
+not expose `link_external_identity`.
 
 ---
 
@@ -587,10 +580,9 @@ opening SQL.
 **UX contract**:
 - Everyone can view connected providers, repo mappings, generated
   webhook URLs, and recent accepted deliveries.
-- Signed-in maintainers can add/remove repo mappings. Internal
-  default: any signed-in PMO user can maintain mappings. To
-  restrict it, set `PMO_INTEGRATION_ADMIN_USER_IDS` or
-  `PMO_INTEGRATION_ADMIN_HANDLES`.
+- Signed-in maintainers can add/remove repo mappings. The page
+  fails closed unless `PMO_INTEGRATION_ADMIN_USER_IDS` or
+  `PMO_INTEGRATION_ADMIN_HANDLES` names allowed maintainers.
 - Provider secrets and tokens are never shown in the browser.
   They remain in the bot deployment. The page shows webhook URLs
   from `BOT_WEBHOOK_BASE_URL` / `NEXT_PUBLIC_BOT_WEBHOOK_BASE_URL`.
@@ -614,9 +606,9 @@ bulk updates.
 
 ---
 
-## 6. Renderer enrichment: `fetch_pr_files` tool (~1.5h)
+## 6. Investigator enrichment: `fetch_pr_files` tool (~1.5h)
 
-**File**: `bot/agent/renderer.py` and a new
+**File**: `bot/agent/investigator.py` and a new
 `bot/external/fetch.py` module.
 
 ```python
@@ -624,7 +616,7 @@ bulk updates.
 async def fetch_pr_files(provider: str, repo_full_name: str,
                           pr_number: int,
                           paths_filter: list[str] | None = None) -> dict:
-    """Returns up to 30 files with paths + first 200 chars of content."""
+    """Returns up to 30 files with paths + first 200 chars of patch_excerpt."""
     cache_key = f"{repo_full_name}/{pr_number}"
     cached = queries.lookup_external_resource(
         provider, "pr_files", cache_key
@@ -650,10 +642,12 @@ async def fetch_pr_files(provider: str, repo_full_name: str,
 `_fetch_pr_files_remote` calls GitHub's
 `/repos/{owner}/{repo}/pulls/{pr_number}/files` endpoint with
 `Authorization: token $GITHUB_API_TOKEN`. Pagination capped at
-30 files. Each file includes path + first 200 chars of content
-(via raw_url fetch, also cached at the file level).
+30 files. Each file includes path plus `patch_excerpt` from the
+provider's PR files API. It does not fetch full file blobs, so
+the investigator must not describe the result as complete file
+contents.
 
-Add the tool to `bot/agent/renderer.py`'s tool subset:
+Add the tool to `bot/agent/investigator.py`'s tool subset:
 
 ```python
 @tool(
@@ -661,8 +655,8 @@ Add the tool to `bot/agent/renderer.py`'s tool subset:
     "Fetch the list of files changed in a GitHub or Gitea PR, "
     "optionally narrowed by paths_filter. Use sparingly — costs "
     "an external API call (cached 24h). Only call when the user's "
-    "subscription explicitly requests file content (e.g. 'send "
-    "spec/plan'), not for every PR notification.",
+    "subscription explicitly requests file/patch details (e.g. "
+    "'send spec/plan changes'), not for every PR notification.",
     {"event_id": int, "paths_filter": list[str] or None},
 )
 async def fetch_pr_files_tool(args: dict) -> dict:
@@ -680,43 +674,48 @@ async def fetch_pr_files_tool(args: dict) -> dict:
     ))
 ```
 
-Add to investigator's tool subset too — investigator may need
-it for "read enough context" on PR-related subscriptions.
+Do not add this tool to renderer. Renderer receives the
+investigator brief and must not fetch new facts after the final
+notify/suppress decision.
 
 **Files touched**:
 - `bot/external/fetch.py` (new)
-- `bot/agent/renderer.py` — add tool registration; extend the
-  1.0c renderer prompt with a small section about fetch_pr_files
-- `bot/agent/investigator.py` — same tool added
+- `bot/agent/investigator.py` — add tool registration and prompt
+  guidance
 - `bot/db/queries.py` — `get_event(event_id)` helper added
 - `bot/config.py` — `github_api_token`, `gitea_api_url` settings
 
 **Exit criterion**:
 - Insert a synthetic `pull_request` event referencing a real PR
-- Call `fetch_pr_files` with the event_id → returns file list
+- Call `fetch_pr_files` with the event_id → returns file list with
+  `patch_excerpt`, not `content_excerpt`
 - Repeat call → second call hits cache (no external API call)
 - Call with paths_filter=['spec.md'] → only spec.md returned
 
 ---
 
-## 7. Renderer / investigator prompt updates (~30 min)
+## 7. Investigator / renderer prompt boundary (~30 min)
 
-Both prompts get a small extension explaining the new tool:
+Investigator prompt gets a small extension explaining the new
+tool:
 
 ```
 当 brief 里 evidence 包含 GitHub/Gitea PR (events.source in
 ('github','gitea') AND payload.event_type='pull_request') 时:
 - 默认信任 brief 已有的 key_facts，不要每条都拉文件
-- 仅当订阅文案明确说"把 spec/plan 发给我"或者类似要求时，
-  调用 fetch_pr_files 拿对应文件
+- 仅当订阅文案明确说"把 spec/plan 改动发给我"或者类似要求时，
+  调用 fetch_pr_files 拿对应 patch_excerpt
 - fetch_pr_files 是缓存的，重复调用同一 PR 不会重复花钱
 - 永远不要超出 brief.evidence_event_ids 列出的 PR
 ```
 
-**Files**: `bot/agent/renderer.py` /
-`bot/agent/investigator.py`. Update the system prompt
-constants. Run existing tests to confirm prompt parsing still
-works.
+Renderer prompt keeps the 1.0c invariant: renderer does not get
+`fetch_pr_files`, does not add facts, and only renders the
+investigator brief.
+
+**Files**: `bot/agent/investigator.py` /
+`bot/agent/renderer.py`. Update tool boundary and prompt text.
+Run existing tests to confirm prompt parsing still works.
 
 **Exit criterion**: existing 1.0c tests still pass; manual
 inspection of prompt text confirms tool description is
@@ -730,8 +729,8 @@ Run the validation scripts from spec §9:
 
 1. Identity claim → event ingestion (spec §9.1)
 2. Repo mapping → project lockout (spec §9.2)
-3. PR merge → spec/plan delivery (spec §9.3)
-4. Identity claim conflict (spec §9.4)
+3. PR merge → spec/plan patch delivery (spec §9.3)
+4. Identity attribution conflict (spec §9.4)
 5. Webhook signature failure (spec §9.5)
 6. Idempotent re-delivery (spec §9.6)
 
@@ -769,7 +768,7 @@ unchanged.
 See docs/specs/2026-05-06-proactive-agent-2.0a-spec.md for the
 full behaviour contract; this commit implements §3 ingest, §5
 integrations UI + optional identity attribution, §6 fetch_pr_files
-renderer enrichment.
+investigator enrichment.
 
 Repo mapping is managed from /integrations; the
 backend/scripts/register_external_repos.mjs script remains a
@@ -808,11 +807,9 @@ repo bootstrap. That's the irreducible 2.0a.
    leaked, attacker can forge events → fake notifications. Plan:
    secrets-only-in-env, no logging, rotate if any concern.
 
-2. **Identity claim impersonation**. The self-claim flow lets
-   bcc claim `albert_github_login` if albert hasn't claimed it
-   yet. Mitigation: spec §5.1 text discourages this; in practice
-   we trust the small team. Real defense would be OAuth — that's
-   a 2.0a-followup if abuse appears.
+2. **Identity claim impersonation**. 2.0a disables self-claim
+   chat tools; `external_identities` remains service-role/admin
+   managed until OAuth or challenge verification exists.
 
 3. **PR diff fetch leakage**. fetch_pr_files reads private repo
    content into our DB cache. Only users with bot DMs can
