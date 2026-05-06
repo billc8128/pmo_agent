@@ -83,7 +83,8 @@ Creates:
     service-role. Lets users see their own claim on /me without
     leaking other users' claims.
   - `external_repos` enabled, no policies (service-role only —
-    repo mapping is admin-managed).
+    repo mapping is managed through trusted server actions and
+    admin scripts).
   - `external_webhook_deliveries` enabled, no policies
     (service-role only — never read by LLMs).
   - `external_resource_cache` enabled, no policies (service-role
@@ -564,34 +565,52 @@ bot lists them.
 
 ---
 
-## 5. Repo mapping bootstrap (~30 min)
+## 5. Integrations web UI (~2.5h)
 
-For 2.0a we don't ship a UI for repo mapping. Instead, a small
-admin script lives at `backend/scripts/register_external_repos.mjs`:
+2.0a treats GitHub/Gitea as system-level PMO agent data sources,
+not personal account bindings. Ship a dedicated `/integrations`
+page so the connection is visible and maintainable without
+opening SQL.
 
-```js
-// Usage: node register_external_repos.mjs
-// Reads a hardcoded list of (provider, repo, project_root)
-// triples and upserts them into external_repos.
-const repos = [
-  { provider: 'github', repo: 'billc8128/vibelive',
-    project_root: '/Users/a/Desktop/vibelive' },
-  { provider: 'github', repo: 'billc8128/oneship',
-    project_root: '/Users/a/Desktop/oneship' },
-  { provider: 'gitea',  repo: 'team/internal-tools',
-    project_root: '/Users/a/Desktop/internal-tools' },
-];
-// ... upsert via supabase service-role client ...
-```
+**Files**:
+- `web/app/integrations/page.tsx` — server component loading
+  provider summaries, repo mappings, and safe recent deliveries.
+- `web/app/integrations/integrations-panel.tsx` — client
+  component for forms, copy buttons, and remove actions.
+- `web/app/integrations/actions.ts` — server actions for
+  adding/upserting and deleting repo mappings.
+- `web/lib/integrations.ts` — validation and safe public mapping
+  helpers.
+- `web/lib/integration-permissions.ts` — maintainer check.
+- `web/app/site-header.tsx` — adds `Integrations` nav.
 
-Run once after migration applies. Update the file as new repos
-get added to the team.
+**UX contract**:
+- Everyone can view connected providers, repo mappings, generated
+  webhook URLs, and recent accepted deliveries.
+- Signed-in maintainers can add/remove repo mappings. Internal
+  default: any signed-in PMO user can maintain mappings. To
+  restrict it, set `PMO_INTEGRATION_ADMIN_USER_IDS` or
+  `PMO_INTEGRATION_ADMIN_HANDLES`.
+- Provider secrets and tokens are never shown in the browser.
+  They remain in the bot deployment. The page shows webhook URLs
+  from `BOT_WEBHOOK_BASE_URL` / `NEXT_PUBLIC_BOT_WEBHOOK_BASE_URL`.
+- Raw webhook payloads are never exposed; recent deliveries only
+  show provider, event type, repo full name, received_at, and
+  whether an `events` row was created.
+- Optional `external_identities` remains an actor-attribution
+  feature for "my PRs" semantics, not the source-access flow.
 
-A future user-facing UI can come once we know what shape it
-needs.
+**Exit criterion**:
+- `/integrations` renders GitHub and Gitea provider blocks.
+- Add mapping `github billc8128/vibelive → /Users/a/Desktop/vibelive`
+  from the UI; row appears in `external_repos`.
+- Copy `/webhooks/github`, configure provider webhook manually,
+  send test delivery; page shows a recent delivery row.
+- Removing a mapping deletes the `external_repos` row.
 
-**Exit criterion**: script runs, `external_repos` populated,
-manual SELECT confirms.
+The admin script `backend/scripts/register_external_repos.mjs`
+remains as bootstrap/automation fallback for initial setup and
+bulk updates.
 
 ---
 
@@ -749,11 +768,12 @@ unchanged.
 
 See docs/specs/2026-05-06-proactive-agent-2.0a-spec.md for the
 full behaviour contract; this commit implements §3 ingest, §5
-identity claim chat tool, §6 fetch_pr_files renderer enrichment.
+integrations UI + optional identity attribution, §6 fetch_pr_files
+renderer enrichment.
 
-Repo mapping is admin-managed via
-backend/scripts/register_external_repos.mjs; user-facing UI is
-deferred until usage shows what shape it needs.
+Repo mapping is managed from /integrations; the
+backend/scripts/register_external_repos.mjs script remains a
+bootstrap/bulk-update fallback.
 ```
 
 Push, deploy via Railway, run §8 validation.

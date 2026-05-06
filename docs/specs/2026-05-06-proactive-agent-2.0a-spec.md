@@ -55,8 +55,10 @@ In scope:
 - Renderer enrichment: when a brief's evidence references a
   GitHub PR / commit, the renderer can read PR diff / mentioned
   files via a small fetch helper
-- Self-claim UX in chat ("我的 GitHub 是 billc8128") and on the
-  web rules panel
+- `/integrations` UI for viewing provider status, managing repo
+  mappings, copying webhook URLs, and checking recent deliveries
+- Optional self-claim UX in chat ("我的 GitHub 是 billc8128") for
+  actor attribution
 - Decider's project lockout (1.0c §4.1) keeps working — webhook
   events feed the same `project_root` field used by lockout
 
@@ -504,9 +506,41 @@ They fall through to the LLM gatekeeper, which can read
 
 ---
 
-## 5. Identity claim — chat tool + web UI
+## 5. Integration management UI
 
-### 5.1 Self-claim via chat tool
+GitHub/Gitea are **system-level PMO agent integrations**, not
+per-user account bindings. A maintainer connects a repository to
+the PMO agent; after that, all PMO users can ask questions or
+write notification rules against that repository, subject to the
+normal PMO product permissions.
+
+2.0a ships a dedicated `/integrations` page:
+
+- Everyone can view connected providers, mapped repositories,
+  webhook URLs, and recent accepted deliveries.
+- Signed-in PMO maintainers can add/remove repo mappings. In the
+  internal default, any signed-in PMO user can maintain mappings;
+  deployments can restrict this with `PMO_INTEGRATION_ADMIN_USER_IDS`
+  or `PMO_INTEGRATION_ADMIN_HANDLES`.
+- Provider secrets and API tokens are never shown in the browser.
+  They stay in the bot deployment environment.
+- Raw webhook payloads stay service-only in
+  `external_webhook_deliveries`; the UI exposes only provider,
+  event type, repo full name, delivery time, and whether an
+  `events` row was created.
+
+The setup flow is:
+
+1. Open `/integrations`.
+2. Add repo mapping: provider + `owner/repo` + `project_root`.
+3. Copy the generated `/webhooks/github` or `/webhooks/gitea`
+   endpoint into the provider's repository webhook settings.
+4. Select supported events: pull requests, pushes, releases,
+   issue comments.
+5. Send a test delivery; `/integrations` should show the accepted
+   delivery and whether it linked to an event.
+
+### 5.1 Optional actor attribution via chat tool
 
 New agent tool `link_external_identity`:
 
@@ -536,40 +570,10 @@ Validations:
   another user; if that's a mistake, contact bcc"
 
 The corresponding `unlink_external_identity` tool exists for
-removal.
-
-### 5.2 Self-claim via web rules panel
-
-The `/notifications/rules` page already lets users add
-subscriptions. 2.0a adds an **Identity** section above the rules:
-
-```
-[Identity]
-
-  GitHub:  billc8128  [unlink]
-  Gitea:   (not linked)  [link]
-```
-
-Same backing table; same uniqueness constraint. Hooked into the
-existing Supabase auth (the user is signed in via Google/Feishu
-OAuth, so `auth.uid()` gives us the profile_id).
-
-### 5.3 Repo mapping UX
-
-In 2.0a's first cut, repo mapping is **manually configured by
-an admin** (you, bcc) via SQL or a small admin script. The
-`external_repos` table is global to the deployment — there's
-just one project ↔ repo set across all users.
-
-A user-facing UI for repo mapping is deferred. Reasons:
-- Most teams have <20 repos to map; a one-time SQL insert is
-  fine
-- User self-mapping invites typos and conflicts ("two users both
-  claim repo X belongs to different project_roots")
-- We learn what the right UX is by seeing what people actually
-  ask for
-
-Bootstrap recipe documented in plan §5.
+removal. This table is optional attribution, not source access.
+It only helps subscriptions like "my PRs", "albert 的 merge", or
+"@external_login 的评论". Repository access comes from the
+system integration above.
 
 ---
 
@@ -850,8 +854,9 @@ Concrete e2e scripts the implementation must pass:
 Anything carried forward from 1.0c §9 plus:
 
 - Linear, Jira, Slack ingestion — separate axes
-- OAuth-based identity (GitHub OAuth app) — 2.0a uses self-claim
-  + manual repo mapping; OAuth comes later if needed
+- OAuth-based provider installation (GitHub OAuth app / GitHub App)
+  — 2.0a uses webhook setup plus `/integrations` repo mapping;
+  OAuth/App installation comes later if needed
 - Bot-initiated comments / labels / merges — invariant: no
   auto-actions
 - Cross-source event correlation ("PR #X relates to turn #Y") —

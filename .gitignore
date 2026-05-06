@@ -37,3 +37,4 @@ __pycache__/
 
 # Claude Code local state (per-machine)
 .claude/
+.superpowers/
