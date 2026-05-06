@@ -107,6 +107,15 @@ alter table public.subscriptions
 alter table public.subscriptions
     add column if not exists target_user_open_id text default null;
 
+-- Records HOW the cross-user permission was granted at creation
+-- time. Read at delivery time by the permission re-check path.
+-- Format:
+--   null                        - no cross-user permission needed
+--   'explicit:{consent_uuid}'   - target_consents row backing this
+--   'chat:{chat_id}'            - chat that vouched for both parties
+alter table public.subscriptions
+    add column if not exists consent_anchor text default null;
+
 -- Backfill: every existing subscription gets target = current scope.
 update public.subscriptions
    set target_kind = case
@@ -180,20 +189,110 @@ Semantics: `(target_user_id, source_user_id)` row with
 `revoked_at IS NULL` means "target_user has agreed that
 source_user can route bot notifications to them."
 
-Bootstrap: there's an **implicit consent** when both users are
-in the same Feishu chat. We don't need a row in this table for
-that case. Reasons:
+**Lifecycle is single-row UPSERT, not insert-then-archive.**
+Revoke is `UPDATE ... SET revoked_at = now()`. Re-grant is
+`UPDATE ... SET revoked_at = null, granted_at = now()` on the
+SAME row. The table never accumulates two rows per pair —
+that's why the constraint is `(target_user_id, source_user_id)`
+without status. The corresponding helper:
 
-- If you're already in the same chat as someone, they can DM
-  you. The bot routing rule can't reveal anything more sensitive
-  than they could do directly.
-- It avoids an "ask everyone for consent" cold-start problem.
+```python
+def add_target_consent(target_user_id, source_user_id):
+    sb_admin().table("target_consents").upsert({
+        "target_user_id": target_user_id,
+        "source_user_id": source_user_id,
+        "revoked_at": None,
+        "granted_at": "now()",
+    }, on_conflict="target_user_id,source_user_id").execute()
+```
 
-Explicit `target_consents` rows exist for cases that don't have
-shared-chat fallback — primarily future expansion (e.g. cross-org
-team members not in any shared chat).
+Or in pure SQL terms:
 
-### 3.4 No changes to other tables
+```sql
+insert into target_consents (target_user_id, source_user_id)
+values (...)
+on conflict (target_user_id, source_user_id)
+do update set revoked_at = null,
+              granted_at = now();
+```
+
+This pattern lets a target who declined or revoked previously
+re-grant by simply running through the consent prompt again —
+no schema cleanup needed.
+
+Explicit `target_consents` rows are now the **default** path for
+user-owned cross-DM rules (per §4.1) and the only path for
+chat-owned rules where the target is not a current member of
+the anchor chat.
+
+Implicit consent (no row in this table) only applies inside
+a chat-owned rule's anchor chat (§4.2). User-owned rules from
+DM context have no chat to anchor implicit consent against, so
+they always need an explicit row here.
+
+### 3.4 New table: `pending_target_consents`
+
+Bot-mediated consent prompts (§7) need state. Without a record
+that "user A asked user B for consent on date D, message id M,"
+the bot can't tell whether B's casual "ok" reply is an answer
+to the consent prompt OR an unrelated response in a busy
+conversation.
+
+```sql
+create table public.pending_target_consents (
+    id                  uuid primary key default gen_random_uuid(),
+    source_user_id      uuid not null references public.profiles(id) on delete cascade,
+    target_user_id      uuid not null references public.profiles(id) on delete cascade,
+    request_message_id  text not null,    -- Feishu message id of the
+                                          -- bot's request DM, used to
+                                          -- match parent_id replies
+    rule_description    text not null,    -- the rule the source wants
+                                          -- to set up (shown to target)
+    status              text not null default 'pending' check (
+                            status in ('pending', 'granted', 'declined', 'expired')
+                        ),
+    created_at          timestamptz not null default now(),
+    expires_at          timestamptz not null default (now() + interval '7 days'),
+    resolved_at         timestamptz,
+    -- A given pair can have at most one pending request at a time;
+    -- previously-resolved requests don't block new ones (status filter).
+    constraint pending_consent_one_active
+        unique (source_user_id, target_user_id, status)
+);
+
+create index pending_consent_message_idx
+    on public.pending_target_consents (request_message_id);
+
+create index pending_consent_expires_idx
+    on public.pending_target_consents (expires_at)
+    where status = 'pending';
+```
+
+Reply detection logic in `_handle_message` (1.0a path) consults
+this table:
+
+1. Incoming Feishu message has `parent_message_id` matching a
+   row's `request_message_id` AND `status='pending'` AND
+   `target_user_id = sender_profile_id` → this IS a consent
+   reply. Parse intent (yes / no / details) and resolve.
+2. Otherwise → not a consent reply. Treat the message as a
+   normal chat agent message; "yes" / "ok" do nothing
+   privileged.
+
+The bot does NOT pattern-match "yes"/"agree" without an active
+pending row keyed to the message thread. This is the design
+choice that keeps the bot from accidentally granting permissions
+when users casually agree to other things.
+
+Expiry: pending requests auto-`expired` after 7 days via daily
+cleanup; once expired, a new request can be opened (the unique
+constraint excludes resolved/expired states because the partial
+unique only fires for `status='pending'`... actually the
+constraint as written includes status in the key — re-grants
+work because the uniqueness key includes status, so old
+expired/declined rows don't conflict with a new pending row).
+
+### 3.5 No changes to other tables
 
 - `notifications`, `decision_logs`, `investigation_jobs`,
   `feishu_links`, `events` — unchanged.
@@ -208,34 +307,73 @@ team members not in any shared chat).
 ## 4. Permission rules
 
 The rules below answer "is target T a valid delivery for a
-subscription owned by O?":
+subscription owned by O?". A central design principle:
+**implicit consent only applies inside a specific known chat
+context**. We do NOT enumerate "all chats two users share" —
+Feishu's API doesn't expose that reliably and the bot has no
+authoritative chat_memberships table. Implicit consent only
+happens when the rule itself is being created INSIDE a chat
+where both owner and target are visible chat members.
 
 ### 4.1 Owner is a user (scope_kind = 'user')
+
+User-owned rules are created from a private DM with the bot.
+There is **no chat context to anchor implicit consent**. So:
 
 | Target kind     | Target identity              | Required for permission |
 |-----------------|------------------------------|------------------------|
 | `user_dm`       | the owner themselves         | always allowed |
-| `user_dm`       | another user                 | EITHER `target_consents(target=user, source=owner)` exists, OR owner+target share at least one Feishu chat (queried via Feishu API at subscription creation time, cached) |
-| `chat`          | any chat the owner is in     | always allowed |
+| `user_dm`       | another user                 | requires explicit `target_consents(target=user, source=owner)` row, status=granted |
+| `chat`          | a chat the owner is in       | always allowed |
 | `chat`          | a chat the owner is NOT in   | not allowed |
-| `mention_in_chat` | any chat the owner is in   | always allowed (the @-mentioned user receives the message visibly in chat, no surprise DM) |
-| `mention_in_chat` | chat the owner is NOT in   | not allowed |
+| `mention_in_chat` | owner in chat AND target user IS a current member of chat AND target ≠ owner | requires `target_consents` (explicit) — the at-mention WILL DM the target via Feishu's notification, so this is functionally equivalent to user_dm cross-user |
+| `mention_in_chat` | owner in chat AND target = self | always allowed |
+| `mention_in_chat` | owner NOT in chat (regardless of target) | not allowed |
+| `mention_in_chat` | owner in chat BUT target user not a chat member | not allowed (Feishu won't render `<at>` for non-members; renderer would silently drop the mention; better to fail at creation) |
+
+User-owned cross-DM rules are explicit-consent-only by design.
+The "shared chat as implicit proof of relationship" was tempting
+but turned out to be unimplementable cleanly: the bot can call
+Feishu's `chats/{chat_id}/members` for a specific chat but not
+"give me all chats user A and user B both belong to." Without
+that primitive, implicit consent for user-owned rules is a
+permission rule we can't actually verify.
 
 ### 4.2 Owner is a chat (scope_kind = 'chat')
 
-A chat-owned rule is created by a chat member acting on behalf
-of the chat. The rule has both a `created_by` profile (who set
-it up) and a `scope_id` (the chat).
+Chat-owned rules ARE created with a chat context — by definition,
+the user who created the rule was in chat C when they did so.
+This is the only place where implicit consent applies.
+
+The rule's owner (chat C) is the implicit-consent anchor. At
+creation time, both the rule's `created_by` profile AND any
+referenced target user MUST be members of chat C, verified via
+Feishu's `chats/{C}/members` API at that moment.
 
 | Target kind     | Allowed when |
 |-----------------|--------------|
 | `user_dm` to created_by | always |
-| `user_dm` to another chat member | shared-chat rule applies — both parties are in this very chat, so consent is implicit |
-| `user_dm` to a non-member | requires explicit `target_consents` row |
-| `chat` to the same chat (this chat) | always (default for chat-scope) |
-| `chat` to a different chat | not allowed (cross-chat routing is out of scope) |
-| `mention_in_chat` for this chat, mentioning a chat member | always |
-| `mention_in_chat` for this chat, mentioning a non-member | not allowed |
+| `user_dm` to another current member of chat C | implicit consent (because both are in chat C right now); recorded as `consent_anchor=chat:{C}` on the subscription so delivery-time re-checks know what to verify |
+| `user_dm` to anyone NOT a current member of C | requires explicit `target_consents` row |
+| `chat` to the same chat C | always |
+| `chat` to a different chat | not allowed (cross-chat routing out of scope) |
+| `mention_in_chat` mentioning a current member of chat C | always (visible in-chat, no surprise DM) |
+| `mention_in_chat` mentioning a non-member of C | not allowed |
+
+The new column `subscriptions.consent_anchor` (text, nullable)
+records HOW permission was granted at creation time. Three
+possible values:
+
+- `null` — no cross-user permission needed (target = owner OR
+  target = chat where owner = chat)
+- `explicit:CONSENT_ID` — the `target_consents` row backing this
+- `chat:CHAT_ID` — the chat that vouched for both parties at
+  creation time
+
+Delivery-time re-check (§4.3) reads `consent_anchor` to know
+what to verify: explicit consents check the `target_consents`
+row; chat anchors re-verify both parties are still members of
+the anchor chat.
 
 ### 4.3 Permission check is at subscription creation time
 
@@ -257,44 +395,50 @@ Specifically, at the moment of delivery (in
 `bot/agent/delivery_loop.py`'s `_delivery_for_subscription`):
 
 - For target_kind in `('user_dm', 'mention_in_chat')` AND
-  cross-user (target identity ≠ owner identity), call
-  `permissions.check_target_allowed(...)` again with current
-  state.
-- If the permission no longer holds (target left shared chat
-  AND no explicit consent → permission denied), do NOT deliver.
-  Instead:
-  - Mark the notification `status = 'suppressed'` with
-    `suppressed_by = 'permission_revoked'`
+  cross-user (target identity ≠ owner identity), check the
+  subscription's `consent_anchor`:
+  - `consent_anchor = explicit:CONSENT_ID` → re-read the
+    `target_consents` row; if `revoked_at IS NOT NULL`, deny
+  - `consent_anchor = chat:CHAT_ID` → re-call
+    `chats/CHAT_ID/members` (cached 6h) to confirm BOTH
+    `created_by` profile and target profile are still members
+    of CHAT_ID; if either has left, deny
+- If permission denies, do NOT deliver. Instead:
+  - Atomically (lease-conditional, same claim_id pattern as
+    1.0c's `mark_sent_if_claimed`) mark the notification
+    `status = 'suppressed'`, `suppressed_by = 'permission_revoked'`
+    via `mark_suppressed_if_claimed(notif_id, claim_id, …)` RPC
   - Log it for audit
   - Disable the subscription so future events stop trying
 
-The recheck is cached per (owner_id, target_id) for 6 hours via
-the same shared-chat membership cache used at creation time —
-so it doesn't add a Feishu API call to every delivery, just to
-the first delivery in any 6h window for a given pair.
+The recheck is cached per `consent_anchor` for 6 hours.
+`chats/{CHAT_ID}/members` is the only Feishu API call we need
+here, and we already need it at creation time. Cache scope is
+keyed on `(consent_anchor, target_user_id)` so revoking one
+target's consent doesn't invalidate other targets in the same
+anchor chat.
 
-### 4.4 Revocation paths (two)
+### 4.4 Revocation paths
 
 **Explicit revoke via `revoke_target_consent`**: target user
-removes a `target_consents` row → trigger fires (or daily
-cleanup) finds subscriptions where:
+removes a `target_consents` row (sets revoked_at to now()).
+A daily cleanup job finds subscriptions with
+`consent_anchor = explicit:CONSENT_ID` for the revoked consent
+and disables them. The next delivery attempt for any of those
+subscriptions, even within the cache window, will hit the
+explicit revoked_at check.
 
-- target_kind in ('user_dm', 'mention_in_chat')
-- target identity ≠ owner identity
-- target_consents row revoked
-- AND no shared-chat backup (verified via cache)
+(Disabled, not archived — target can re-grant and the rule
+can be re-enabled by the owner.)
 
-…and disables them. (Disabled, not archived — target can
-re-grant and re-enable.)
-
-**Implicit revoke via leaving shared chat**: target user leaves
-the only chat they shared with the rule's owner. There's no
-direct event for this — Feishu doesn't push "user X left chat Y"
-to the bot. The recheck path in §4.3 is what catches this:
-when the cache expires (6h max) and the next delivery is about
-to fire, the shared-chat check returns false, the delivery is
-suppressed, and the subscription is disabled the same way as
-explicit revoke.
+**Implicit revoke via leaving the anchor chat**: target user
+leaves CHAT_ID where the rule was created. There's no direct
+event for this — Feishu doesn't push "user X left chat Y" to
+the bot. The recheck path in §4.3 catches it when the
+membership cache expires (6h max): the next delivery sees the
+target is no longer in the anchor chat, the delivery is
+suppressed via lease-conditional `mark_suppressed_if_claimed`,
+and the subscription is disabled.
 
 This means there's an at-most-6-hour window where a
 just-departed user could still receive a DM. Acceptable
@@ -413,24 +557,52 @@ A new section under `/me`:
 
 ## 7. Bot-mediated consent prompts
 
-When user A wants to route to user B but doesn't have consent
-or shared chat, A's flow includes "Ask the bot to request
+When user A wants to route to user B but doesn't have explicit
+consent (and per §4.1 user-owned rules require explicit consent
+for cross-DM), A's flow includes "Ask the bot to request
 consent." The bot then:
 
-1. Sends a DM from itself to B saying "{A's display name} wants
-   to route bot notifications to your DM via this subscription
-   description: '{description}'. Reply 'yes/同意' to consent,
-   'no/拒绝' to decline, or 'tell me more/详情' to see the
-   subscription details."
+1. Inserts a `pending_target_consents` row with
+   `source_user_id=A, target_user_id=B, status='pending',
+   rule_description='{description}'`.
+2. Sends a DM from itself to B with rich text:
+   ```
+   {A's display name} wants to route bot notifications to your DM
+   for the rule: "{description}".
 
-2. B's reply is parsed (existing chat agent path); if
-   yes/agree, a `target_consents` row is inserted; if no, the
-   bot acks the decline.
+   Reply to this message:
+   - 同意 / yes / agree — grants consent
+   - 拒绝 / no / decline — declines
+   - 详情 / tell me more — show more about the rule
+   ```
+3. Captures the bot's outgoing message_id, writes it back to
+   the `pending_target_consents.request_message_id`.
 
-3. A receives a follow-up DM either way.
+When B replies, the existing `_handle_message` path checks the
+incoming message's `parent_message_id`:
 
-This makes consent collection feel like a normal team
-interaction rather than a permissions UI.
+- If parent matches a `pending_target_consents.request_message_id`
+  AND `status='pending'` AND `target_user_id = sender's profile_id`:
+  this IS a consent reply. Parse the text:
+  - "同意" / "yes" / "agree" / "ok" / "好" → resolve
+    `granted`, INSERT-OR-UPSERT `target_consents` row (per #4
+    fix below), DM A "B granted consent."
+  - "拒绝" / "no" / "decline" / "不要" / "不行" → resolve
+    `declined`, no `target_consents` row, DM A "B declined."
+  - "详情" / "details" / "tell me more" / unrecognised → bot
+    DMs B with the full subscription detail and asks again
+    (does NOT resolve the pending row)
+- If parent does NOT match any pending row, the message is a
+  normal agent message. "yes" / "ok" alone do NOT grant
+  permission.
+
+This is the critical anti-pattern guard: we never pattern-match
+consent words without confirming the message is a reply to a
+specific pending request. Casually saying "ok" in a different
+DM context cannot accidentally authorize cross-user routing.
+
+Pending requests expire after 7 days; A can issue a fresh
+request after expiry.
 
 ---
 

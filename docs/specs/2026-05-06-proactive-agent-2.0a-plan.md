@@ -55,11 +55,28 @@ Creates:
   - 30-day retention (cleanup outside the migration)
 - `external_resource_cache` table per spec §6.2 for fetched
   PR diffs and similar.
-- **`events.payload_fingerprint` column** (text) — webhook
-  events compute md5 over the normalised payload (excluding
-  volatile timestamps); turn events compute the same field via
-  the existing 1.0c trigger fingerprint. Used by the webhook
-  upsert to skip no-op redeliveries (plan §3.4).
+- **`events.payload_fingerprint` column** (text, nullable) —
+  webhook events compute md5 over the normalised payload
+  (excluding volatile timestamps) and write it on insert.
+  **Turn events**: 0020 does NOT extend `on_turn_to_event` to
+  populate this column. Rationale:
+  - 1.0c's existing on_turn_to_event computes a local fingerprint
+    in PL/pgSQL but doesn't persist it; persisting it would
+    require a 0020 backfill across the existing `events` table
+    (potentially many rows) AND a function rewrite — a much
+    bigger change than 2.0a needs.
+  - The fingerprint guard ONLY matters for webhook redeliveries.
+    Turn events arrive once per (turn_id, payload_version) and
+    1.0c's logic already handles late-summary updates correctly
+    via `payload_version`.
+  - Therefore: webhook upsert path checks
+    `payload_fingerprint IS DISTINCT FROM excluded.payload_fingerprint`
+    AND `excluded.payload_fingerprint IS NOT NULL`. Turn events
+    leave the column NULL — they never reach this upsert path
+    anyway (they go through the trigger).
+  - Cleaner-but-bigger alternative left for a future migration:
+    extend `on_turn_to_event` to populate the column AND
+    backfill all existing rows. Out of scope for 2.0a.
 - RLS:
   - `external_identities` enabled. Policy: owner can read their
     own row (`auth.uid() = profile_id`); inserts/updates only via
@@ -163,23 +180,66 @@ in `bot/app.py` lifespan or wherever Feishu webhook routes are
 registered.
 
 ```python
+_MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024  # 2MB cap
+
 @app.post("/webhooks/github")
 async def github_webhook(request: Request) -> Response:
+    # 1. Body size cap BEFORE reading body — protects against
+    #    DoS via giant POST. GitHub PR bodies max ~150KB in
+    #    practice; 2MB is generous.
+    content_length = int(request.headers.get("content-length") or 0)
+    if content_length > _MAX_WEBHOOK_BODY_BYTES:
+        return Response(status_code=413)  # Payload Too Large
     raw_body = await request.body()
+    if len(raw_body) > _MAX_WEBHOOK_BODY_BYTES:
+        # body() ignores Content-Length, double-check on actual bytes
+        return Response(status_code=413)
+
+    # 2. Signature first, error responses second. Don't parse JSON
+    #    until signature passes — prevents wasting CPU on attacker
+    #    bodies.
     signature = request.headers.get("x-hub-signature-256", "")
     if not _verify_github_signature(raw_body, signature,
                                      settings.github_webhook_secret):
         return Response(status_code=401)
-    payload = json.loads(raw_body)
+
+    # 3. JSON parse with explicit error handling. Malformed JSON →
+    #    400, no DB writes. Don't surface parse errors to caller
+    #    (could leak info); caller doesn't need details.
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return Response(status_code=400)
+    if not isinstance(payload, dict):
+        return Response(status_code=400)
+
     event_type = request.headers.get("x-github-event", "")
     delivery = request.headers.get("x-github-delivery", "")
+    if not event_type or not delivery:
+        # Required headers missing → not a real GitHub webhook
+        # (signature could have passed if attacker has the secret
+        # but didn't replicate headers). Reject for hygiene.
+        return Response(status_code=400)
+
     await ingest_external_event("github", event_type, delivery,
-                                 payload)
+                                 payload, raw_body=raw_body)
     return Response(status_code=200)
 ```
 
 `/webhooks/gitea` mirrors the structure with
 `X-Gitea-Signature` / `X-Gitea-Event` / `X-Gitea-Delivery`.
+
+**Failure mode summary** (the public-facing endpoint contract):
+
+| Status | Reason |
+|--------|--------|
+| 200 | webhook accepted (whether or not it produced an `events` row — duplicate redelivery still 200) |
+| 400 | malformed JSON / missing required headers |
+| 401 | signature missing or wrong |
+| 413 | body exceeds 2MB cap |
+| 500 | internal error (logged, no body returned) — GitHub will retry |
+
+NOT 422 / 404 / others — keep the surface small.
 
 ### 3.2 Signature verification
 

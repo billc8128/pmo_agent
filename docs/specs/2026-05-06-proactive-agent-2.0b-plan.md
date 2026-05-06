@@ -350,14 +350,29 @@ def _consent_still_valid(sub: Subscription) -> bool:
 ```
 
 **Caller** (the delivery loop's `process_pending` per 1.0c
-§4.4) handles the None return:
+§4.4) handles the None return. Critically, **the suppression
+must be lease-conditional** — same pattern as `mark_sent_if_claimed`
+in 1.0c. Without the claim_id guard, a stale worker that lost
+the lease could overwrite a notification another worker is
+already sending:
 
 ```python
 delivery = _delivery_for_subscription(sub)
 if delivery is None:
-    queries.mark_notification_suppressed(
-        notif.id, suppressed_by="permission_revoked"
+    # Lease-conditional. If our claim has been reaped/lost,
+    # this returns False and we let the next claim cycle
+    # handle the row.
+    suppressed = queries.mark_suppressed_if_claimed(
+        notif_id=notif.id,
+        claim_id=current_claim_id,
+        suppressed_by="permission_revoked",
     )
+    if not suppressed:
+        logger.warning(
+            "permission_revoked: lost claim on notif=%s; skipping",
+            notif.id,
+        )
+        continue
     queries.update_subscription(
         subscription_id=sub.id,
         scope_kind=sub.scope_kind, scope_id=sub.scope_id,
@@ -369,6 +384,47 @@ if delivery is None:
     )
     continue
 ```
+
+**New RPC** in migration 0021:
+
+```sql
+create or replace function public.mark_suppressed_if_claimed(
+    p_notif_id bigint,
+    p_claim_id uuid,
+    p_suppressed_by text
+) returns bigint
+language sql
+security definer
+as $$
+    update public.notifications
+       set status = 'suppressed',
+           suppressed_by = p_suppressed_by,
+           claim_id = null,
+           claimed_at = null,
+           updated_at = now()
+     where id = p_notif_id
+       and claim_id = p_claim_id
+       and status = 'claimed'
+    returning id;
+$$;
+```
+
+Same shape as 1.0c's lease-conditional RPCs (mark_sent_if_claimed,
+mark_failed_if_claimed). Only the lease-holder can flip the row
+to suppressed; stale workers see 0 rows returned.
+
+ACL: revoke from public/anon/authenticated, grant to
+service_role only. search_path pinned. Mirrors the §1 ACL
+pattern.
+
+**Test for stale claim**: in addition to the cross-DM
+revocation tests, add `test_permission_revoked_respects_lease`:
+- Worker A claims notif 1 (claim_id=A).
+- Worker A's claim is reaped; worker B claims it (claim_id=B).
+- Worker A's revoked-permission code path tries to call
+  `mark_suppressed_if_claimed(1, A, ...)` → returns NULL.
+- Worker B is unaffected; the row keeps B's claim and its
+  natural delivery flow.
 
 Notification row gains an additional optional column
 `mention_open_id` (or this gets stuffed into payload_snapshot

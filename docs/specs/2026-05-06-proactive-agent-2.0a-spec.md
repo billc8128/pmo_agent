@@ -305,8 +305,18 @@ Mismatched signature → 401 with no body. Missing secret →
 ### 4.3 Event types we ingest in 2.0a
 
 For each event type we extract a stable shape into
-`events.payload`. The original webhook body is preserved at
-`payload.raw` so investigators / renderers can dig deeper.
+`events.payload`. The original webhook body lives **only** in
+`external_webhook_deliveries` (§3.5) for service-only
+debugging. The LLM agents never see raw bodies — they read
+`events.payload` (the normalised shape below), and for richer
+content they explicitly call tools like `fetch_pr_files` (§6).
+
+Why no `payload.raw` even though earlier drafts had it: raw
+GitHub PR bodies run 50-200KB, would multiply token cost on
+every gatekeeper call, and would expose unrelated fields
+(unrelated review comments, CI configurations, deploy keys)
+to the LLM. Normalised payload + per-tool fetch is the cleaner
+boundary.
 
 #### `pull_request` (action=opened, closed-merged, synchronize)
 
@@ -395,10 +405,14 @@ For each event type we extract a stable shape into
 ```
 
 We deliberately **don't** ingest `pull_request_review`,
-`check_run`, `workflow_run`, `deployment_status`, etc. in
-2.0a — they're available in raw payload if investigator wants to
-fall back, but they don't get their own typed shape until usage
-data shows demand.
+`check_run`, `workflow_run`, `deployment_status`, etc. in 2.0a.
+For ignored event types, we still store the raw delivery in
+`external_webhook_deliveries` for forensic value, but **no row
+is written to `events`** — they don't enter the investigation
+pipeline at all. Adding a typed shape for one of these is a
+small follow-up if usage data shows demand. The investigator
+does NOT have a "fall back to raw" path, by design: raw bodies
+never reach LLM prompts.
 
 ### 4.4 What `events.occurred_at` is set to
 
