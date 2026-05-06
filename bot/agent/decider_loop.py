@@ -91,6 +91,23 @@ def _parse_failure_output(exc: decider.DecisionParseError, previous_failures: in
     }
 
 
+def _transient_failure_input(event_id: int, sub_id: str, decided_version: int) -> dict[str, Any]:
+    return {
+        "event": {"id": event_id, "payload_version": decided_version},
+        "candidate": {"id": sub_id},
+    }
+
+
+def _transient_failure_output(exc: Exception, previous_failures: int) -> dict[str, Any]:
+    return {
+        "investigate": False,
+        "suppressed_by": "gatekeeper_transient_error",
+        "reason": str(exc)[:1000],
+        "error_class": type(exc).__name__,
+        "consecutive_failure_count": previous_failures + 1,
+    }
+
+
 async def process_event(
     event: dict[str, Any],
     subs_by_scope: dict[tuple[str, str], list[dict[str, Any]]],
@@ -227,8 +244,40 @@ async def process_event(
                     )
                     continue
                 had_unhandled_error = True
-            except Exception:
+            except Exception as e:
                 logger.exception("decider error event=%s sub=%s", event_id, sub_id)
+                previous_failures = queries.gatekeeper_transient_failure_count(event_id, sub_id, decided_version)
+                transient_input = _transient_failure_input(event_id, sub_id, decided_version)
+                queries.write_decision_log(
+                    event_id=event_id,
+                    subscription_id=sub_id,
+                    payload_version=decided_version,
+                    judge_input=transient_input,
+                    judge_output=_transient_failure_output(e, previous_failures),
+                    model=settings.anthropic_model,
+                    latency_ms=None,
+                    input_tokens=None,
+                    output_tokens=None,
+                    investigation_job_id=None,
+                )
+                if previous_failures >= 2:
+                    queries.write_decision_log(
+                        event_id=event_id,
+                        subscription_id=sub_id,
+                        payload_version=decided_version,
+                        judge_input=transient_input,
+                        judge_output={
+                            "investigate": False,
+                            "suppressed_by": "gatekeeper_failure",
+                            "reason": "gatekeeper transient error 3 consecutive times",
+                        },
+                        model=settings.anthropic_model,
+                        latency_ms=None,
+                        input_tokens=None,
+                        output_tokens=None,
+                        investigation_job_id=None,
+                    )
+                    continue
                 had_unhandled_error = True
 
     if not had_unhandled_error and not had_blocking_claim:

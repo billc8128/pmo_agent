@@ -945,7 +945,9 @@ repo bootstrap. That's the irreducible 2.0a.
    add a per-source rate limiter. 2.0a intentionally does not
    add a subject-index fast-skip layer; broad rules such as
    "all my PRs" still rely on the gatekeeper as first semantic
-   filter.
+   filter. Gatekeeper transient exceptions have a 3-attempt
+   budget per `(event_id, subscription_id, payload_version)`;
+   after that the pair is settled as `gatekeeper_failure`.
 
 6. **Repo mapping drift**. `external_repos.project_root` is no
    longer copied into webhook events, so a bad display/admin
@@ -962,3 +964,9 @@ repo bootstrap. That's the irreducible 2.0a.
    noisy in production, aggregate by PR/job window before
    gatekeeper or add subscription subject indexing in a later
    phase.
+
+8. **Burst backlog**. The decider loop still polls batches of 100
+   events. This is adequate for MVP traffic, but webhook bursts
+   need active enqueue / worker pool semantics before scale-out.
+   Enabled subscription scans use an explicit 10,000 row limit so
+   PostgREST's 1,000 row default does not silently drop rules.

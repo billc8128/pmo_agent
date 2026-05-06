@@ -94,6 +94,30 @@ def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
     return safe
 
 
+def _mark_archive_ignored_safely(
+    archive_id: int,
+    reason: str,
+    *,
+    log_provider: str,
+    log_event_type: str,
+    log_delivery_id: str,
+) -> bool:
+    try:
+        queries.mark_archive_ignored(archive_id, reason)
+        return True
+    except Exception:
+        logger.warning(
+            "webhook.archive_ignore_mark_failed provider=%s event_type=%s delivery_id=%s archive_id=%s reason=%s",
+            log_provider,
+            log_event_type,
+            log_delivery_id,
+            archive_id,
+            reason,
+            exc_info=True,
+        )
+        return False
+
+
 async def ingest_external_event(
     *,
     provider: str,
@@ -129,7 +153,13 @@ async def ingest_external_event(
         elif provider == "gitea":
             normalized = normalize_gitea(event_type, payload)
         else:
-            queries.mark_archive_ignored(archive_id, "unsupported_provider")
+            _mark_archive_ignored_safely(
+                archive_id,
+                "unsupported_provider",
+                log_provider=log_provider,
+                log_event_type=log_event_type,
+                log_delivery_id=log_delivery_id,
+            )
             logger.info(
                 "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_provider",
                 log_provider,
@@ -139,7 +169,13 @@ async def ingest_external_event(
             )
             return
         if normalized is None:
-            queries.mark_archive_ignored(archive_id, "unsupported_event_type")
+            _mark_archive_ignored_safely(
+                archive_id,
+                "unsupported_event_type",
+                log_provider=log_provider,
+                log_event_type=log_event_type,
+                log_delivery_id=log_delivery_id,
+            )
             logger.info(
                 "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_event_type",
                 log_provider,
@@ -151,7 +187,13 @@ async def ingest_external_event(
 
         actor = _as_dict(normalized.get("actor"))
         if actor.get("is_bot"):
-            queries.mark_archive_ignored(archive_id, "bot_actor")
+            _mark_archive_ignored_safely(
+                archive_id,
+                "bot_actor",
+                log_provider=log_provider,
+                log_event_type=log_event_type,
+                log_delivery_id=log_delivery_id,
+            )
             logger.info(
                 "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=bot_actor actor=%s",
                 log_provider,
@@ -164,7 +206,13 @@ async def ingest_external_event(
 
         source_id = source_id_for_event(normalized)
         if source_id is None:
-            queries.mark_archive_ignored(archive_id, "missing_source_identity")
+            _mark_archive_ignored_safely(
+                archive_id,
+                "missing_source_identity",
+                log_provider=log_provider,
+                log_event_type=log_event_type,
+                log_delivery_id=log_delivery_id,
+            )
             logger.info(
                 "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=missing_source_identity",
                 log_provider,
@@ -197,7 +245,13 @@ async def ingest_external_event(
             safe_log_value(normalized.get("project_root") or ""),
         )
     except Exception:
-        queries.mark_archive_ignored(archive_id, "ingest_error")
+        _mark_archive_ignored_safely(
+            archive_id,
+            "ingest_error",
+            log_provider=log_provider,
+            log_event_type=log_event_type,
+            log_delivery_id=log_delivery_id,
+        )
         logger.exception(
             "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=ingest_error",
             log_provider,

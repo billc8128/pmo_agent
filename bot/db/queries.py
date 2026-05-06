@@ -1135,6 +1135,7 @@ def fetch_all_enabled_subscriptions() -> list[dict[str, Any]]:
         .eq("enabled", True)
         .is_("archived_at", "null")
         .order("created_at", desc=True)
+        .limit(10000)
         .execute()
         .data
         or []
@@ -2060,6 +2061,28 @@ def judge_parse_failure_count(event_id: int, subscription_id: str, payload_versi
         for row in rows
         if (row.get("judge_output") or {}).get("suppressed_by")
         in {"judge_parse_error", "gatekeeper_parse_error"}
+    )
+
+
+def gatekeeper_transient_failure_count(event_id: int, subscription_id: str, payload_version: int) -> int:
+    rows = (
+        sb_admin()
+        .table("decision_logs")
+        .select("id, judge_output")
+        .eq("event_id", event_id)
+        .eq("subscription_id", subscription_id)
+        .eq("payload_version", payload_version)
+        .order("created_at", desc=True)
+        .limit(10)
+        .execute()
+        .data
+        or []
+    )
+    return sum(
+        1
+        for row in rows
+        if (row.get("judge_output") or {}).get("suppressed_by")
+        == "gatekeeper_transient_error"
     )
 
 

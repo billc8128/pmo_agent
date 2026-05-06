@@ -145,6 +145,41 @@ def test_fetch_subscriptions_for_scope_only_lists_enabled(monkeypatch):
     assert ("archived_at", "null") in is_calls
 
 
+def test_fetch_all_enabled_subscriptions_uses_explicit_high_limit(monkeypatch):
+    from db import queries
+
+    limits: list[int] = []
+
+    class _Table:
+        def table(self, name):
+            assert name == "subscriptions"
+            return self
+
+        def select(self, *args, **kwargs):
+            return self
+
+        def eq(self, *args, **kwargs):
+            return self
+
+        def is_(self, *args, **kwargs):
+            return self
+
+        def order(self, *args, **kwargs):
+            return self
+
+        def limit(self, value):
+            limits.append(value)
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[])
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: _Table())
+
+    assert queries.fetch_all_enabled_subscriptions() == []
+    assert limits == [10000]
+
+
 def test_daily_sent_count_uses_exact_count_instead_of_limited_rows(monkeypatch):
     from db import queries
 
@@ -181,6 +216,49 @@ def test_daily_sent_count_uses_exact_count_instead_of_limited_rows(monkeypatch):
     assert ("subscriptions.scope_id", "profile-1") in filters
     assert ("status", "sent") in filters
     assert ("sent_at", "2026-05-07T00:00:00+08:00") in filters
+
+
+def test_gatekeeper_transient_failure_count_counts_only_transient_errors(monkeypatch):
+    from db import queries
+
+    class _Table:
+        def table(self, name):
+            assert name == "decision_logs"
+            return self
+
+        def select(self, *args, **kwargs):
+            return self
+
+        def eq(self, *args, **kwargs):
+            return self
+
+        def order(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[
+                {"judge_output": {"suppressed_by": "gatekeeper_transient_error"}},
+                {"judge_output": {"suppressed_by": "gatekeeper_parse_error"}},
+                {"judge_output": {"suppressed_by": "gatekeeper_transient_error"}},
+            ])
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: _Table())
+
+    assert queries.gatekeeper_transient_failure_count(9, "sub-1", 2) == 2
+
+
+def test_claim_pending_notifications_excludes_archived_subscriptions():
+    from pathlib import Path
+
+    sql = Path("backend/supabase/migrations/0013_active_notifications.sql").read_text()
+    claim_sql = sql[sql.index("create or replace function public.claim_pending_notifications"):sql.index("create or replace function public.mark_sent_if_claimed")]
+
+    assert "join public.subscriptions s2 on s2.id = n2.subscription_id" in claim_sql
+    assert "s2.archived_at is null" in claim_sql
+    assert "s2.enabled is true" in claim_sql
 
 
 def test_judge_prompt_states_self_events_send_by_default():
@@ -428,6 +506,93 @@ async def test_decider_caps_repeated_parse_failures(monkeypatch):
     assert logs[-1]["judge_output"]["suppressed_by"] == "gatekeeper_failure"
     assert upserts == []
     assert marked == [(9, 1)]
+
+
+@pytest.mark.anyio
+async def test_decider_caps_repeated_transient_gatekeeper_errors(monkeypatch):
+    from agent import decider_loop
+
+    logs: list[dict] = []
+    marked: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(decider_loop, "build_scope_context", lambda scope_kind, scope_id: object())
+    monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", lambda pairs: {})
+    monkeypatch.setattr(decider_loop.queries, "gatekeeper_transient_failure_count", lambda event_id, sub_id, version: 2)
+    monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: logs.append(kwargs))
+    monkeypatch.setattr(
+        decider_loop.queries,
+        "mark_event_processed",
+        lambda event_id, version: marked.append((event_id, version)),
+    )
+    monkeypatch.setattr(decider_loop.lockout, "is_project_mismatch", lambda event, candidate: False)
+
+    async def failing_decide(*args, **kwargs):
+        raise RuntimeError("OpenRouter 5xx")
+
+    monkeypatch.setattr(decider_loop.decider, "decide", failing_decide)
+
+    await decider_loop.process_event(
+        {"id": 9, "payload_version": 1, "payload": {"turn_id": 99}},
+        {
+            ("user", "22222222-2222-2222-2222-222222222222"): [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "scope_kind": "user",
+                    "scope_id": "22222222-2222-2222-2222-222222222222",
+                    "description": "vibelive 进展告诉我",
+                }
+            ]
+        },
+    )
+
+    assert logs[0]["judge_output"]["suppressed_by"] == "gatekeeper_transient_error"
+    assert logs[0]["judge_output"]["consecutive_failure_count"] == 3
+    assert logs[-1]["judge_output"]["suppressed_by"] == "gatekeeper_failure"
+    assert marked == [(9, 1)]
+
+
+@pytest.mark.anyio
+async def test_decider_retries_transient_gatekeeper_errors_before_budget(monkeypatch):
+    from agent import decider_loop
+
+    logs: list[dict] = []
+    marked: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(decider_loop, "build_scope_context", lambda scope_kind, scope_id: object())
+    monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", lambda pairs: {})
+    monkeypatch.setattr(decider_loop.queries, "gatekeeper_transient_failure_count", lambda event_id, sub_id, version: 1)
+    monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: logs.append(kwargs))
+    monkeypatch.setattr(
+        decider_loop.queries,
+        "mark_event_processed",
+        lambda event_id, version: marked.append((event_id, version)),
+    )
+    monkeypatch.setattr(decider_loop.lockout, "is_project_mismatch", lambda event, candidate: False)
+
+    async def failing_decide(*args, **kwargs):
+        raise RuntimeError("OpenRouter 5xx")
+
+    monkeypatch.setattr(decider_loop.decider, "decide", failing_decide)
+
+    await decider_loop.process_event(
+        {"id": 9, "payload_version": 1, "payload": {"turn_id": 99}},
+        {
+            ("user", "22222222-2222-2222-2222-222222222222"): [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "scope_kind": "user",
+                    "scope_id": "22222222-2222-2222-2222-222222222222",
+                    "description": "vibelive 进展告诉我",
+                }
+            ]
+        },
+    )
+
+    assert logs[0]["judge_output"]["suppressed_by"] == "gatekeeper_transient_error"
+    assert logs[0]["judge_output"]["consecutive_failure_count"] == 2
+    assert marked == []
 
 
 @pytest.mark.anyio

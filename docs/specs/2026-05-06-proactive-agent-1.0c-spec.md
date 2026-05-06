@@ -324,6 +324,16 @@ For each (event, candidate subscription) pair:
    so the next loop iteration retries. This mirrors 1.0a's parse
    failure budget pattern and prevents the 1.0a-class infinite
    retry / API-cost-burn bug from coming back.
+6. **If the gatekeeper call raises before producing a parseable
+   response** (OpenRouter/network/unknown exception): write a
+   decision_log row with
+   `suppressed_by="gatekeeper_transient_error"` and leave the
+   event unprocessed for the first two consecutive failures for
+   that `(event_id, subscription_id, payload_version)`. On the 3rd
+   consecutive transient failure, write a final
+   `suppressed_by="gatekeeper_failure"` row and settle the pair.
+   This gives transient provider outages a retry budget without
+   allowing one event to burn LLM calls forever.
 
 The decider does NOT write a `notifications` row in 1.0c. That's
 the investigator's job.
@@ -1040,6 +1050,13 @@ Latency target:
 
 5 min is acceptable for the proactive use case (this is async by
 nature). For breaking-news urgency we'd add a "high-priority"
+
+Current backpressure limit: the decider polls up to 100
+`events_needing_decision` rows per iteration and fetches up to
+10,000 enabled, unarchived subscriptions per iteration. This is
+fine for the single-team MVP. Large burst traffic needs a wakeup
+queue / worker pool or smaller poll interval rather than relying
+only on the 30s poll.
 subscription tier, deferred to 2.0.
 
 ---

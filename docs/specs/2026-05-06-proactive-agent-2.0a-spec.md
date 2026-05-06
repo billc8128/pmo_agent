@@ -854,6 +854,10 @@ events row, but changed PR payloads still bump `payload_version`
 and can re-enter the gatekeeper. Monitor gatekeeper call volume
 by source/repo after rollout; if webhook volume dominates, 2.0b/c
 should add subscription subject indexing or per-repo rate limits.
+Gatekeeper transient exceptions have a 3-attempt budget per
+`(event_id, subscription_id, payload_version)`; after that the
+pair is settled as `gatekeeper_failure` so provider/API outages do
+not spin forever.
 
 Investigator enrichment: each `fetch_pr_files` call is a single
 external API hit + 24h cache. At <5 PRs/day, this is a few
@@ -863,6 +867,12 @@ Decider event fanout prefetches current notification rows in one
 batch per event before iterating candidate subscriptions. It must
 not do a `get_notification` round-trip per subscription on the
 hot path.
+
+Active subscription scans use an explicit 10,000 row limit to avoid
+PostgREST's default 1,000 row cap silently dropping later rules.
+The decider still polls only 100 events per iteration; burst
+latency above that is a known 2.0a scale limit and should be fixed
+with active enqueue/worker-pool semantics before scale-out.
 
 Daily send-cap checks use an exact PostgREST count instead of
 counting a capped page of notification rows.

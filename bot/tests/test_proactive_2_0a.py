@@ -616,6 +616,51 @@ def test_ingest_marks_archive_ignored_on_processing_exception(monkeypatch, caplo
     assert any("webhook.archive_ignored" in record.getMessage() and "ingest_error" in record.getMessage() for record in caplog.records)
 
 
+def test_ingest_swallows_audit_mark_failure_after_processing_exception(monkeypatch, caplog):
+    from external import ingest
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            calls.append(("archive", kwargs))
+            return 7
+
+        @staticmethod
+        def mark_archive_ignored(*args):
+            calls.append(("ignored", args))
+            raise RuntimeError("db still down")
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            calls.append(("upsert", kwargs))
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            calls.append(("link", args))
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+    monkeypatch.setattr(ingest, "normalize_github", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with caplog.at_level(logging.WARNING, logger="external.ingest"):
+        asyncio.run(
+            ingest.ingest_external_event(
+                provider="github",
+                event_type="pull_request",
+                delivery_id="delivery-processing-error",
+                payload=_github_pr_payload(),
+                raw_bytes=b"{}",
+                headers={},
+            )
+        )
+
+    assert calls[0][0] == "archive"
+    assert calls[1] == ("ignored", (7, "ingest_error"))
+    assert any("webhook.archive_ignore_mark_failed" in record.getMessage() for record in caplog.records)
+
+
 def test_ingest_logs_sanitize_attacker_controlled_identifiers(monkeypatch, caplog):
     from external import ingest
 

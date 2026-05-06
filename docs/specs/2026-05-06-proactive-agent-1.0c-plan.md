@@ -698,13 +698,20 @@ already handles fenced/unfenced JSON).
    happen); third failure DOES settle the pair as
    `gatekeeper_parse_error`; assert no infinite retry loop.
 
-5. `test_decider_idempotent_on_existing_job`: pre-create an
+5. `test_decider_handles_transient_failure_budget`: mock
+   OpenRouter/network exception 3 times for the same (event, sub,
+   version); assert first 2 failures log
+   `gatekeeper_transient_error` and leave the event unprocessed;
+   third failure logs final `gatekeeper_failure` and settles the
+   pair.
+
+6. `test_decider_idempotent_on_existing_job`: pre-create an
    investigation_job for this subscription with seed_event_ids=
    [event_id]; run `process_event` for the same event; assert
    the job's seed_event_ids is unchanged (not duplicated); no new
    job opened.
 
-6. `test_decider_partial_failure_leaves_event_unprocessed`:
+7. `test_decider_partial_failure_leaves_event_unprocessed`:
    subscription A's LLM call succeeds, subscription B's LLM call
    raises; assert events.processed_at IS NULL (whole event left
    for next iteration); assert A still got its

@@ -252,8 +252,11 @@ begin
             select n2.id
               from public.notifications n2
               join public.events e on e.id = n2.event_id
+              join public.subscriptions s2 on s2.id = n2.subscription_id
              where n2.status = 'pending'
                and n2.decided_payload_version = e.payload_version
+               and s2.enabled is true
+               and s2.archived_at is null
              order by n2.decided_at
              limit greatest(coalesce(p_limit, 20), 0)
              for update of n2 skip locked
