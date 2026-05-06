@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -117,7 +118,11 @@ def build_judge_event(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _excerpt(value: Any, limit: int = 400) -> str:
-    return str(value or "")[:limit]
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<at\b[^>]*>.*?</at>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?[A-Za-z][^>\n]{0,200}>", "", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
+    return text[:limit]
 
 
 def _judge_event_for_pull_request(payload: dict[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 process.env.TZ = 'UTC';
@@ -115,4 +116,14 @@ test('integration management is fail-closed unless admin env is configured', () 
       process.env.PMO_INTEGRATION_ADMIN_HANDLES = previousHandles;
     }
   }
+});
+
+test('integrations page does not create service-role client for anonymous viewers', () => {
+  const source = readFileSync(new URL('../app/integrations/page.tsx', import.meta.url), 'utf8');
+  const loginGate = source.indexOf('if (!user)');
+  const adminClientUse = source.indexOf('adminClient()');
+
+  assert.ok(loginGate > 0, 'expected explicit anonymous viewer gate');
+  assert.ok(adminClientUse > 0, 'expected page to still use admin client after auth');
+  assert.ok(loginGate < adminClientUse, 'anonymous gate must run before adminClient()');
 });

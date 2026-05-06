@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _github_pr_payload(**overrides):
     payload = {
@@ -56,9 +58,7 @@ def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch
     monkeypatch.setattr(
         normalizer.queries,
         "lookup_project_root_for_repo",
-        lambda provider, repo: "/Users/a/Desktop/vibelive"
-        if (provider, repo) == ("github", "billc8128/vibelive")
-        else None,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("webhook project_root must not use global path mapping")),
     )
 
     normalized = normalizer.normalize_github("pull_request", payload)
@@ -66,10 +66,11 @@ def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch
     assert normalized["event_type"] == "pull_request"
     assert normalized["action"] == "merged"
     assert normalized["occurred_at"] == "2026-05-06T06:30:00Z"
-    assert normalized["project_root"] == "/Users/a/Desktop/vibelive"
+    assert normalized["project_root"] == "github:billc8128/vibelive"
     assert normalized["pr"]["merged"] is True
     assert normalized["pr"]["number"] == 42
     assert normalized["repo"]["full_name"] == "billc8128/vibelive"
+    assert normalized["repo"]["project_root"] == "github:billc8128/vibelive"
     assert normalized["actor"] == {
         "login": "hellobit",
         "id": "12345",
@@ -268,8 +269,10 @@ def test_ingest_upserts_event_and_links_archive(monkeypatch):
     upsert = calls[1][1]
     assert upsert["source"] == "github"
     assert upsert["source_id"] == "pull_request:billc8128/vibelive:42"
-    assert upsert["project_root"] == "/repo/vibelive"
+    assert upsert["user_id"] is None
+    assert upsert["project_root"] == "github:billc8128/vibelive"
     assert upsert["payload"]["event_type"] == "pull_request"
+    assert upsert["payload"]["actor"]["profile_id"] is None
     assert calls[2] == ("link", (7, 99))
 
 
@@ -380,6 +383,107 @@ def test_stable_payload_fingerprint_ignores_delivery_and_lookup_fields():
 
     assert payload_fingerprint(base) == payload_fingerprint(redelivery)
     assert payload_fingerprint(base) != payload_fingerprint(changed)
+
+
+def test_archive_external_delivery_uses_ignore_duplicates_to_preserve_raw_body(monkeypatch):
+    from db import queries
+
+    class FakeTable:
+        def __init__(self):
+            self.upsert_kwargs: dict[str, object] = {}
+
+        def upsert(self, row, **kwargs):
+            self.upsert_kwargs = kwargs
+            return self
+
+        def select(self, *_args):
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[{"id": 77}])
+
+    table = FakeTable()
+
+    class FakeClient:
+        def table(self, name):
+            assert name == "external_webhook_deliveries"
+            return table
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: FakeClient())
+
+    assert queries.archive_external_delivery(
+        provider="github",
+        delivery_id="delivery-1",
+        event_type="pull_request",
+        raw_body={"first": True},
+        raw_headers={},
+    ) == 77
+    assert table.upsert_kwargs["on_conflict"] == "provider,delivery_id"
+    assert table.upsert_kwargs["ignore_duplicates"] is True
+
+
+def test_write_external_resource_reaps_expired_rows_and_rejects_large_content(monkeypatch):
+    from db import queries
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeTable:
+        def delete(self):
+            calls.append(("delete", None))
+            return self
+
+        def lt(self, key, value):
+            calls.append(("lt", (key, value)))
+            return self
+
+        def upsert(self, row, **kwargs):
+            calls.append(("upsert", (row, kwargs)))
+            return self
+
+        def execute(self):
+            calls.append(("execute", None))
+            return SimpleNamespace(data=None)
+
+    class FakeClient:
+        def table(self, name):
+            assert name == "external_resource_cache"
+            return FakeTable()
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: FakeClient())
+
+    queries.write_external_resource("github", "pr_files", "repo#1", {"files": []})
+
+    assert calls[0] == ("delete", None)
+    assert calls[1][0] == "lt"
+    assert calls[2][0] == "execute"
+    assert calls[3][0] == "upsert"
+
+    with pytest.raises(ValueError, match="external resource content too large"):
+        queries.write_external_resource("github", "pr_files", "repo#big", {"patch": "x" * (1024 * 1024 + 1)})
+
+
+def test_build_judge_event_strips_feishu_mentions_and_html_from_external_body():
+    from agent.decider import build_judge_event
+
+    projected = build_judge_event(
+        {
+            "event_type": "pull_request",
+            "action": "opened",
+            "project_root": "github:billc8128/vibelive",
+            "repo": {"full_name": "billc8128/vibelive"},
+            "actor": {"login": "hellobit"},
+            "pr": {
+                "number": 42,
+                "title": "Media check",
+                "body": 'hello <at user_id="ou_fake"></at> <b>ship</b> &amp; verify',
+            },
+        }
+    )
+
+    assert "<at" not in projected["body_excerpt"]
+    assert "ou_fake" not in projected["body_excerpt"]
+    assert "<b>" not in projected["body_excerpt"]
+    assert "ship & verify" in projected["body_excerpt"]
 
 
 def test_link_external_identity_normalizes_login_before_write(monkeypatch):
@@ -590,6 +694,15 @@ def test_migration_0020_defines_external_sources_contracts():
     assert "grant all on public.external_webhook_deliveries to service_role" in sql
 
 
+def test_migration_0021_uses_repo_identifier_project_tokens():
+    sql = Path("backend/supabase/migrations/0021_webhook_event_semantics.sql").read_text()
+
+    assert "github:owner/repo" in sql
+    assert "lower(source || ':' || (payload #>> '{repo,full_name}'))" in sql
+    assert "position(token in desc_lower) > 0" in sql
+    assert "set search_path = public, pg_temp" in sql
+
+
 def test_register_external_repos_script_exists_with_dry_run_and_apply_modes():
     script = Path("backend/scripts/register_external_repos.mjs").read_text()
 
@@ -597,3 +710,5 @@ def test_register_external_repos_script_exists_with_dry_run_and_apply_modes():
     assert "external_repos?on_conflict=provider,repo_full_name" in script
     assert "--apply" in script
     assert "dry-run only" in script
+    assert "/Users/a/Desktop/vibelive" not in script
+    assert "EXTERNAL_REPOS_JSON is required" in script

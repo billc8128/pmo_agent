@@ -38,11 +38,19 @@ def _usage_value(usage: Any, key: str) -> int | None:
 
 
 def _sanitize_brief_subjects(brief: dict[str, Any], bundle: Any) -> dict[str, Any]:
-    allowed = {
-        str(ev.get("user_id"))
-        for ev in list(getattr(bundle, "events", []) or [])
-        if ev.get("user_id")
-    }
+    allowed: set[str] = set()
+    for ev in list(getattr(bundle, "events", []) or []):
+        if ev.get("user_id"):
+            allowed.add(str(ev.get("user_id")))
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        actor = payload.get("actor") or {}
+        if isinstance(actor, dict) and actor.get("profile_id"):
+            allowed.add(str(actor.get("profile_id")))
+        mentions = payload.get("mentioned_profile_ids") or []
+        if isinstance(mentions, list):
+            allowed.update(str(value) for value in mentions if value)
     raw_subjects = brief.get("subject_user_ids") or []
     if not isinstance(raw_subjects, list):
         raw_subjects = []

@@ -58,10 +58,10 @@ Creates:
 - **`events.payload_fingerprint` column** (text, nullable) —
   webhook events compute md5 over the stable normalised payload
   and write it on insert. The hash excludes top-level delivery
-  noise plus DB lookup outputs (`project_root`,
-  `actor.profile_id`, `repo.project_root`,
-  `mentioned_profile_ids`) so identity/repo rebinding does not
-  re-notify old webhook events.
+  noise, duplicate derived repo identifiers (`project_root`,
+  `repo.project_root`), and identity lookup outputs
+  (`actor.profile_id`, `mentioned_profile_ids`) so identity
+  rebinding does not re-notify old webhook events.
   **Turn events**: 0020 does NOT extend `on_turn_to_event` to
   populate this column. Rationale:
   - 1.0c's existing on_turn_to_event computes a local fingerprint
@@ -147,8 +147,6 @@ Identity:
   for the /me page UI.
 
 Repos:
-- `lookup_project_root_for_repo(provider, repo_full_name) -> str
-  | None` — returns project_root or None.
 - `register_external_repo(provider, repo_full_name,
   project_root, created_by=None) -> dict` — for admin script /
   bootstrap.
@@ -166,9 +164,9 @@ Resource cache:
 External ingest:
 - `archive_external_delivery(provider, delivery_id, event_type,
   raw_body, raw_headers) -> int` — idempotent archive helper.
-  Uses `INSERT ... ON CONFLICT (provider, delivery_id) DO UPDATE`
-  and returns the archive row id; duplicate redeliveries must not
-  raise before `upsert_event` can run.
+  Uses an insert/upsert with `ignore_duplicates=True` and returns
+  the archive row id; duplicate redeliveries must preserve the
+  first raw body and must not raise before `upsert_event` can run.
 - `link_archive_to_event(archive_id, event_id) -> None` — sets
   `external_webhook_deliveries.event_id` only if it is currently
   NULL; never clobbers an existing successful link.
@@ -323,7 +321,9 @@ def normalize_github(event_type: str, raw: dict) -> dict | None:
 Each handler:
 - extracts the typed fields per spec §4.3
 - looks up actor profile_id via `lookup_profile_by_external_login`
-- looks up project_root via `lookup_project_root_for_repo`
+- sets `project_root` to the repo identifier
+  `{provider}:{lower(repo_full_name)}`; it does not copy
+  `external_repos.project_root` into events
 - determines `occurred_at` per the table in spec §4.4
 - **does NOT** copy the entire raw body into `events.payload`.
   Per spec §4.3 raw goes to a service-only
@@ -437,13 +437,17 @@ async def ingest_external_event(
     #    push: push:{repo}:{ref}:{after}
     #    release: release:{repo}:{tag}
     #    comment: issue_comment:{repo}:{comment_id}
+    #    Webhook events have no events.user_id subject. The actor
+    #    profile stays inside payload.actor.profile_id.
+    #    project_root is the repo identifier, e.g.
+    #    github:billc8128/vibelive, not external_repos.project_root.
     #    Idempotency via payload_fingerprint (computed from a
     #    stable subset of the normalised payload — see helper
     #    contract in §2). Returns event_id.
     event_id = queries.upsert_event(
         source=provider,
         source_id=source_id_for_event(normalized),
-        user_id=normalized.get("actor", {}).get("profile_id"),
+        user_id=None,
         project_root=normalized.get("repo", {}).get("project_root"),
         occurred_at=normalized["occurred_at"],
         payload=normalized,
@@ -511,10 +515,10 @@ returning id;
 `payload_fingerprint` is a new nullable column on `events` (added
 in plan §1's migration if not already present). For webhook
 events: `md5(stable_json(normalised_payload_minus_volatile_fields))`
-where the stable subset excludes delivery noise and DB lookup
-outputs (`project_root`, `actor.profile_id`, `repo.project_root`,
-`mentioned_profile_ids`). For turn events: leave this column NULL
-in 2.0a. Turn events continue through the existing
+where the stable subset excludes delivery noise, duplicate
+derived repo identifiers, and identity lookup outputs
+(`actor.profile_id`, `mentioned_profile_ids`). For turn events:
+leave this column NULL in 2.0a. Turn events continue through the existing
 `on_turn_to_event` trigger and its `payload_version` semantics;
 webhook redelivery is the only path that needs the persisted
 fingerprint guard.
@@ -599,8 +603,10 @@ opening SQL.
 - `web/app/site-header.tsx` — adds `Integrations` nav.
 
 **UX contract**:
-- Everyone can view connected providers, repo mappings, generated
-  webhook URLs, and recent accepted deliveries.
+- Signed-in users can view connected providers, repo mappings,
+  generated webhook URLs, and recent accepted deliveries.
+  Anonymous visitors see the setup shell/login CTA only; the page
+  must not create a service-role Supabase client before auth.
 - Signed-in maintainers can add/remove repo mappings. The page
   fails closed unless `PMO_INTEGRATION_ADMIN_USER_IDS` or
   `PMO_INTEGRATION_ADMIN_HANDLES` names allowed maintainers.
@@ -782,9 +788,9 @@ Single commit on `proactive-agent` branch:
 
 Adds GitHub and Gitea webhook ingestion alongside turns. New
 external_identities and external_repos tables let webhook events
-map to existing profiles and project_roots so 1.0c's project
-lockout, gatekeeper, investigator, renderer, delivery all work
-unchanged.
+map actors to existing profiles while webhook project identity
+uses stable repo identifiers so 1.0c's gatekeeper, investigator,
+renderer, and delivery paths keep working.
 
 See docs/specs/2026-05-06-proactive-agent-2.0a-spec.md for the
 full behaviour contract; this commit implements §3 ingest, §5
@@ -843,7 +849,9 @@ repo bootstrap. That's the irreducible 2.0a.
    row growth post-deploy; if a single repo's events dominate,
    add a per-source rate limiter.
 
-5. **Repo mapping drift**. If `external_repos.project_root` is
-   wrong (typo, repo renamed), all events from that repo land
-   in the wrong project. Document the bootstrap script + run
-   the mapping verification query (see plan §5).
+5. **Repo mapping drift**. `external_repos.project_root` is no
+   longer copied into webhook events, so a bad display/admin
+   mapping does not corrupt lockout. Repo rename drift still
+   matters for the `/integrations` registry and provider webhook
+   setup; document the bootstrap script + run the mapping
+   verification query (see plan §5).

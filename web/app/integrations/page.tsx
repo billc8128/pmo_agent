@@ -30,6 +30,32 @@ export default async function IntegrationsPage() {
     : { data: null };
   const viewer = user ? { id: user.id, handle: profile?.handle ?? null } : null;
   const canManage = canManageIntegrations(viewer);
+  const botBaseUrl =
+    process.env.BOT_WEBHOOK_BASE_URL ??
+    process.env.NEXT_PUBLIC_BOT_WEBHOOK_BASE_URL ??
+    '';
+
+  if (!user) {
+    const providers = EXTERNAL_PROVIDERS.map((provider) => ({
+      provider,
+      webhookUrl: buildWebhookUrl(botBaseUrl, provider),
+      repoCount: 0,
+      latestDeliveryAt: null,
+    }));
+    return (
+      <main className="mx-auto max-w-5xl px-4 py-8 sm:py-12">
+        <IntegrationsPanel
+          providers={providers}
+          repos={[]}
+          deliveries={[]}
+          signedIn={false}
+          canManage={false}
+          loginHref={`/login?next=${encodeURIComponent('/integrations')}`}
+          botBaseConfigured={Boolean(botBaseUrl)}
+        />
+      </main>
+    );
+  }
 
   let admin: ReturnType<typeof adminClient>;
   try {
@@ -79,10 +105,6 @@ export default async function IntegrationsPage() {
     .map(toPublicExternalDelivery)
     .filter((delivery): delivery is PublicExternalDelivery => delivery != null);
 
-  const botBaseUrl =
-    process.env.BOT_WEBHOOK_BASE_URL ??
-    process.env.NEXT_PUBLIC_BOT_WEBHOOK_BASE_URL ??
-    '';
   const providers = EXTERNAL_PROVIDERS.map((provider) => {
     const providerDeliveries = deliveries.filter((d) => d.provider === provider);
     return {

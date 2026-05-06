@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from typing import Any
 
@@ -10,6 +11,7 @@ _CACHE_TTL_SECONDS = 60
 _cached_at = 0.0
 _cached_tokens: set[str] = set()
 _cached_hash = hashlib.sha256(b"").hexdigest()[:16]
+_REPO_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_+.-]*:[^/\s]+/[^/\s]+$")
 
 
 def _token_hash(tokens: set[str]) -> str:
@@ -32,9 +34,11 @@ def known_project_tokens() -> tuple[set[str], str]:
 def last_segment(project_root: str | None) -> str:
     if not project_root:
         return ""
-    root = project_root.strip()
+    root = project_root.strip().lower()
     if not root or root.endswith("/"):
         return ""
+    if _REPO_IDENTIFIER_RE.match(root):
+        return root
     return root.rsplit("/", 1)[-1].lower()
 
 
@@ -83,4 +87,8 @@ def is_project_mismatch(event: Any, sub: Any) -> bool:
     if not matched_projects:
         return False
     matched = {str(p).lower() for p in matched_projects if p}
+    event_repo_tokens = {t for t in event_tokens if _REPO_IDENTIFIER_RE.match(t)}
+    matched_repo_tokens = {t for t in matched if _REPO_IDENTIFIER_RE.match(t)}
+    if event_repo_tokens and not matched_repo_tokens:
+        return False
     return event_tokens.isdisjoint(matched)

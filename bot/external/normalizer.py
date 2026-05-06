@@ -16,6 +16,11 @@ def _login(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _repo_identifier(provider: str, full_name: str) -> str | None:
+    repo = full_name.strip().lower()
+    return f"{provider}:{repo}" if repo else None
+
+
 def _actor(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
     sender = _as_dict(raw.get("sender") or raw.get("user"))
     login = _login(sender.get("login") or sender.get("username"))
@@ -27,8 +32,8 @@ def _actor(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
 
 def _repo(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
     repo = _as_dict(raw.get("repository") or raw.get("repo"))
-    full_name = str(repo.get("full_name") or repo.get("fullName") or "").strip()
-    project_root = queries.lookup_project_root_for_repo(provider, full_name) if full_name else None
+    full_name = str(repo.get("full_name") or repo.get("fullName") or "").strip().lower()
+    project_root = _repo_identifier(provider, full_name)
     return {
         "full_name": full_name,
         "default_branch": repo.get("default_branch") or repo.get("default_branch_name"),

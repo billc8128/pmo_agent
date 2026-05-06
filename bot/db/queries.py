@@ -7,10 +7,10 @@ turns them into tool error messages the LLM can react to.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-import re
 
 from .client import sb, sb_admin
 
@@ -1141,12 +1141,18 @@ def fetch_all_enabled_subscriptions() -> list[dict[str, Any]]:
     )
 
 
+_REPO_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_+.-]*:[^/\s]+/[^/\s]+$")
+_MAX_EXTERNAL_RESOURCE_CONTENT_BYTES = 1024 * 1024
+
+
 def _project_last_segment(project_root: str | None) -> str:
     if not project_root:
         return ""
-    root = project_root.strip()
+    root = project_root.strip().lower()
     if not root or root.endswith("/"):
         return ""
+    if _REPO_IDENTIFIER_RE.match(root):
+        return root
     return root.rsplit("/", 1)[-1].lower()
 
 
@@ -1206,7 +1212,18 @@ def write_external_resource(
     content: dict[str, Any],
     ttl_seconds: int = 86400,
 ) -> None:
+    content_bytes = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(content_bytes) > _MAX_EXTERNAL_RESOURCE_CONTENT_BYTES:
+        raise ValueError("external resource content too large")
+    now = _utc_now_iso()
     expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+    (
+        sb_admin()
+        .table("external_resource_cache")
+        .delete()
+        .lt("expires_at", now)
+        .execute()
+    )
     (
         sb_admin()
         .table("external_resource_cache")
@@ -1216,7 +1233,7 @@ def write_external_resource(
                 "resource_kind": resource_kind,
                 "resource_key": resource_key,
                 "content": content,
-                "fetched_at": _utc_now_iso(),
+                "fetched_at": now,
                 "expires_at": expires_at,
             },
             on_conflict="provider,resource_kind,resource_key",
@@ -1246,11 +1263,23 @@ def archive_external_delivery(
                 "received_at": _utc_now_iso(),
             },
             on_conflict="provider,delivery_id",
+            ignore_duplicates=True,
         )
         .select("id")
         .execute()
     )
-    row = (res.data or [{}])[0]
+    row = (res.data or [None])[0]
+    if not row:
+        row = (
+            sb_admin()
+            .table("external_webhook_deliveries")
+            .select("id")
+            .eq("provider", provider)
+            .eq("delivery_id", delivery_id)
+            .maybe_single()
+            .execute()
+            .data
+        )
     return int(row["id"])
 
 

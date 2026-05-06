@@ -43,6 +43,7 @@ def test_lockout_last_segment_treats_trailing_slash_as_unknown():
     assert lockout.last_segment(None) == ""
     assert lockout.last_segment("") == ""
     assert lockout.last_segment("/Users/a/vibelive") == "vibelive"
+    assert lockout.last_segment("github:billc8128/vibelive") == "github:billc8128/vibelive"
     assert lockout.last_segment("/Users/a/vibelive/") == ""
 
 
@@ -118,6 +119,31 @@ def test_lockout_still_rejects_unmatched_project_path_leaf(monkeypatch):
     }
 
     assert lockout.is_project_mismatch(event, sub) is True
+
+
+def test_lockout_matches_exact_repo_identifier_for_webhook_events(monkeypatch):
+    from agent import lockout
+
+    sub = SimpleNamespace(
+        id="11111111-1111-1111-1111-111111111111",
+        metadata={"matched_projects": ["github:billc8128/vibelive"], "project_tokens_hash": "hash"},
+    )
+    monkeypatch.setattr(lockout, "known_project_tokens", lambda: ({"github:billc8128/vibelive"}, "hash"))
+
+    assert lockout.is_project_mismatch({"project_root": "github:billc8128/vibelive"}, sub) is False
+    assert lockout.is_project_mismatch({"project_root": "github:other/vibelive"}, sub) is True
+
+
+def test_lockout_does_not_hard_skip_webhook_events_on_short_project_token(monkeypatch):
+    from agent import lockout
+
+    sub = SimpleNamespace(
+        id="11111111-1111-1111-1111-111111111111",
+        metadata={"matched_projects": ["vibelive"], "project_tokens_hash": "hash"},
+    )
+    monkeypatch.setattr(lockout, "known_project_tokens", lambda: ({"vibelive", "github:other/vibelive"}, "hash"))
+
+    assert lockout.is_project_mismatch({"project_root": "github:other/vibelive"}, sub) is False
 
 
 class _RpcStub:
@@ -431,6 +457,7 @@ def test_renderer_1_0c_prompt_forbids_new_facts():
 
     assert "investigator brief" in prompt
     assert "不能加入新事实" in prompt
+    assert "不要复制 brief/key_facts 里已有的 `<at ...>`" in prompt
 
 
 def test_investigator_loop_filters_hallucinated_subject_user_ids():
@@ -450,6 +477,34 @@ def test_investigator_loop_filters_hallucinated_subject_user_ids():
 
     assert investigator_loop._sanitize_brief_subjects(brief, bundle)["subject_user_ids"] == [
         "33333333-3333-3333-3333-333333333333"
+    ]
+
+
+def test_investigator_loop_allows_webhook_actor_and_mentions_as_subjects():
+    from agent import investigator_loop
+
+    bundle = SimpleNamespace(
+        events=[
+            {
+                "user_id": None,
+                "payload": {
+                    "actor": {"profile_id": "33333333-3333-3333-3333-333333333333"},
+                    "mentioned_profile_ids": ["44444444-4444-4444-4444-444444444444"],
+                },
+            }
+        ]
+    )
+    brief = {
+        "subject_user_ids": [
+            "33333333-3333-3333-3333-333333333333",
+            "44444444-4444-4444-4444-444444444444",
+            "99999999-9999-9999-9999-999999999999",
+        ],
+    }
+
+    assert investigator_loop._sanitize_brief_subjects(brief, bundle)["subject_user_ids"] == [
+        "33333333-3333-3333-3333-333333333333",
+        "44444444-4444-4444-4444-444444444444",
     ]
 
 

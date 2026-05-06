@@ -1,11 +1,10 @@
-// Service-role Supabase client. Bypasses RLS — only use server-side,
-// only when the route handler has already authenticated the caller via
-// the normal session-cookie path.
+// Service-role Supabase client. Bypasses RLS — only use server-side, after
+// the route/page/action has authenticated the caller or has otherwise gated
+// what public data may be returned.
 //
-// Today's only consumer is the Feishu OAuth callback, which needs to
-// upsert a row into feishu_links on behalf of the user. RLS doesn't
-// allow that with the anon key by design (we don't want a logged-in
-// user to claim an arbitrary open_id from the browser).
+// Consumers include Feishu OAuth, integration management, and public-safe
+// server-rendered views that explicitly filter service-role rows before they
+// reach the browser.
 
 import { createClient } from '@supabase/supabase-js';
 

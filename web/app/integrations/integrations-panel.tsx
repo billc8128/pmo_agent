@@ -123,7 +123,7 @@ export function IntegrationsPanel({
                 Connected repositories
               </h2>
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">
-                Mapping decides which project a webhook event belongs to.
+                Registry of repositories connected to the PMO agent.
               </p>
             </div>
             <span className="text-xs text-zinc-400 dark:text-zinc-500">

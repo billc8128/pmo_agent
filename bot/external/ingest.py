@@ -113,7 +113,7 @@ async def ingest_external_event(
     event_id = queries.upsert_event(
         source=provider,
         source_id=source_id,
-        user_id=(normalized.get("actor") or {}).get("profile_id"),
+        user_id=None,
         project_root=normalized.get("project_root") or (normalized.get("repo") or {}).get("project_root"),
         occurred_at=normalized.get("occurred_at"),
         payload=normalized,

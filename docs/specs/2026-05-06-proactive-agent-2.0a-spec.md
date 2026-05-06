@@ -50,8 +50,8 @@ In scope:
 - Mapping incoming webhook payloads to `events` rows
 - `external_identities` table mapping (provider, external_login)
   → profile_id
-- `external_repos` table mapping (provider, repo full_name)
-  → project_root
+- `external_repos` table for visible/admin-managed connected
+  repositories
 - Investigator enrichment: when a candidate job references a
   GitHub/Gitea PR, the investigator can read changed-file
   metadata and patch excerpts via a small fetch helper
@@ -59,8 +59,8 @@ In scope:
   mappings, copying webhook URLs, and checking recent deliveries
 - Optional service-role/admin-managed actor attribution via
   `external_identities`
-- Decider's project lockout (1.0c §4.1) keeps working — webhook
-  events feed the same `project_root` field used by lockout
+- Decider's project lockout (1.0c §4.1) keeps working with repo
+  identifiers (`github:owner/repo`) for webhook events
 
 Out of scope (explicitly):
 
@@ -134,16 +134,15 @@ per provider — two profiles can't both claim "billc8128" on
 github, and after a rename two profiles can't both claim the
 same numeric id with different logins.
 
-### 3.2 `external_repos` — map external repo to project_root
+### 3.2 `external_repos` — connected external repos
 
 ```sql
 create table public.external_repos (
     id              uuid primary key default gen_random_uuid(),
     provider        text not null check (provider in ('github', 'gitea')),
     repo_full_name  text not null,    -- "billc8128/vibelive"
-    project_root    text not null,    -- "/Users/.../vibelive"
-                                      -- (matches turns.project_root
-                                      --  format so 1.0c lockout works)
+    project_root    text not null,    -- admin/display project key;
+                                      -- NOT copied into webhook events
     created_by      uuid references public.profiles(id) on delete set null,
     created_at      timestamptz not null default now(),
     updated_at      timestamptz not null default now(),
@@ -154,10 +153,10 @@ create index repos_project_root_idx
     on public.external_repos (project_root);
 ```
 
-A repo maps to exactly one project_root. A project_root may have
-multiple repos (e.g., monorepo with subprojects, or vibelive
-having both `vibelive` and `vibelive-mobile` repos pointing at
-the same project).
+A repo appears once in this registry. `project_root` remains an
+admin/display field for grouping in the UI and scripts; webhook
+events derive their canonical project identity from the repo
+itself (`{provider}:{repo_full_name}`), not from this column.
 
 ### 3.3 `events` schema unchanged, new source values
 
@@ -198,27 +197,36 @@ byte-identical re-delivery. If it did, every re-delivery would
 re-enter `events_needing_decision` and produce duplicate
 investigations / notifications.
 
+For webhook events, `events.project_root` is the repo identifier
+`{provider}:{repo_full_name}` (for example
+`github:billc8128/vibelive`), not a developer-local filesystem
+path from `external_repos`. This keeps lockout semantics global
+and stable. Repo identifiers only hard-lockout on exact repo
+identifier matches; short project-name matches fall through to
+the gatekeeper LLM for webhook events to avoid same-name repo
+collisions.
+
 The upsert uses a `payload_fingerprint` md5 over the stable parts
 of the **normalised** payload. It excludes top-level delivery
-noise and DB lookup outputs (`project_root`, `actor.profile_id`,
-`repo.project_root`, `mentioned_profile_ids`) so rebinding an
-identity or repo mapping does not re-notify old webhook events.
-Same fingerprint → no-op. Different fingerprint (e.g. PR
-description was edited and the event re-ingested) → bump
-`payload_version`, re-enter needs-decision. This mirrors 1.0c's
-late-summary semantics for turn events.
+noise, duplicate derived repo identifiers (`project_root`,
+`repo.project_root`), and identity lookup outputs
+(`actor.profile_id`, `mentioned_profile_ids`) so rebinding an
+identity does not re-notify old webhook events. Same fingerprint
+→ no-op. Different fingerprint (e.g. PR description was edited
+and the event re-ingested) → bump `payload_version`, re-enter
+needs-decision. This mirrors 1.0c's late-summary semantics for
+turn events.
 
 `payload` jsonb contents per webhook event type — see §4.
 
-`user_id` is set when we can map the webhook's actor (PR author,
-pusher, commenter) to a profile via `external_identities`. NULL
-otherwise (still ingested, just unmapped — investigator can read
-the external_login from payload directly).
+`events.user_id` is always NULL for webhook events. The turn
+path uses `events.user_id` for the event subject; webhook actor
+identity is not the same concept and stays in
+`payload.actor.profile_id` / `payload.actor.login`.
 
-`project_root` is set when the webhook's repo maps to a known
-`external_repos.project_root`. NULL otherwise (still ingested,
-but the project lockout in 1.0c won't filter it — it falls
-through to the gatekeeper LLM as a "no project context" event).
+`payload.repo.project_root` mirrors the repo identifier for
+gatekeeper/renderer compatibility. `external_repos.project_root`
+is UI/admin metadata and must not be copied into webhook events.
 
 ### 3.5 `external_webhook_deliveries` — service-only raw archive
 
@@ -306,11 +314,13 @@ These all read `events.payload` opaquely. New event sources slot
 in without schema changes.
 
 The 1.0c project lockout (`subscriptions.metadata.matched_projects`)
-works for webhook events because we populate `events.project_root`
-from the repo mapping. Subscription "vibelive merge 告诉我" with
-`matched_projects=["vibelive"]` correctly hard-skips a github
-event whose `project_root='/Users/.../oneship'` (assuming `oneship`
-repo is mapped) just like it does for turn events.
+continues to work for turn events as before. For webhook events,
+`events.project_root` is a repo identifier such as
+`github:billc8128/vibelive`. A subscription that explicitly
+matches that repo identifier can be hard-skipped by lockout.
+Short names like "vibelive" are not used to hard-skip webhook
+events, because different providers/owners can have same-name
+repos; those fall through to the LLM gatekeeper.
 
 ---
 
@@ -499,24 +509,20 @@ the gatekeeper LLM seeing `actor.login` in payload and reasoning
 about it — coarser than profile_id-based, but works for most
 real cases.
 
-### 4.6 Project root mapping
+### 4.6 Webhook project identity
 
-```sql
-select project_root from external_repos
- where provider = $provider
-   and repo_full_name = lower($repo_full_name)
- limit 1
-```
+Webhook normalisation sets both `events.project_root` and
+`payload.repo.project_root` to
+`{provider}:{lower(repo_full_name)}`. It does not look up
+`external_repos.project_root`, because that value is global UI
+metadata and may be a developer-local filesystem path.
 
-Match → `events.project_root = found`. No match →
-`events.project_root = NULL`.
-
-Implications for 1.0c project lockout (§4.1): when project_root
-is NULL, the gatekeeper's
-`last_segment(event.project_root) == ""` short-circuit returns
-False, so events without a known project don't get hard-skipped.
-They fall through to the LLM gatekeeper, which can read
-`payload.repo.full_name` and reason normally.
+Implications for 1.0c project lockout (§4.1): exact repo
+identifier matches may hard-skip mismatched webhook events.
+Short project-name matches are intentionally treated as
+insufficient for webhook hard-skip and fall through to the LLM
+gatekeeper, which can read `payload.repo.full_name` and reason
+normally.
 
 ---
 
@@ -530,8 +536,10 @@ normal PMO product permissions.
 
 2.0a ships a dedicated `/integrations` page:
 
-- Everyone can view connected providers, mapped repositories,
-  webhook URLs, and recent accepted deliveries.
+- Signed-in users can view connected providers, mapped
+  repositories, webhook URLs, and recent accepted deliveries.
+  Anonymous visitors see only the setup shell and login path; the
+  page does not create a service-role client before auth.
 - Signed-in PMO maintainers can add/remove repo mappings. The UI
   fails closed unless `PMO_INTEGRATION_ADMIN_USER_IDS` or
   `PMO_INTEGRATION_ADMIN_HANDLES` names allowed maintainers.
@@ -737,9 +745,8 @@ no projection needed there.
 - investigator system prompt — reads bundle.events list
   shape-by-shape; bundle entries get the §7.1 projection
 - delivery loop — unchanged
-- Lockout's `last_segment(event.project_root)` — webhook events
-  populate project_root from `external_repos` mapping, same
-  path format. ✅ checked: matches.
+- Lockout's project token extraction — webhook events use exact
+  repo identifiers; short names fall through to the gatekeeper.
 
 ### 7.4 What this means for "fields the gatekeeper sees"
 
@@ -748,7 +755,7 @@ exposes:
 
 | Subscription | Event source | Fields gatekeeper matches against |
 |--------------|--------------|-----------------------------------|
-| "vibelive merge 告诉我" | github pull_request, merged=true | `event_type=pull_request`, `merged=true`, `project_root=.../vibelive`, `headline="albert merged PR #42 ..."` |
+| "vibelive merge 告诉我" | github pull_request, merged=true | `event_type=pull_request`, `merged=true`, `project_root=github:billc8128/vibelive`, `repo_full_name=billc8128/vibelive`, `headline="albert merged PR #42 ..."` |
 | "albert 的 PR 提我" | github pull_request | `actor_handle=albert`, `event_type=pull_request` |
 | "release 标签出来" | github release | `event_type=release`, `release.tag_name` |
 | "vibelive 进展" | turn | original 1.0c fields |
@@ -789,20 +796,20 @@ Concrete e2e scripts the implementation must pass:
 1. Service-role/admin maps github login `billc8128` to bcc's
    profile in `external_identities`
 2. A test webhook delivery comes in with `actor.login=billc8128`
-3. Resulting `events` row has `user_id=bcc.profile_id`
+3. Resulting `events` row has `user_id=NULL` and
+   `payload.actor.profile_id=bcc.profile_id`
 
 ### 9.2 Repo mapping → project lockout
 
-1. `external_repos` has `('github', 'billc8128/vibelive') →
-   '/Users/a/Desktop/vibelive'` mapped
-2. bcc subscribes "vibelive 进展告诉我"; metadata has
-   `matched_projects=["vibelive"]`
-3. Webhook from `oneship` repo arrives → events row has
-   `project_root='/Users/.../oneship'` → gatekeeper lockout
-   skips the event for this subscription
-4. Webhook from `vibelive` repo arrives → events row has
-   `project_root='/Users/.../vibelive'` → lockout doesn't fire,
-   gatekeeper LLM sees the event, opens an investigation
+1. A webhook from `billc8128/vibelive` arrives → events row has
+   `project_root='github:billc8128/vibelive'`
+2. A subscription explicitly mentioning
+   `github:billc8128/vibelive` gets
+   `matched_projects=["github:billc8128/vibelive"]`
+3. Webhook from `github:other/vibelive` arrives → exact repo
+   lockout skips the event for this subscription
+4. A subscription that only says "vibelive" does not hard-skip
+   same-name webhook repos; the LLM gatekeeper decides
 
 ### 9.3 PR merge → spec/plan delivery
 
