@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+
+
+def _github_pr_payload(**overrides):
+    payload = {
+        "action": "closed",
+        "pull_request": {
+            "number": 42,
+            "title": "Ship RTC media verification",
+            "body": "Adds Agora RTC media-flow verification for vibelive.",
+            "html_url": "https://github.com/billc8128/vibelive/pull/42",
+            "diff_url": "https://github.com/billc8128/vibelive/pull/42.diff",
+            "base": {"ref": "main"},
+            "head": {"ref": "rtc-media-check"},
+            "merged": True,
+            "merged_at": "2026-05-06T06:30:00Z",
+            "created_at": "2026-05-06T05:00:00Z",
+            "changed_files": 3,
+            "additions": 120,
+            "deletions": 15,
+        },
+        "repository": {
+            "full_name": "billc8128/vibelive",
+            "default_branch": "main",
+        },
+        "sender": {"login": "hellobit", "id": 12345},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch):
+    from external import normalizer
+
+    monkeypatch.setattr(
+        normalizer.queries,
+        "lookup_profile_by_external_login",
+        lambda provider, login, external_id=None: "profile-hellobit"
+        if (provider, login, external_id) == ("github", "hellobit", "12345")
+        else None,
+    )
+    monkeypatch.setattr(
+        normalizer.queries,
+        "lookup_project_root_for_repo",
+        lambda provider, repo: "/Users/a/Desktop/vibelive"
+        if (provider, repo) == ("github", "billc8128/vibelive")
+        else None,
+    )
+
+    normalized = normalizer.normalize_github("pull_request", _github_pr_payload())
+
+    assert normalized["event_type"] == "pull_request"
+    assert normalized["action"] == "merged"
+    assert normalized["occurred_at"] == "2026-05-06T06:30:00Z"
+    assert normalized["project_root"] == "/Users/a/Desktop/vibelive"
+    assert normalized["pr"]["merged"] is True
+    assert normalized["pr"]["number"] == 42
+    assert normalized["repo"]["full_name"] == "billc8128/vibelive"
+    assert normalized["actor"] == {
+        "login": "hellobit",
+        "id": "12345",
+        "profile_id": "profile-hellobit",
+    }
+    assert "raw" not in normalized
+
+
+def test_build_judge_event_for_pull_request_projection():
+    from agent.decider import build_judge_event
+
+    projected = build_judge_event(
+        {
+            "event_type": "pull_request",
+            "action": "merged",
+            "project_root": "/Users/a/Desktop/vibelive",
+            "occurred_at": "2026-05-06T06:30:00Z",
+            "pr": {
+                "number": 42,
+                "title": "Ship RTC media verification",
+                "body": "Adds Agora RTC media-flow verification for vibelive.",
+                "merged": True,
+            },
+            "repo": {"full_name": "billc8128/vibelive"},
+            "actor": {"login": "hellobit", "profile_id": "profile-hellobit"},
+            "raw": {"large": "must not leak"},
+        }
+    )
+
+    assert projected["event_type"] == "pull_request"
+    assert projected["merged"] is True
+    assert projected["pr_number"] == 42
+    assert projected["actor_handle"] == "hellobit"
+    assert projected["project_root"] == "/Users/a/Desktop/vibelive"
+    assert "Ship RTC media verification" in projected["headline"]
+    assert "raw" not in projected
+
+
+def test_build_judge_event_for_turn_is_unchanged_shape():
+    from agent.decider import build_judge_event
+
+    projected = build_judge_event(
+        {
+            "turn_id": "turn-1",
+            "agent": "codex",
+            "project_path": "/repo/vibelive/bot",
+            "project_root": "/repo/vibelive",
+            "user_message_at": "2026-05-06T06:00:00Z",
+            "user_message": "帮我看一下播放器方案",
+            "agent_summary": "整理 RTC 播放器方案",
+            "agent_response_full": "长回复" * 400,
+        }
+    )
+
+    assert projected["event_type"] == "turn"
+    assert projected["turn_id"] == "turn-1"
+    assert projected["project_root"] == "/repo/vibelive"
+    assert projected["user_message"] == "帮我看一下播放器方案"
+    assert projected["agent_summary"] == "整理 RTC 播放器方案"
+    assert len(projected["agent_response_excerpt"]) <= 600
+
+
+def test_build_judge_event_for_unknown_source_falls_back_without_raw():
+    from agent.decider import build_judge_event
+
+    projected = build_judge_event(
+        {
+            "event_type": "workflow_run",
+            "project_root": "/repo/vibelive",
+            "raw": {"large": "must not leak"},
+        }
+    )
+
+    assert projected == {
+        "event_type": "workflow_run",
+        "headline": "(unrecognised event source)",
+        "project_root": "/repo/vibelive",
+    }
+
+
+def test_ingest_archives_ignored_event_without_upserting(monkeypatch):
+    from external import ingest
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            calls.append(("archive", kwargs))
+            return 7
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            calls.append(("upsert", kwargs))
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            calls.append(("link", args))
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+
+    asyncio.run(
+        ingest.ingest_external_event(
+            provider="github",
+            event_type="workflow_run",
+            delivery_id="delivery-1",
+            payload={"action": "completed"},
+            raw_bytes=b'{"action":"completed"}',
+            headers={"x-github-delivery": "delivery-1", "x-hub-signature-256": "secret"},
+        )
+    )
+
+    assert calls == [
+        (
+            "archive",
+            {
+                "provider": "github",
+                "delivery_id": "delivery-1",
+                "event_type": "workflow_run",
+                "raw_body": {"action": "completed"},
+                "raw_headers": {"x-github-delivery": "delivery-1"},
+            },
+        )
+    ]
+
+
+def test_ingest_upserts_event_and_links_archive(monkeypatch):
+    from external import ingest, normalizer
+
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", lambda *args, **kwargs: None)
+    monkeypatch.setattr(normalizer.queries, "lookup_project_root_for_repo", lambda *args, **kwargs: "/repo/vibelive")
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            calls.append(("archive", kwargs))
+            return 7
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            calls.append(("upsert", kwargs))
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            calls.append(("link", args))
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+
+    asyncio.run(
+        ingest.ingest_external_event(
+            provider="github",
+            event_type="pull_request",
+            delivery_id="delivery-2",
+            payload=_github_pr_payload(),
+            raw_bytes=b"{}",
+            headers={},
+        )
+    )
+
+    assert calls[0][0] == "archive"
+    assert calls[1][0] == "upsert"
+    upsert = calls[1][1]
+    assert upsert["source"] == "github"
+    assert upsert["source_id"] == "pull_request:delivery-2"
+    assert upsert["project_root"] == "/repo/vibelive"
+    assert upsert["payload"]["event_type"] == "pull_request"
+    assert calls[2] == ("link", (7, 99))
+
+
+def test_stable_payload_fingerprint_ignores_delivery_only_fields():
+    from external.ingest import payload_fingerprint
+
+    base = {
+        "event_type": "pull_request",
+        "occurred_at": "2026-05-06T06:30:00Z",
+        "ingested_at": "2026-05-06T06:31:00Z",
+        "delivery_id": "a",
+        "pr": {"number": 42, "title": "A"},
+    }
+    redelivery = {**base, "ingested_at": "2026-05-06T07:00:00Z", "delivery_id": "b"}
+    changed = {**base, "pr": {"number": 42, "title": "B"}}
+
+    assert payload_fingerprint(base) == payload_fingerprint(redelivery)
+    assert payload_fingerprint(base) != payload_fingerprint(changed)
+
+
+def test_meta_tools_include_external_identity_tools():
+    from agent.request_context import RequestContext
+    from agent.tools_meta import build_meta_tools
+
+    names = {tool_def.name for tool_def in build_meta_tools(RequestContext(asker_user_id="profile-1"))}
+
+    assert {"link_external_identity", "unlink_external_identity", "list_external_identities"} <= names
+
+
+def test_migration_0020_defines_external_sources_contracts():
+    sql = Path("backend/supabase/migrations/0020_external_event_sources.sql").read_text()
+
+    for table in [
+        "public.external_identities",
+        "public.external_repos",
+        "public.external_webhook_deliveries",
+        "public.external_resource_cache",
+    ]:
+        assert table in sql
+    assert "add column if not exists payload_fingerprint text" in sql
+    assert "extid_id_unique" in sql
+    assert "where external_id is not null" in sql
+    assert "webhook_delivery_unique unique (provider, delivery_id)" in sql
+    assert "excluded.payload_fingerprint is not null" in sql
+    assert "enable row level security" in sql.lower()
+    assert "grant all on public.external_webhook_deliveries to service_role" in sql
+
+
+def test_register_external_repos_script_exists_with_dry_run_and_apply_modes():
+    script = Path("backend/scripts/register_external_repos.mjs").read_text()
+
+    assert "EXTERNAL_REPOS_JSON" in script
+    assert "external_repos?on_conflict=provider,repo_full_name" in script
+    assert "--apply" in script
+    assert "dry-run only" in script

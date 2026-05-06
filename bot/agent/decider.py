@@ -88,7 +88,23 @@ def _inject_anthropic_env() -> None:
 
 
 def build_judge_event(payload: dict[str, Any]) -> dict[str, Any]:
+    event_type = payload.get("event_type") or "turn"
+    if event_type == "pull_request":
+        return _judge_event_for_pull_request(payload)
+    if event_type == "push":
+        return _judge_event_for_push(payload)
+    if event_type == "release":
+        return _judge_event_for_release(payload)
+    if event_type == "issue_comment":
+        return _judge_event_for_issue_comment(payload)
+    if event_type != "turn":
+        return {
+            "event_type": event_type,
+            "headline": "(unrecognised event source)",
+            "project_root": payload.get("project_root"),
+        }
     return {
+        "event_type": "turn",
         "turn_id": payload.get("turn_id"),
         "agent": payload.get("agent"),
         "project_path": payload.get("project_path"),
@@ -97,6 +113,94 @@ def build_judge_event(payload: dict[str, Any]) -> dict[str, Any]:
         "user_message": (payload.get("user_message") or "")[:800],
         "agent_summary": payload.get("agent_summary"),
         "agent_response_excerpt": (payload.get("agent_response_full") or "")[:600] or None,
+    }
+
+
+def _excerpt(value: Any, limit: int = 400) -> str:
+    return str(value or "")[:limit]
+
+
+def _judge_event_for_pull_request(payload: dict[str, Any]) -> dict[str, Any]:
+    pr = payload.get("pr") or {}
+    repo = payload.get("repo") or {}
+    actor = payload.get("actor") or {}
+    title = pr.get("title") or ""
+    number = pr.get("number")
+    action = payload.get("action") or ""
+    return {
+        "event_type": "pull_request",
+        "headline": f"{actor.get('login') or 'someone'} {action} PR #{number}: {title}",
+        "body_excerpt": _excerpt(pr.get("body")),
+        "actor_handle": actor.get("login"),
+        "actor_profile_id": actor.get("profile_id"),
+        "project_root": payload.get("project_root") or repo.get("project_root"),
+        "occurred_at": payload.get("occurred_at"),
+        "repo_full_name": repo.get("full_name"),
+        "pr_number": number,
+        "pr_title": title,
+        "action": action,
+        "merged": bool(pr.get("merged")),
+        "base_branch": pr.get("base_branch"),
+        "head_branch": pr.get("head_branch"),
+        "files_changed_count": pr.get("files_changed_count"),
+        "additions": pr.get("additions"),
+        "deletions": pr.get("deletions"),
+    }
+
+
+def _judge_event_for_push(payload: dict[str, Any]) -> dict[str, Any]:
+    repo = payload.get("repo") or {}
+    actor = payload.get("actor") or {}
+    summaries = payload.get("commit_summaries") or []
+    return {
+        "event_type": "push",
+        "headline": f"{actor.get('login') or 'someone'} pushed {payload.get('commits_count') or 0} commits to {repo.get('full_name') or ''}",
+        "body_excerpt": _excerpt("; ".join(str(s) for s in summaries)),
+        "actor_handle": actor.get("login"),
+        "actor_profile_id": actor.get("profile_id"),
+        "project_root": payload.get("project_root") or repo.get("project_root"),
+        "occurred_at": payload.get("occurred_at"),
+        "repo_full_name": repo.get("full_name"),
+        "ref": payload.get("ref"),
+        "commits_count": payload.get("commits_count"),
+        "commit_summaries": summaries[:10] if isinstance(summaries, list) else [],
+    }
+
+
+def _judge_event_for_release(payload: dict[str, Any]) -> dict[str, Any]:
+    repo = payload.get("repo") or {}
+    actor = payload.get("actor") or {}
+    release = payload.get("release") or {}
+    return {
+        "event_type": "release",
+        "headline": f"{actor.get('login') or 'someone'} published release {release.get('tag_name') or release.get('name') or ''}",
+        "body_excerpt": _excerpt(release.get("body")),
+        "actor_handle": actor.get("login"),
+        "actor_profile_id": actor.get("profile_id"),
+        "project_root": payload.get("project_root") or repo.get("project_root"),
+        "occurred_at": payload.get("occurred_at"),
+        "repo_full_name": repo.get("full_name"),
+        "tag_name": release.get("tag_name"),
+        "release_name": release.get("name"),
+    }
+
+
+def _judge_event_for_issue_comment(payload: dict[str, Any]) -> dict[str, Any]:
+    repo = payload.get("repo") or {}
+    actor = payload.get("actor") or {}
+    comment = payload.get("comment") or {}
+    issue = payload.get("issue") or {}
+    return {
+        "event_type": "issue_comment",
+        "headline": f"{actor.get('login') or 'someone'} commented on issue #{issue.get('number')}: {issue.get('title') or ''}",
+        "body_excerpt": _excerpt(comment.get("body")),
+        "actor_handle": actor.get("login"),
+        "actor_profile_id": actor.get("profile_id"),
+        "project_root": payload.get("project_root") or repo.get("project_root"),
+        "occurred_at": payload.get("occurred_at"),
+        "repo_full_name": repo.get("full_name"),
+        "issue_number": issue.get("number"),
+        "mentioned_profile_ids": payload.get("mentioned_profile_ids") or [],
     }
 
 

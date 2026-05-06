@@ -24,6 +24,7 @@ from agent.request_context import RequestContext
 from agent.tool_utils import err, ok
 from config import settings
 from db import queries
+from external.fetch import fetch_pr_files
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,30 @@ def _investigator_mcp(ctx: RequestContext):
             }
         )
 
+    @tool(
+        "fetch_pr_files",
+        "Fetch files changed in a GitHub or Gitea PR event. Use sparingly when a subscription explicitly needs file/spec/plan details.",
+        {"event_id": int, "paths_filter": list},
+    )
+    async def fetch_pr_files_tool(args: dict) -> dict[str, Any]:
+        try:
+            event = queries.get_event(int(args["event_id"]))
+            if not event or event.get("source") not in ("github", "gitea"):
+                return err("event is not a GitHub/Gitea PR event")
+            payload = event.get("payload") or {}
+            if payload.get("event_type") != "pull_request":
+                return err("event is not a pull_request")
+            return ok(
+                await fetch_pr_files(
+                    event["source"],
+                    payload["repo"]["full_name"],
+                    int(payload["pr"]["number"]),
+                    paths_filter=args.get("paths_filter") or None,
+                )
+            )
+        except Exception as e:
+            return err(str(e))
+
     return create_sdk_mcp_server(
         name="pmo_investigator",
         version="0.1.0",
@@ -163,6 +188,7 @@ def _investigator_mcp(ctx: RequestContext):
             get_project_overview,
             get_activity_stats,
             today_iso,
+            fetch_pr_files_tool,
         ],
     )
 
@@ -179,6 +205,7 @@ async def investigate(bundle: Any) -> tuple[dict[str, Any], Usage]:
             "mcp__pmo_investigator__get_project_overview",
             "mcp__pmo_investigator__get_activity_stats",
             "mcp__pmo_investigator__today_iso",
+            "mcp__pmo_investigator__fetch_pr_files",
         ],
         mcp_servers={"pmo_investigator": _investigator_mcp(ctx)},
         disallowed_tools=[

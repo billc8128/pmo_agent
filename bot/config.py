@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     supabase_anon_key: str
     supabase_service_role_key: str = ""
 
+    # ── External event sources ──
+    github_webhook_secret: str = ""
+    gitea_webhook_secret: str = ""
+    github_api_token: str = ""
+    gitea_api_url: str = ""
+    gitea_api_token: str = ""
+
     # ── Web base URL — used in answers to link out to /u/<handle> ──
     web_base_url: str = "https://pmo-agent-sigma.vercel.app"
 

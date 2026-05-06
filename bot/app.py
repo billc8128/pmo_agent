@@ -34,6 +34,7 @@ from feishu import cards
 from feishu import events as feishu_events
 from feishu import post_format
 from feishu.client import feishu_client
+from external.webhooks import router as external_webhook_router
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -90,6 +91,7 @@ async def _gc_loop() -> None:
 
 
 app = FastAPI(title="pmo-bot", version="0.1.0", lifespan=lifespan)
+app.include_router(external_webhook_router)
 
 
 @app.get("/health")

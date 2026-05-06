@@ -90,6 +90,28 @@ class InvestigatableJobBundle:
     recent_notifications_for_subscription: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class ExternalIdentity:
+    id: str
+    profile_id: str
+    provider: str
+    external_login: str
+    external_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
+class ExternalRepo:
+    id: str
+    provider: str
+    repo_full_name: str
+    project_root: str
+    created_by: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
 def _dataclass_from_row(cls, row: dict[str, Any]):
     allowed = {f.name for f in fields(cls)}
     return cls(**{k: v for k, v in row.items() if k in allowed})
@@ -280,6 +302,149 @@ def list_profiles() -> list[dict[str, Any]]:
         .execute()
     )
     return res.data or []
+
+
+def link_external_identity(
+    profile_id: str,
+    provider: str,
+    external_login: str,
+    external_id: str | None = None,
+) -> dict[str, Any]:
+    provider = provider.strip().lower()
+    login = external_login.strip()
+    existing = (
+        sb_admin()
+        .table("external_identities")
+        .select("*")
+        .eq("provider", provider)
+        .eq("external_login", login)
+        .maybe_single()
+        .execute()
+        .data
+    )
+    if existing and str(existing.get("profile_id")) != str(profile_id):
+        raise ValueError(f"{provider} identity {login} is already linked to another profile")
+    row = {
+        "profile_id": profile_id,
+        "provider": provider,
+        "external_login": login,
+        "external_id": str(external_id) if external_id is not None else None,
+        "updated_at": _utc_now_iso(),
+    }
+    res = (
+        sb_admin()
+        .table("external_identities")
+        .upsert(row, on_conflict="provider,external_login")
+        .select("*")
+        .execute()
+    )
+    return (res.data or [row])[0]
+
+
+def unlink_external_identity(profile_id: str, provider: str) -> bool:
+    res = (
+        sb_admin()
+        .table("external_identities")
+        .delete()
+        .eq("profile_id", profile_id)
+        .eq("provider", provider.strip().lower())
+        .execute()
+    )
+    return bool(res.data)
+
+
+def lookup_profile_by_external_login(provider: str, external_login: str, external_id: str | None = None) -> str | None:
+    provider = provider.strip().lower()
+    if external_id:
+        row = (
+            sb_admin()
+            .table("external_identities")
+            .select("profile_id")
+            .eq("provider", provider)
+            .eq("external_id", str(external_id))
+            .maybe_single()
+            .execute()
+            .data
+        )
+        if row:
+            return row.get("profile_id")
+    login = (external_login or "").strip()
+    if not login:
+        return None
+    row = (
+        sb_admin()
+        .table("external_identities")
+        .select("profile_id")
+        .eq("provider", provider)
+        .eq("external_login", login)
+        .maybe_single()
+        .execute()
+        .data
+    )
+    return row.get("profile_id") if row else None
+
+
+def external_identities_for_profile(profile_id: str) -> list[dict[str, Any]]:
+    return (
+        sb_admin()
+        .table("external_identities")
+        .select("*")
+        .eq("profile_id", profile_id)
+        .order("provider")
+        .execute()
+        .data
+        or []
+    )
+
+
+def lookup_project_root_for_repo(provider: str, repo_full_name: str) -> str | None:
+    row = (
+        sb_admin()
+        .table("external_repos")
+        .select("project_root")
+        .eq("provider", provider.strip().lower())
+        .eq("repo_full_name", repo_full_name.strip())
+        .maybe_single()
+        .execute()
+        .data
+    )
+    return row.get("project_root") if row else None
+
+
+def register_external_repo(
+    provider: str,
+    repo_full_name: str,
+    project_root: str,
+    created_by: str | None = None,
+) -> dict[str, Any]:
+    row = {
+        "provider": provider.strip().lower(),
+        "repo_full_name": repo_full_name.strip(),
+        "project_root": project_root,
+        "created_by": created_by,
+        "updated_at": _utc_now_iso(),
+    }
+    res = (
+        sb_admin()
+        .table("external_repos")
+        .upsert(row, on_conflict="provider,repo_full_name")
+        .select("*")
+        .execute()
+    )
+    return (res.data or [row])[0]
+
+
+def external_repos_for_project_root(project_root: str) -> list[dict[str, Any]]:
+    return (
+        sb_admin()
+        .table("external_repos")
+        .select("*")
+        .eq("project_root", project_root)
+        .order("provider")
+        .execute()
+        .data
+        or []
+    )
 
 
 def recent_turns(
@@ -1018,6 +1183,128 @@ def distinct_project_root_tokens() -> list[str]:
             if token
         }
     )
+
+
+def lookup_external_resource(provider: str, resource_kind: str, resource_key: str) -> dict[str, Any] | None:
+    row = _execute_data(
+        sb_admin()
+        .table("external_resource_cache")
+        .select("*")
+        .eq("provider", provider)
+        .eq("resource_kind", resource_kind)
+        .eq("resource_key", resource_key)
+        .gt("expires_at", _utc_now_iso())
+        .maybe_single()
+    )
+    return row or None
+
+
+def write_external_resource(
+    provider: str,
+    resource_kind: str,
+    resource_key: str,
+    content: dict[str, Any],
+    ttl_seconds: int = 86400,
+) -> None:
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+    (
+        sb_admin()
+        .table("external_resource_cache")
+        .upsert(
+            {
+                "provider": provider,
+                "resource_kind": resource_kind,
+                "resource_key": resource_key,
+                "content": content,
+                "fetched_at": _utc_now_iso(),
+                "expires_at": expires_at,
+            },
+            on_conflict="provider,resource_kind,resource_key",
+        )
+        .execute()
+    )
+
+
+def archive_external_delivery(
+    *,
+    provider: str,
+    delivery_id: str,
+    event_type: str,
+    raw_body: dict[str, Any],
+    raw_headers: dict[str, Any] | None = None,
+) -> int:
+    res = (
+        sb_admin()
+        .table("external_webhook_deliveries")
+        .upsert(
+            {
+                "provider": provider,
+                "delivery_id": delivery_id,
+                "event_type": event_type,
+                "raw_body": raw_body,
+                "raw_headers": raw_headers or {},
+                "received_at": _utc_now_iso(),
+            },
+            on_conflict="provider,delivery_id",
+        )
+        .select("id")
+        .execute()
+    )
+    row = (res.data or [{}])[0]
+    return int(row["id"])
+
+
+def link_archive_to_event(archive_id: int, event_id: int) -> None:
+    (
+        sb_admin()
+        .table("external_webhook_deliveries")
+        .update({"event_id": event_id})
+        .eq("id", archive_id)
+        .is_("event_id", "null")
+        .execute()
+    )
+
+
+def upsert_event(
+    *,
+    source: str,
+    source_id: str,
+    user_id: str | None,
+    project_root: str | None,
+    occurred_at: str | None,
+    payload: dict[str, Any],
+    payload_fingerprint: str | None = None,
+) -> int | None:
+    data = (
+        sb_admin()
+        .rpc(
+            "upsert_external_event",
+            {
+                "p_source": source,
+                "p_source_id": source_id,
+                "p_user_id": user_id,
+                "p_project_root": project_root,
+                "p_occurred_at": occurred_at or _utc_now_iso(),
+                "p_payload": payload,
+                "p_payload_fingerprint": payload_fingerprint,
+            },
+        )
+        .execute()
+        .data
+    )
+    value = _rpc_scalar(data)
+    return int(value) if value is not None else None
+
+
+def get_event(event_id: int) -> dict[str, Any] | None:
+    row = _execute_data(
+        sb_admin()
+        .table("events")
+        .select("*")
+        .eq("id", event_id)
+        .maybe_single()
+    )
+    return row or None
 
 
 def fetch_subscriptions_for_scope(scope_kind: str, scope_id: str) -> list[dict[str, Any]]:
