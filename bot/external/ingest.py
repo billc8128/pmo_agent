@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any
 
 from db import queries
 from external.normalizer import normalize_github, normalize_gitea
+from external.redaction import redact_payload
+
+logger = logging.getLogger(__name__)
 
 _TOP_LEVEL_FINGERPRINT_EXCLUDES = {
     "delivery_id",
@@ -89,6 +93,7 @@ async def ingest_external_event(
     raw_bytes: bytes,
     headers: dict[str, str] | None = None,
 ) -> None:
+    payload, redaction_hits = redact_payload(payload)
     archive_id = queries.archive_external_delivery(
         provider=provider,
         delivery_id=delivery_id,
@@ -96,25 +101,63 @@ async def ingest_external_event(
         raw_body=payload,
         raw_headers=_safe_headers(headers or {}),
     )
+    logger.info(
+        "webhook.archived provider=%s event_type=%s delivery_id=%s archive_id=%s redaction_hits=%s",
+        provider,
+        event_type,
+        delivery_id,
+        archive_id,
+        redaction_hits,
+    )
 
     if provider == "github":
         normalized = normalize_github(event_type, payload)
     elif provider == "gitea":
         normalized = normalize_gitea(event_type, payload)
     else:
+        queries.mark_archive_ignored(archive_id, "unsupported_provider")
+        logger.info(
+            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_provider",
+            provider,
+            event_type,
+            delivery_id,
+            archive_id,
+        )
         return
     if normalized is None:
         queries.mark_archive_ignored(archive_id, "unsupported_event_type")
+        logger.info(
+            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=unsupported_event_type",
+            provider,
+            event_type,
+            delivery_id,
+            archive_id,
+        )
         return
 
     actor = _as_dict(normalized.get("actor"))
     if actor.get("is_bot"):
         queries.mark_archive_ignored(archive_id, "bot_actor")
+        logger.info(
+            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=bot_actor actor=%s",
+            provider,
+            event_type,
+            delivery_id,
+            archive_id,
+            actor.get("login") or "",
+        )
         return
 
     source_id = source_id_for_event(normalized)
     if source_id is None:
         queries.mark_archive_ignored(archive_id, "missing_source_identity")
+        logger.info(
+            "webhook.archive_ignored provider=%s event_type=%s delivery_id=%s archive_id=%s reason=missing_source_identity",
+            provider,
+            event_type,
+            delivery_id,
+            archive_id,
+        )
         return
 
     event_id = queries.upsert_event(
@@ -128,3 +171,13 @@ async def ingest_external_event(
     )
     if event_id is not None:
         queries.link_archive_to_event(archive_id, event_id)
+    logger.info(
+        "webhook.event_upserted provider=%s event_type=%s delivery_id=%s archive_id=%s event_id=%s source_id=%s project_root=%s",
+        provider,
+        event_type,
+        delivery_id,
+        archive_id,
+        event_id,
+        source_id,
+        normalized.get("project_root") or "",
+    )

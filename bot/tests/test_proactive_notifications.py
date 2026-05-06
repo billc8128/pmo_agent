@@ -228,6 +228,77 @@ def test_recent_decision_logs_batch_fetches_current_notifications(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_decider_prefetches_current_notifications_for_event_candidates(monkeypatch):
+    from agent import decider_loop
+
+    decided: list[str] = []
+    marked: list[tuple[int, int]] = []
+    fetched_pairs: list[set[tuple[int, str]]] = []
+
+    monkeypatch.setattr(decider_loop, "build_scope_context", lambda scope_kind, scope_id: object())
+    monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
+    monkeypatch.setattr(
+        decider_loop.queries,
+        "get_notification",
+        lambda event_id, sub_id: (_ for _ in ()).throw(AssertionError("N+1 notification lookup")),
+    )
+
+    def fake_fetch(pairs):
+        fetched_pairs.append(set(pairs))
+        return {(9, "sub-sent"): {"status": "sent", "decided_payload_version": 1}}
+
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", fake_fetch)
+    monkeypatch.setattr(decider_loop.lockout, "is_project_mismatch", lambda event, candidate: False)
+    monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: None)
+    monkeypatch.setattr(decider_loop.queries, "append_to_or_open_investigation_job", lambda *args, **kwargs: 55)
+    monkeypatch.setattr(
+        decider_loop.queries,
+        "mark_event_processed",
+        lambda event_id, version: marked.append((event_id, version)),
+    )
+
+    async def fake_decide(event, candidate, siblings, context):
+        decided.append(candidate["id"])
+        return SimpleNamespace(
+            investigate=False,
+            initial_focus="",
+            reason="not relevant",
+            raw_input={},
+            raw_output={"investigate": False},
+            model="test-model",
+            latency_ms=1,
+            input_tokens=None,
+            output_tokens=None,
+        )
+
+    monkeypatch.setattr(decider_loop.decider, "decide", fake_decide)
+
+    await decider_loop.process_event(
+        {"id": 9, "payload_version": 1, "payload": {}},
+        {
+            ("user", "22222222-2222-2222-2222-222222222222"): [
+                {
+                    "id": "sub-sent",
+                    "scope_kind": "user",
+                    "scope_id": "22222222-2222-2222-2222-222222222222",
+                    "description": "already sent",
+                },
+                {
+                    "id": "sub-new",
+                    "scope_kind": "user",
+                    "scope_id": "22222222-2222-2222-2222-222222222222",
+                    "description": "needs decision",
+                },
+            ]
+        },
+    )
+
+    assert fetched_pairs == [{(9, "sub-sent"), (9, "sub-new")}]
+    assert decided == ["sub-new"]
+    assert marked == [(9, 1)]
+
+
+@pytest.mark.anyio
 async def test_decider_keeps_stale_claimed_event_unprocessed(monkeypatch):
     from agent import decider_loop
 
@@ -237,6 +308,16 @@ async def test_decider_keeps_stale_claimed_event_unprocessed(monkeypatch):
         decider_loop.queries,
         "get_notification",
         lambda event_id, sub_id: {"status": "claimed", "decided_payload_version": 1},
+    )
+    monkeypatch.setattr(
+        decider_loop.queries,
+        "fetch_notifications_for_event_subscription_pairs",
+        lambda pairs: {
+            (9, "11111111-1111-1111-1111-111111111111"): {
+                "status": "claimed",
+                "decided_payload_version": 1,
+            }
+        },
     )
     monkeypatch.setattr(
         decider_loop.queries,
@@ -272,6 +353,7 @@ async def test_decider_caps_repeated_parse_failures(monkeypatch):
     monkeypatch.setattr(decider_loop, "build_scope_context", lambda scope_kind, scope_id: object())
     monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
     monkeypatch.setattr(decider_loop.queries, "get_notification", lambda event_id, sub_id: None)
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", lambda pairs: {})
     monkeypatch.setattr(decider_loop.queries, "judge_parse_failure_count", lambda event_id, sub_id, version: 2)
     monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: logs.append(kwargs))
     monkeypatch.setattr(
@@ -344,6 +426,7 @@ async def test_decider_skips_subscriptions_created_after_event(monkeypatch):
     monkeypatch.setattr(decider_loop.decider, "decide", should_not_decide)
     monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
     monkeypatch.setattr(decider_loop.queries, "get_notification", lambda event_id, sub_id: None)
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", lambda pairs: {})
     monkeypatch.setattr(
         decider_loop.queries,
         "mark_event_processed",

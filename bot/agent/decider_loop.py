@@ -102,6 +102,8 @@ async def process_event(
     had_unhandled_error = False
     had_blocking_claim = False
     context_cache: dict[tuple[str, str], decider.ScopeContext] = {}
+    scoped_subs_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    notification_pairs: set[tuple[int, str]] = set()
 
     for scope_key, raw_scope_subs in subs_by_scope.items():
         scope_subs = [
@@ -110,10 +112,21 @@ async def process_event(
         ]
         if not scope_subs:
             continue
+        scoped_subs_by_key[scope_key] = scope_subs
+        for candidate in scope_subs:
+            sub_id = candidate.get("id")
+            if sub_id:
+                notification_pairs.add((event_id, str(sub_id)))
+
+    current_notifications = queries.fetch_notifications_for_event_subscription_pairs(notification_pairs)
+
+    for scope_key, scope_subs in scoped_subs_by_key.items():
         scope_kind, scope_id = scope_key
         for candidate in scope_subs:
             sub_id = candidate.get("id")
-            existing = queries.get_notification(event_id, sub_id)
+            if not sub_id:
+                continue
+            existing = current_notifications.get((event_id, str(sub_id)))
             if existing and _row_value(existing, "status") == "sent":
                 continue
             if existing and _row_value(existing, "status") == "claimed":

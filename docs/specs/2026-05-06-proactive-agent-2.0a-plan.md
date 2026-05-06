@@ -53,7 +53,7 @@ Creates:
   - constraint `repo_unique unique (provider, repo_full_name)`
   - index `repos_project_root_idx on (project_root)`
 - `external_webhook_deliveries` table per spec §3.5:
-  - service-role-only raw archive of full webhook bodies
+  - service-role-only archive of redacted webhook bodies
   - `(provider, delivery_id)` unique
   - Migration 0022 adds `ignored_reason` / `ignored_at` plus an
     ignored-delivery index so archive-only deliveries are
@@ -174,7 +174,8 @@ External ingest:
   raw_body, raw_headers) -> int` — idempotent archive helper.
   Uses an insert/upsert with `ignore_duplicates=True` and returns
   the archive row id; duplicate redeliveries must preserve the
-  first raw body and must not raise before `upsert_event` can run.
+  first redacted body and must not raise before `upsert_event` can
+  run.
 - `link_archive_to_event(archive_id, event_id) -> None` — sets
   `external_webhook_deliveries.event_id` only if it is currently
   NULL; never clobbers an existing successful link.
@@ -308,7 +309,9 @@ hex signatures and a `sha256=` prefix for newer Gitea versions.
 Both secrets live in env: `GITHUB_WEBHOOK_SECRET` /
 `GITEA_WEBHOOK_SECRET`. Add to Railway and Vercel env vars
 (Vercel only if web also handles webhooks; for 2.0a we keep
-webhooks bot-side, so just Railway).
+webhooks bot-side, so just Railway). 2.0a uses one global secret
+per provider per deployment; per-repo secrets are deferred and
+documented as a rollout hardening item.
 
 ### 3.3 Event payload normalisation
 
@@ -338,7 +341,8 @@ Each handler:
 - sets `project_root` to the repo identifier
   `{provider}:{lower(repo_full_name)}`; it does not copy
   `external_repos.project_root` into events
-- determines `occurred_at` per the table in spec §4.4
+- determines `occurred_at` per the table in spec §4.4, then
+  clamps it into `[now - 7d, now + 1h]`
 - **does NOT** copy the entire raw body into `events.payload`.
   Per spec §4.3 raw goes to a service-only
   `external_webhook_deliveries` table (added in plan §1's
@@ -417,7 +421,13 @@ async def ingest_external_event(
                                   # only for audit/debug archive
     headers: dict[str, str] | None = None,
 ) -> None:
-    # 1. ALWAYS archive the raw delivery first, regardless of
+    # 0. Webhooks do not pass through the local daemon redaction
+    #    layer. Redact parsed payload strings server-side before
+    #    archive or normalisation. This is best-effort, not a
+    #    replacement for provider-side secret hygiene.
+    payload, redaction_hits = redact_payload(payload)
+
+    # 1. ALWAYS archive the redacted parsed delivery first, regardless of
     #    whether we'll write an events row. This gives us a full
     #    forensic trail for events we ignore today and might
     #    decide to ingest later. Per spec §3.5, this table is
@@ -433,6 +443,8 @@ async def ingest_external_event(
         raw_body=payload,         # parsed dict; row is jsonb
         raw_headers=_safe_headers(headers or {}),
     )
+    logger.info("webhook.archived ... redaction_hits=%s",
+                redaction_hits)
 
     # 2. Normalize. If event_type is one we don't ingest, return
     #    here — raw is already archived above.
@@ -445,16 +457,19 @@ async def ingest_external_event(
     if normalized is None:
         queries.mark_archive_ignored(archive_id,
                                      "unsupported_event_type")
+        logger.info("webhook.archive_ignored ... reason=unsupported_event_type")
         return
 
     if normalized.get("actor", {}).get("is_bot"):
         queries.mark_archive_ignored(archive_id, "bot_actor")
+        logger.info("webhook.archive_ignored ... reason=bot_actor")
         return
 
     source_id = source_id_for_event(normalized)
     if source_id is None:
         queries.mark_archive_ignored(archive_id,
                                      "missing_source_identity")
+        logger.info("webhook.archive_ignored ... reason=missing_source_identity")
         return
 
     # 3. Upsert into events with the compact normalised shape.
@@ -480,9 +495,11 @@ async def ingest_external_event(
     )
 
     # 4. Cross-link the archive row to the event row so audit
-    #    queries can hop "raw → normalized → notification".
+    #    queries can hop "archive → normalized → notification".
     if event_id is not None:
         queries.link_archive_to_event(archive_id, event_id)
+    logger.info("webhook.event_upserted ... event_id=%s source_id=%s",
+                event_id, source_id)
 
 
 def _safe_headers(headers: dict) -> dict:
@@ -562,6 +579,15 @@ fingerprint approach handles both: identical retries are no-ops,
 content changes bump version (same as turn agent_summary
 arriving late in 1.0c).
 
+### 3.4.1 Decider current-notification prefetch
+
+`bot/agent/decider_loop.py::process_event` must prefetch current
+notification rows for all `(event_id, subscription_id)` candidate
+pairs with `fetch_notifications_for_event_subscription_pairs`
+before looping candidates. Do not call `get_notification` once per
+subscription; webhook fanout can make that N+1 path visible in
+production.
+
 ### 3.5 Files touched in this chunk
 
 - `bot/web/external/webhooks.py` (new)
@@ -587,6 +613,12 @@ arriving late in 1.0c).
   events_needing_decision DOES re-include this row.
 - POST with bad signature → 401, no events row written and no
   external_webhook_deliveries entry.
+- POST with fake secret-like strings in PR/comment body →
+  `external_webhook_deliveries.raw_body` and `events.payload`
+  contain `[REDACTED]`, not the original strings.
+- INFO logs include `webhook.accepted`, `webhook.archived`, and
+  either `webhook.event_upserted` or `webhook.archive_ignored`;
+  logs include ids/reasons but not payload text.
 
 ---
 
@@ -706,10 +738,13 @@ async def fetch_pr_files(provider: str, repo_full_name: str,
 30 files. Each file includes path plus `patch_excerpt` from the
 provider's PR files API. It does not fetch full file blobs, so
 the investigator must not describe the result as complete file
-contents. Remote calls retry transient network errors and 5xx
-responses with bounded backoff; 4xx responses fail fast. The
+contents. Remote calls retry transient network errors, HTTP 429,
+and 5xx responses with bounded backoff; other 4xx responses fail
+fast. The
 cache key includes `payload.pr.head_sha` when present, so a PR
-force-push does not reuse an old file list.
+force-push does not reuse an old file list. Patch excerpts run
+through the same server-side redaction helper before cache write
+or tool return.
 
 Add the tool to `bot/agent/investigator.py`'s tool subset:
 
@@ -754,6 +789,8 @@ notify/suppress decision.
 - Insert a synthetic `pull_request` event referencing a real PR
 - Call `fetch_pr_files` with the event_id → returns file list with
   `patch_excerpt`, not `content_excerpt`
+- Fake token-like strings in `patch_excerpt` are redacted before
+  cache/tool return
 - Repeat call → second call hits cache (no external API call)
 - Same PR number with a different head_sha → different cache key
 - Call with paths_filter=['spec.md'] → only spec.md returned
@@ -799,12 +836,13 @@ Run the validation scripts from spec §9:
 4. Identity attribution conflict (spec §9.4)
 5. Webhook signature failure (spec §9.5)
 6. Idempotent re-delivery (spec §9.6)
+7. Redaction + observability (spec §9.7)
 
 For tests requiring real webhook delivery, configure GitHub
 webhook on a test repo pointing at `pmo-bot.up.railway.app/webhooks/github`
 with the test secret.
 
-**Exit criterion**: 6/6 validation scripts pass against a
+**Exit criterion**: 7/7 validation scripts pass against a
 sandbox or production deployment.
 
 ---
@@ -871,7 +909,10 @@ repo bootstrap. That's the irreducible 2.0a.
 1. **Webhook secret leakage**. Treat
    `GITHUB_WEBHOOK_SECRET` like a database password. If
    leaked, attacker can forge events → fake notifications. Plan:
-   secrets-only-in-env, no logging, rotate if any concern.
+   secrets-only-in-env, no logging, rotate if any concern. 2.0a
+   uses one global provider secret; per-repo secrets can be added
+   later by routing `/webhooks/{provider}/{repo_key}` or storing a
+   repo secret hash in `external_repos`.
 
 2. **Identity claim impersonation**. 2.0a disables self-claim
    chat tools; `external_identities` remains service-role/admin
@@ -883,7 +924,12 @@ repo bootstrap. That's the irreducible 2.0a.
    has 24h TTL + 7d cleanup; PR titles already in events.payload
    are the bigger surface.
 
-4. **Webhook flood**. A noisy repo pushing many events could
+4. **Webhook payload secrets**. Webhooks bypass the daemon's
+   local redaction layer. The bot applies server-side best-effort
+   redaction before archive/normalisation and logs redaction hit
+   counts, but provider-side secret hygiene is still required.
+
+5. **Webhook flood**. A noisy repo pushing many events could
    blow past 1.0c's gatekeeper budget. Monitor decision_logs
    row growth post-deploy; if a single repo's events dominate,
    add a per-source rate limiter. 2.0a intentionally does not
@@ -891,7 +937,7 @@ repo bootstrap. That's the irreducible 2.0a.
    "all my PRs" still rely on the gatekeeper as first semantic
    filter.
 
-5. **Repo mapping drift**. `external_repos.project_root` is no
+6. **Repo mapping drift**. `external_repos.project_root` is no
    longer copied into webhook events, so a bad display/admin
    mapping does not corrupt lockout. Repo rename drift still
    matters for the `/integrations` registry and provider webhook
@@ -900,7 +946,7 @@ repo bootstrap. That's the irreducible 2.0a.
    lowercased at every entrypoint and enforced by DB CHECK to
    avoid case-only mapping misses.
 
-6. **Repeated PR updates**. Stable `source_id` means one PR maps
+7. **Repeated PR updates**. Stable `source_id` means one PR maps
    to one events row, but changed payloads still bump
    `payload_version` and can re-enter the gatekeeper. If this is
    noisy in production, aggregate by PR/job window before

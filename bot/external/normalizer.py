@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from db import queries
 
+logger = logging.getLogger(__name__)
+
 _MENTION_RE = re.compile(r"(?<![\w.-])@([A-Za-z0-9][A-Za-z0-9_.-]{0,78})")
+_MAX_PAST_SKEW = timedelta(days=7)
+_MAX_FUTURE_SKEW = timedelta(hours=1)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -23,6 +29,35 @@ def _is_bot_login(login: str) -> bool:
 def _repo_identifier(provider: str, full_name: str) -> str | None:
     repo = full_name.strip().lower()
     return f"{provider}:{repo}" if repo else None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _clamp_occurred_at(value: Any, *, now: datetime | None = None) -> str | None:
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return None
+    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    lower = now_utc - _MAX_PAST_SKEW
+    upper = now_utc + _MAX_FUTURE_SKEW
+    if parsed < lower:
+        return lower.isoformat()
+    if parsed > upper:
+        return upper.isoformat()
+    return parsed.isoformat()
 
 
 def _actor(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -80,10 +115,10 @@ def _normalize_pull_request(provider: str, raw: dict[str, Any]) -> dict[str, Any
         if action == "merged"
         else pr.get("updated_at") or pr.get("created_at")
     )
-    return {
+    normalized = {
         "event_type": "pull_request",
         "action": action,
-        "occurred_at": occurred_at,
+        "occurred_at": _clamp_occurred_at(occurred_at),
         "project_root": repo.get("project_root"),
         "pr": {
             "number": pr.get("number"),
@@ -103,6 +138,8 @@ def _normalize_pull_request(provider: str, raw: dict[str, Any]) -> dict[str, Any
         "repo": repo,
         "actor": _actor(provider, raw),
     }
+    _log_normalized(provider, normalized)
+    return normalized
 
 
 def _normalize_push(provider: str, raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -111,18 +148,20 @@ def _normalize_push(provider: str, raw: dict[str, Any]) -> dict[str, Any] | None
     if not isinstance(commits, list):
         commits = []
     head_commit = _as_dict(raw.get("head_commit"))
-    return {
+    normalized = {
         "event_type": "push",
         "ref": raw.get("ref") or "",
         "before": raw.get("before"),
         "after": raw.get("after"),
-        "occurred_at": head_commit.get("timestamp") or raw.get("updated_at"),
+        "occurred_at": _clamp_occurred_at(head_commit.get("timestamp") or raw.get("updated_at")),
         "project_root": repo.get("project_root"),
         "commits_count": len(commits),
         "commit_summaries": [str(c.get("message") or "").splitlines()[0][:160] for c in commits[:20] if isinstance(c, dict)],
         "repo": repo,
         "actor": _actor(provider, raw),
     }
+    _log_normalized(provider, normalized)
+    return normalized
 
 
 def _normalize_release(provider: str, raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -130,10 +169,10 @@ def _normalize_release(provider: str, raw: dict[str, Any]) -> dict[str, Any] | N
         return None
     rel = _as_dict(raw.get("release"))
     repo = _repo(provider, raw)
-    return {
+    normalized = {
         "event_type": "release",
         "action": "published",
-        "occurred_at": rel.get("published_at") or rel.get("created_at"),
+        "occurred_at": _clamp_occurred_at(rel.get("published_at") or rel.get("created_at")),
         "project_root": repo.get("project_root"),
         "release": {
             "tag_name": rel.get("tag_name") or "",
@@ -144,6 +183,8 @@ def _normalize_release(provider: str, raw: dict[str, Any]) -> dict[str, Any] | N
         "repo": repo,
         "actor": _actor(provider, raw),
     }
+    _log_normalized(provider, normalized)
+    return normalized
 
 
 def _normalize_issue_comment(provider: str, raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -152,10 +193,10 @@ def _normalize_issue_comment(provider: str, raw: dict[str, Any]) -> dict[str, An
     comment = _as_dict(raw.get("comment"))
     issue = _as_dict(raw.get("issue"))
     repo = _repo(provider, raw)
-    return {
+    normalized = {
         "event_type": "issue_comment",
         "action": "created",
-        "occurred_at": comment.get("created_at"),
+        "occurred_at": _clamp_occurred_at(comment.get("created_at")),
         "project_root": repo.get("project_root"),
         "comment": {
             "id": comment.get("id"),
@@ -167,6 +208,23 @@ def _normalize_issue_comment(provider: str, raw: dict[str, Any]) -> dict[str, An
         "actor": _actor(provider, raw),
         "mentioned_profile_ids": _mentioned_profile_ids(provider, comment.get("body") or ""),
     }
+    _log_normalized(provider, normalized)
+    return normalized
+
+
+def _log_normalized(provider: str, normalized: dict[str, Any]) -> None:
+    repo = _as_dict(normalized.get("repo"))
+    actor = _as_dict(normalized.get("actor"))
+    logger.info(
+        "webhook.normalized provider=%s event_type=%s action=%s repo=%s actor=%s is_bot=%s occurred_at=%s",
+        provider,
+        normalized.get("event_type"),
+        normalized.get("action") or "",
+        repo.get("full_name") or "",
+        actor.get("login") or "",
+        bool(actor.get("is_bot")),
+        normalized.get("occurred_at") or "",
+    )
 
 
 def normalize_github(event_type: str, raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -177,7 +235,10 @@ def normalize_github(event_type: str, raw: dict[str, Any]) -> dict[str, Any] | N
         "issue_comment": _normalize_issue_comment,
     }
     handler = handlers.get(event_type)
-    return handler("github", raw) if handler else None
+    if not handler:
+        logger.info("webhook.normalizer_ignored provider=github event_type=%s reason=unsupported_event_type", event_type)
+        return None
+    return handler("github", raw)
 
 
 def normalize_gitea(event_type: str, raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -188,4 +249,7 @@ def normalize_gitea(event_type: str, raw: dict[str, Any]) -> dict[str, Any] | No
         "issue_comment": _normalize_issue_comment,
     }
     handler = handlers.get(event_type)
-    return handler("gitea", raw) if handler else None
+    if not handler:
+        logger.info("webhook.normalizer_ignored provider=gitea event_type=%s reason=unsupported_event_type", event_type)
+        return None
+    return handler("gitea", raw)

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,12 +61,17 @@ def test_github_pr_normalizer_extracts_merge_signal_and_excludes_raw(monkeypatch
         "lookup_project_root_for_repo",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("webhook project_root must not use global path mapping")),
     )
+    monkeypatch.setattr(
+        normalizer,
+        "_clamp_occurred_at",
+        lambda value, **_kwargs: str(value).replace("Z", "+00:00"),
+    )
 
     normalized = normalizer.normalize_github("pull_request", payload)
 
     assert normalized["event_type"] == "pull_request"
     assert normalized["action"] == "merged"
-    assert normalized["occurred_at"] == "2026-05-06T06:30:00Z"
+    assert normalized["occurred_at"] == "2026-05-06T06:30:00+00:00"
     assert normalized["project_root"] == "github:billc8128/vibelive"
     assert normalized["pr"]["merged"] is True
     assert normalized["pr"]["number"] == 42
@@ -108,6 +114,17 @@ def test_issue_comment_normalizer_resolves_at_mentions(monkeypatch):
     )
 
     assert normalized["mentioned_profile_ids"] == ["profile-hellobit"]
+
+
+def test_normalizer_clamps_untrusted_occurred_at_to_safe_window():
+    from datetime import datetime, timezone
+    from external.normalizer import _clamp_occurred_at
+
+    now = datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc)
+
+    assert _clamp_occurred_at("2026-05-06T12:30:00Z", now=now) == "2026-05-06T12:30:00+00:00"
+    assert _clamp_occurred_at("2026-06-01T00:00:00Z", now=now) == "2026-05-06T13:00:00+00:00"
+    assert _clamp_occurred_at("2026-04-01T00:00:00Z", now=now) == "2026-04-29T12:00:00+00:00"
 
 
 def test_bot_actor_pull_request_is_ignored_before_event_upsert(monkeypatch):
@@ -285,6 +302,56 @@ def test_ingest_archives_ignored_event_without_upserting(monkeypatch):
     ]
 
 
+def test_ingest_redacts_secret_like_strings_before_archive_and_event_upsert(monkeypatch):
+    from external import ingest, normalizer
+
+    calls: list[tuple[str, object]] = []
+    secret = "ghp_1234567890abcdefghijklmnopqrstuvwxyz1234"
+    payload = _github_pr_payload()
+    payload["pull_request"]["body"] = f"token={secret}\npassword=hunter2"
+
+    monkeypatch.setattr(normalizer.queries, "lookup_profile_by_external_login", lambda *args, **kwargs: None)
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            calls.append(("archive", kwargs))
+            return 7
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            calls.append(("upsert", kwargs))
+            return 99
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            calls.append(("link", args))
+
+        @staticmethod
+        def mark_archive_ignored(*args):
+            calls.append(("ignored", args))
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+
+    asyncio.run(
+        ingest.ingest_external_event(
+            provider="github",
+            event_type="pull_request",
+            delivery_id="delivery-redact",
+            payload=payload,
+            raw_bytes=b"{}",
+            headers={},
+        )
+    )
+
+    archive_body = calls[0][1]["raw_body"]
+    event_payload = calls[1][1]["payload"]
+    serialized = json.dumps({"archive": archive_body, "event": event_payload})
+    assert secret not in serialized
+    assert "hunter2" not in serialized
+    assert "[REDACTED]" in serialized
+
+
 def test_ingest_upserts_event_and_links_archive(monkeypatch):
     from external import ingest, normalizer
 
@@ -428,6 +495,44 @@ def test_ingest_marks_archive_ignored_when_resource_identity_is_missing(monkeypa
     assert calls[0][0] == "archive"
     assert calls[1] == ("ignored", (7, "missing_source_identity"))
     assert [call[0] for call in calls] == ["archive", "ignored"]
+
+
+def test_ingest_logs_archive_only_reason(monkeypatch, caplog):
+    from external import ingest
+
+    class FakeQueries:
+        @staticmethod
+        def archive_external_delivery(**kwargs):
+            return 7
+
+        @staticmethod
+        def mark_archive_ignored(*args):
+            return None
+
+        @staticmethod
+        def upsert_event(**kwargs):
+            raise AssertionError("unsupported events should not be upserted")
+
+        @staticmethod
+        def link_archive_to_event(*args):
+            raise AssertionError("unsupported events should not be linked")
+
+    monkeypatch.setattr(ingest, "queries", FakeQueries)
+
+    with caplog.at_level(logging.INFO, logger="external.ingest"):
+        asyncio.run(
+            ingest.ingest_external_event(
+                provider="github",
+                event_type="workflow_run",
+                delivery_id="delivery-log",
+                payload={"action": "completed"},
+                raw_bytes=b"{}",
+                headers={},
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("webhook.archive_ignored" in msg and "unsupported_event_type" in msg for msg in messages)
 
 
 def test_source_id_for_external_events_uses_resource_identity_not_delivery():
@@ -756,6 +861,33 @@ def test_webhook_rejects_missing_content_length_without_reading_body(monkeypatch
     assert request.body_read is False
 
 
+def test_webhook_logs_accepted_delivery(monkeypatch, caplog):
+    from external import webhooks
+
+    async def fake_ingest(**kwargs):
+        return None
+
+    monkeypatch.setattr(webhooks.settings, "github_webhook_secret", "secret")
+    monkeypatch.setattr(webhooks, "ingest_external_event", fake_ingest)
+    body = json.dumps(_github_pr_payload()).encode("utf-8")
+    signature = "sha256=" + hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+    request = _FakeRequest(
+        {
+            "content-length": str(len(body)),
+            "x-hub-signature-256": signature,
+            "x-github-event": "pull_request",
+            "x-github-delivery": "delivery-log",
+        },
+        body,
+    )
+
+    with caplog.at_level(logging.INFO, logger="external.webhooks"):
+        response = asyncio.run(webhooks._handle_webhook(request, "github"))
+
+    assert response.status_code == 200
+    assert any("webhook.accepted" in record.getMessage() for record in caplog.records)
+
+
 def test_webhook_rejects_invalid_content_length_as_bad_request(monkeypatch):
     from external import webhooks
 
@@ -824,6 +956,8 @@ def test_meta_tools_do_not_expose_unverified_external_identity_self_claim():
 def test_fetch_pr_files_returns_patch_excerpt_not_content_excerpt(monkeypatch):
     from external import fetch
 
+    secret = "ghp_1234567890abcdefghijklmnopqrstuvwxyz1234"
+
     class FakeResponse:
         def raise_for_status(self):
             return None
@@ -836,7 +970,7 @@ def test_fetch_pr_files_returns_patch_excerpt_not_content_excerpt(monkeypatch):
                     "additions": 3,
                     "deletions": 1,
                     "changes": 4,
-                    "patch": "@@ -1 +1 @@\n-old\n+new",
+                    "patch": f"@@ -1 +1 @@\n-old\n+token={secret}",
                 }
             ]
 
@@ -857,7 +991,8 @@ def test_fetch_pr_files_returns_patch_excerpt_not_content_excerpt(monkeypatch):
 
     result = asyncio.run(fetch._fetch_pr_files_remote("github", "billc8128/vibelive", 42))
 
-    assert result["files"][0]["patch_excerpt"] == "@@ -1 +1 @@\n-old\n+new"
+    assert secret not in result["files"][0]["patch_excerpt"]
+    assert result["files"][0]["patch_excerpt"] == "@@ -1 +1 @@\n-old\n+token=[REDACTED]"
     assert "content_excerpt" not in result["files"][0]
 
 
@@ -917,6 +1052,48 @@ def test_fetch_pr_files_remote_retries_transient_http_errors(monkeypatch):
             if type(self).attempts == 1:
                 raise fetch.httpx.ConnectError("temporary network error")
             return FakeResponse()
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(fetch.asyncio, "sleep", no_sleep)
+
+    result = asyncio.run(fetch._fetch_pr_files_remote("github", "billc8128/vibelive", 42))
+
+    assert result == {"files": [], "count": 0}
+    assert FakeAsyncClient.attempts == 2
+
+
+def test_fetch_pr_files_remote_retries_rate_limit(monkeypatch):
+    from external import fetch
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise fetch.httpx.HTTPStatusError("rate limited", request=None, response=self)
+
+        def json(self):
+            return []
+
+    class FakeAsyncClient:
+        attempts = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            type(self).attempts += 1
+            return FakeResponse(429 if type(self).attempts == 1 else 200)
 
     async def no_sleep(_seconds):
         return None

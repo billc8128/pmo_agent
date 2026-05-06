@@ -237,10 +237,11 @@ identity is not the same concept and stays in
 gatekeeper/renderer compatibility. `external_repos.project_root`
 is UI/admin metadata and must not be copied into webhook events.
 
-### 3.5 `external_webhook_deliveries` — service-only raw archive
+### 3.5 `external_webhook_deliveries` — service-only delivery archive
 
-The raw webhook bodies are kept for debugging / replay /
-audit-of-payload-edits, but they are NOT in `events.payload`.
+Webhook bodies are recursively redacted before storage, then kept
+for debugging / replay / audit-of-payload-edits. They are NOT in
+`events.payload`.
 Rationale:
 
 - Raw GitHub PR payloads can run 50-200KB. Putting them on
@@ -251,8 +252,9 @@ Rationale:
 - The normalised compact `events.payload` (per §4) has
   everything the gatekeeper / investigator / renderer actually
   need.
-- For rare deeper forensic inspection, the raw is a
-  service-role-only side table.
+- For rare deeper forensic inspection, the full delivery archive
+  is a service-role-only side table. The side table stores the
+  redacted parsed payload, not the original byte-for-byte body.
 
 ```sql
 create table public.external_webhook_deliveries (
@@ -293,7 +295,7 @@ do not expose it. Operators inspect it via direct SQL when
 something looks weird.
 
 **Idempotent archive contract**: `archive_external_delivery`
-preserves the first raw body for a `(provider, delivery_id)`.
+preserves the first redacted body for a `(provider, delivery_id)`.
 GitHub/Gitea redelivery arrives with the same key repeatedly; a
 plain INSERT would raise on the unique constraint and short-
 circuit ingest before `upsert_event` ever runs, while a normal
@@ -356,12 +358,17 @@ shouldn't go through Vercel's edge.
 
 ### 4.2 Signature verification
 
-Each route reads a per-provider HMAC secret from environment:
+Each route reads one per-provider HMAC secret from environment:
 
 - `GITHUB_WEBHOOK_SECRET` — used to verify
   `X-Hub-Signature-256` header (HMAC-SHA256 of raw body)
 - `GITEA_WEBHOOK_SECRET` — used to verify `X-Gitea-Signature`
   header (HMAC-SHA256 of raw body)
+
+2.0a deliberately uses a global provider secret per deployment,
+not per-repo secrets. Per-repo secrets are a future hardening
+step; until then, treat these secrets like DB credentials and
+rotate if any connected repo's webhook configuration leaks.
 
 Mismatched signature → 401 with no body. Missing secret →
 500 with log line; the route fails closed.
@@ -374,10 +381,18 @@ chunked requests bypassing the declared body cap.
 
 ### 4.3 Event types we ingest in 2.0a
 
+Before archive or normalisation, the parsed webhook payload runs
+through a server-side best-effort redaction pass. This is a
+compensation for the fact that GitHub/Gitea webhooks do not pass
+through the local daemon redaction layer from `CLAUDE.md`.
+Redaction covers common token/private-key/key-value-secret
+patterns; the original unredacted parsed body is not written to
+Postgres.
+
 For each event type we extract a stable shape into
-`events.payload`. The original webhook body lives **only** in
-`external_webhook_deliveries` (§3.5) for service-only
-debugging. The LLM agents never see raw bodies — they read
+`events.payload`. The redacted webhook body lives **only** in
+`external_webhook_deliveries` (§3.5) for service-only debugging.
+The LLM agents never see full webhook bodies — they read
 `events.payload` (the normalised shape below), and for richer
 content the investigator explicitly calls tools like
 `fetch_pr_files` (§6).
@@ -477,7 +492,7 @@ boundary.
 
 We deliberately **don't** ingest `pull_request_review`,
 `check_run`, `workflow_run`, `deployment_status`, etc. in 2.0a.
-For ignored event types, we still store the raw delivery in
+For ignored event types, we still store the redacted delivery in
 `external_webhook_deliveries` for forensic value, but **no row
 is written to `events`**. The archive row is marked with
 `ignored_reason='unsupported_event_type'` so operators can tell
@@ -504,6 +519,11 @@ For each event type, prefer the most user-facing time:
 
 `ingested_at` is always `now()` — used by the 1.0c forward-only
 filter.
+
+Webhook timestamps are untrusted input. Normalisation clamps
+`occurred_at` into `[now - 7 days, now + 1 hour]` before writing
+the `events` row so malicious or malformed payload timestamps do
+not poison ordering or future-window queries.
 
 ### 4.5 What `events.user_id` is set to
 
@@ -564,7 +584,7 @@ normal PMO product permissions.
   `PMO_INTEGRATION_ADMIN_HANDLES` names allowed maintainers.
 - Provider secrets and API tokens are never shown in the browser.
   They stay in the bot deployment environment.
-- Raw webhook payloads stay service-only in
+- Redacted webhook payloads stay service-only in
   `external_webhook_deliveries`; the UI exposes only provider,
   event type, repo full name, delivery time, whether an `events`
   row was created, and the safe ignored reason when a delivery was
@@ -636,6 +656,8 @@ Implementation:
   updates do not reuse stale file lists.
 - Retry transient HTTP/network failures with bounded backoff;
   permanent 4xx responses fail fast.
+- `patch_excerpt` is redacted with the same server-side redaction
+  pass before caching or returning to the investigator.
 
 This tool is added only to the investigator's tool subset. The
 renderer deliberately does not get it; renderer must turn the
@@ -825,6 +847,18 @@ Investigator enrichment: each `fetch_pr_files` call is a single
 external API hit + 24h cache. At <5 PRs/day, this is a few
 calls/day at most.
 
+Decider event fanout prefetches current notification rows in one
+batch per event before iterating candidate subscriptions. It must
+not do a `get_notification` round-trip per subscription on the
+hot path.
+
+Operational logging: webhook handler, ingest, normalizer, and
+external fetch modules emit INFO logs with safe key fields
+(`provider`, `event_type`, `delivery_id`, `archive_id`,
+`event_id`, `source_id`, ignored reason, retry attempt, cache
+hit/miss). Logs must never include raw body text, PR/comment
+body, headers containing secrets, or external API tokens.
+
 ---
 
 ## 9. Validation criteria
@@ -884,6 +918,20 @@ Concrete e2e scripts the implementation must pass:
    if changed
 3. Only one investigation_job opens per subscription per
    aggregation window — covered by 1.0c's existing append logic
+
+### 9.7 Redaction + observability
+
+1. POST a signed PR payload whose PR body contains a fake GitHub
+   token and `password=...`
+2. Assert `external_webhook_deliveries.raw_body` and
+   `events.payload` contain `[REDACTED]` and do not contain the
+   original secret-like strings
+3. Assert Railway/bot logs include `webhook.accepted`,
+   `webhook.archived`, and either `webhook.event_upserted` or
+   `webhook.archive_ignored` with provider/event/delivery ids
+4. POST an unsupported but signed event → 200, archived-only,
+   `ignored_reason='unsupported_event_type'`, and an INFO log with
+   that reason
 
 ---
 

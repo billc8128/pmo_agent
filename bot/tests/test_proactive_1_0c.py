@@ -546,6 +546,7 @@ async def test_decider_opens_investigation_job_instead_of_notification(monkeypat
     monkeypatch.setattr(decider_loop, "build_scope_context", lambda scope_kind, scope_id: object())
     monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
     monkeypatch.setattr(decider_loop.queries, "get_notification", lambda event_id, sub_id: None)
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", lambda pairs: {})
     monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: logs.append(kwargs))
     monkeypatch.setattr(
         decider_loop.queries,
@@ -609,6 +610,7 @@ async def test_decider_project_lockout_short_circuits_before_llm(monkeypatch):
 
     monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
     monkeypatch.setattr(decider_loop.queries, "get_notification", lambda event_id, sub_id: None)
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", lambda pairs: {})
     monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: logs.append(kwargs))
     monkeypatch.setattr(
         decider_loop.queries,
@@ -655,6 +657,7 @@ async def test_decider_investigate_false_only_logs_and_settles(monkeypatch):
     monkeypatch.setattr(decider_loop, "build_scope_context", lambda scope_kind, scope_id: object())
     monkeypatch.setattr(decider_loop.queries, "lookup_profile_by_user_id", lambda user_id: None)
     monkeypatch.setattr(decider_loop.queries, "get_notification", lambda event_id, sub_id: None)
+    monkeypatch.setattr(decider_loop.queries, "fetch_notifications_for_event_subscription_pairs", lambda pairs: {})
     monkeypatch.setattr(decider_loop.queries, "write_decision_log", lambda **kwargs: logs.append(kwargs))
     monkeypatch.setattr(
         decider_loop.queries,

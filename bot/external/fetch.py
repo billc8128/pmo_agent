@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import httpx
 
 from config import settings
 from db import queries
+from external.redaction import redact_text
+
+logger = logging.getLogger(__name__)
 
 
 def _auth_headers(provider: str) -> dict[str, str]:
@@ -32,8 +36,11 @@ async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: 
         res.raise_for_status()
         rows = res.json()
     files = []
+    redaction_hits_total = 0
     for row in rows[:30] if isinstance(rows, list) else []:
         patch = row.get("patch") or ""
+        patch_excerpt, redaction_hits = redact_text(patch[:200]) if patch else ("", 0)
+        redaction_hits_total += redaction_hits
         files.append(
             {
                 "path": row.get("filename") or row.get("path") or "",
@@ -41,10 +48,19 @@ async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: 
                 "additions": row.get("additions"),
                 "deletions": row.get("deletions"),
                 "changes": row.get("changes"),
-                "patch_excerpt": patch[:200] if patch else "",
+                "patch_excerpt": patch_excerpt,
             }
         )
-    return {"files": files, "count": len(files)}
+    result = {"files": files, "count": len(files)}
+    logger.info(
+        "external.fetch_pr_files_remote provider=%s repo=%s pr=%s count=%s redaction_hits=%s",
+        provider,
+        repo_full_name,
+        pr_number,
+        len(files),
+        redaction_hits_total,
+    )
+    return result
 
 
 async def _get_with_retries(client: httpx.AsyncClient, url: str, **kwargs: Any) -> httpx.Response:
@@ -52,14 +68,26 @@ async def _get_with_retries(client: httpx.AsyncClient, url: str, **kwargs: Any) 
     for attempt in range(3):
         try:
             res = await client.get(url, **kwargs)
-            if int(getattr(res, "status_code", 200)) < 500:
+            status = int(getattr(res, "status_code", 200))
+            if status not in (429,) and status < 500:
                 return res
-            res.raise_for_status()
+            try:
+                res.raise_for_status()
+            except httpx.HTTPError as e:
+                last_error = e
         except httpx.HTTPError as e:
             last_error = e
-            if attempt == 2:
-                raise
-            await asyncio.sleep(0.5 * (2 ** attempt))
+        if attempt == 2:
+            if last_error:
+                raise last_error
+            return res
+        logger.info(
+            "external.fetch_retry url=%s attempt=%s reason=%s",
+            url,
+            attempt + 1,
+            type(last_error).__name__ if last_error else f"status_{status}",
+        )
+        await asyncio.sleep(0.5 * (2 ** attempt))
     if last_error:
         raise last_error
     raise RuntimeError("unreachable retry state")
@@ -75,8 +103,10 @@ async def fetch_pr_files(
     cache_key = f"{repo_full_name}/{pr_number}/{head_sha}" if head_sha else f"{repo_full_name}/{pr_number}"
     cached = queries.lookup_external_resource(provider, "pr_files", cache_key)
     if cached:
+        logger.info("external.fetch_pr_files_cache_hit provider=%s key=%s", provider, cache_key)
         result = cached["content"]
     else:
+        logger.info("external.fetch_pr_files_cache_miss provider=%s key=%s", provider, cache_key)
         result = await _fetch_pr_files_remote(provider, repo_full_name, pr_number)
         queries.write_external_resource(provider, "pr_files", cache_key, result, ttl_seconds=86400)
     if paths_filter:
