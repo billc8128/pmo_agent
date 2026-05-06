@@ -336,15 +336,21 @@ alter table public.subscriptions
 # bot/agent/lockout.py (sketch)
 def known_project_tokens() -> tuple[set[str], str]:
     """Returns (K, k_hash). K is the set of distinct
-    events.project_root last-segments, lowercased. k_hash is a
-    stable digest of sorted(K) — when K changes, k_hash changes.
-    TTL 60s. Cheap query, but cached so the decider loop doesn't
-    re-issue it for every (event, sub) pair in the iteration.
+    events.project_root last-segments, lowercased, with empty
+    tokens filtered out (matching the SQL function exactly —
+    plan §2.5 enforces this on both sides via the same query).
+    k_hash is a stable digest of sorted(K). TTL 60s.
     """
     if _cache_age() < 60:
         return _cache_K, _cache_hash
-    _cache_K = {seg.lower() for r in distinct_project_roots()
-                for seg in [last_segment(r)]}
+    # IMPORTANT: queries.distinct_project_root_tokens() already
+    # returns the lowercased, empty-filtered, deduplicated tokens
+    # (it runs the same CTE the SQL `index_subscription_metadata`
+    # function uses internally — see plan §2.5). DO NOT do a raw
+    # `select distinct project_root` and then last_segment() it
+    # in Python; that would re-introduce empty tokens for trailing-
+    # slash project_roots and break Python/SQL hash equivalence.
+    _cache_K = set(queries.distinct_project_root_tokens())
     _cache_hash = sha256("|".join(sorted(_cache_K)).encode()).hexdigest()[:16]
     return _cache_K, _cache_hash
 

@@ -109,9 +109,17 @@ Creates:
     terminal; status → 'failed'.
   - `reap_stale_job_claims(p_stale_after_minutes default 10)`:
     flips any 'investigating' row stuck >10min back to 'open'.
+  - `index_subscription_metadata(p_subscription_id uuid)`:
+    populates `subscriptions.metadata.matched_projects` +
+    `project_tokens_hash` + `indexed_at` per spec §4.1.1. Full
+    PL/pgSQL body in §2.5.1 below. The single source of truth
+    for token matching across bot + web. Called after every
+    description-touching mutation (add / update) AND on lazy
+    recompute when K's hash shifts.
 - ACL block: revoke from public/anon/authenticated, grant to
-  service_role only. Set search_path on every new function.
-  Mirror the pattern from 1.0a's 0013.
+  service_role only — applies to ALL 7 new functions including
+  `index_subscription_metadata`. Set search_path on every new
+  function. Mirror the pattern from 1.0a's 0013.
 
 **Apply path**: via Supabase Management API (same pattern as
 0005-0016).
@@ -186,8 +194,19 @@ insert into subscriptions (...) values (...) returning id;  -- s
     (s, eX, ...)` for a fresh subscription with no open jobs.
     Expect exactly ONE new job created (advisory lock serialises),
     second call appends to the first.
-13. ACL: with anon key, call any of these RPCs → permission
-    denied.
+13. ACL: with anon key, call each of these 7 RPCs → permission
+    denied for every one:
+    `append_to_or_open_investigation_job`,
+    `claim_investigatable_jobs`,
+    `create_notification_for_investigation_job`,
+    `mark_job_suppressed_if_claimed`,
+    `mark_job_failed_if_claimed`,
+    `release_job_claim`,
+    `reap_stale_job_claims`,
+    `index_subscription_metadata`.
+    Plus the parse-budget pair if implemented as RPCs:
+    `bump_investigation_parse_failure`,
+    `investigation_parse_failure_count`.
 
 **Exit criterion**: all 13 smoke tests pass; ROLLBACK leaves DB
 clean.
@@ -227,8 +246,14 @@ Maintenance:
 - `reap_stale_job_claims(stale_after_minutes default 10)` →
   returns int reaped_count
 
-Total: 9 wrappers, all thin `.rpc()` calls that match SQL functions
-defined in 0017.
+Indexing:
+- `index_subscription_metadata(subscription_id)` → returns None.
+  Wraps the SQL function from §2.5.1 (the single source of truth
+  for project-token matching). Called by add_subscription /
+  update_subscription / lazy recompute / web rules panel.
+
+Total: **10 wrappers**, all thin `.rpc()` calls that match SQL
+functions defined in 0017.
 
 New dataclass `InvestigatableJobBundle`:
 
@@ -246,7 +271,36 @@ class InvestigatableJobBundle:
     recent_notifications_for_subscription: list[dict]
 ```
 
-`InvestigationJob` dataclass mirrors the table columns.
+`InvestigationJob` dataclass mirrors the investigation_jobs table
+columns from spec §3.1.
+
+**Subscription dataclass extension** (existing class at
+`bot/db/queries.py::Subscription` predates 1.0c — it must be
+extended to include the new `metadata` and `archived_at` fields,
+otherwise `_dataclass_from_row` will silently drop them and
+`sub.metadata` will raise AttributeError in lockout):
+
+```python
+@dataclass
+class Subscription:
+    id: str
+    scope_kind: str
+    scope_id: str
+    description: str
+    enabled: bool
+    created_by: str | None
+    chat_id: str | None
+    created_at: str
+    updated_at: str
+    archived_at: str | None       # 1.0b column (added in 0016)
+    metadata: dict[str, Any]      # 1.0c column (added in 0017)
+                                  # holds matched_projects,
+                                  # project_tokens_hash, indexed_at
+```
+
+Both `archived_at` and `metadata` MUST be in this list so
+`fetch_subscriptions_for_scope`, `fetch_all_enabled_subscriptions`,
+`get_subscription` etc. all return them populated.
 
 Also add helper `recent_notifications_for_subscription(
 subscription_id, since_hours=72, limit=20)` so the investigator
@@ -363,7 +417,15 @@ also calls this RPC (NOT a parallel Python implementation):
 
 ```python
 def is_project_mismatch(event, sub) -> bool:
-    K, k_hash = known_project_tokens()
+    # Defensive: events.project_root is nullable. Empty/None →
+    # we don't know what project this event belongs to → can't
+    # apply lockout, fall through to gatekeeper LLM. This MUST
+    # match spec §4.1.1's is_project_mismatch sketch line-for-line.
+    event_token = last_segment(getattr(event, "project_root", None))
+    if not event_token:
+        return False
+
+    _K, k_hash = known_project_tokens()
     cached = sub.metadata.get("matched_projects")
     cached_hash = sub.metadata.get("project_tokens_hash")
     if cached is None or cached_hash != k_hash:
@@ -373,7 +435,7 @@ def is_project_mismatch(event, sub) -> bool:
         cached = sub.metadata.get("matched_projects") or []
     if not cached:
         return False
-    return last_segment(event.project_root).lower() not in set(cached)
+    return event_token not in set(cached)
 ```
 
 This means **zero parallel matching code**: the long/short
