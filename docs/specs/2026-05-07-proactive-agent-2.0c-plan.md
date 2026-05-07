@@ -45,7 +45,8 @@ users have tried passive retrieval in at least one active group.
 
 - Future Phase 2 create: `backend/supabase/migrations/0025_observer_candidates.sql`
   - `observer_candidates`
-  - feedback / budget tables if needed
+  - `observer_feedback`
+  - budget indexes
 
 ### Bot data layer
 
@@ -66,6 +67,9 @@ users have tried passive retrieval in at least one active group.
 - Create: `bot/chat_memory/people.py`
   - `person_key` resolution
   - people-note update prompt wrapper
+
+- Create: `bot/chat_memory/cleanup_loop.py`
+  - retention cleanup for expired `chat_messages`
 
 ### Feishu / app entry
 
@@ -149,6 +153,18 @@ Exit criterion: we know whether ordinary group messages will reach
 `/feishu/webhook`. If not, do not start code until Feishu app config is
 fixed.
 
+- [ ] **Step 4: Confirm Railway target**
+
+Run:
+
+```bash
+railway status
+```
+
+Expected: CLI is linked to the bot service/environment that currently
+serves `/feishu/webhook`. Do not deploy from this plan until the target
+is explicit.
+
 ---
 
 ## 3. Task 1 — Migration 0024: Chat and People Memory
@@ -168,6 +184,8 @@ def test_0024_creates_chat_memory_tables():
     assert "create table if not exists public.chat_messages" in sql
     assert "create table if not exists public.people_memory" in sql
     assert "feishu_message_id" in sql
+    assert "references public.chat_memory_settings(chat_id) on delete cascade" in sql
+    assert "between 1 and 730" in sql
     assert "to_tsvector('simple', text_redacted)" in sql
 ```
 
@@ -187,7 +205,9 @@ Create `0024_chat_memory.sql` with:
 
 - `chat_memory_settings` per spec §4.3
 - `chat_messages` per spec §4.4
+  - `chat_id` references `chat_memory_settings(chat_id) on delete cascade`
 - `people_memory` per spec §5.1
+  - includes `metadata jsonb` for note updater audit fields
 - comments stating stored payloads are redacted, not raw Feishu bodies
 - RLS enabled with no public policies
 - indexes:
@@ -226,10 +246,13 @@ insert into public.chat_messages (
 );
 
 select count(*) from public.chat_messages where chat_id='oc_test';
+
+delete from public.chat_memory_settings where chat_id='oc_test';
+select count(*) from public.chat_messages where chat_id='oc_test';
 rollback;
 ```
 
-Expected: count = 1.
+Expected: first count = 1, second count = 0, proving delete cascade.
 
 - [ ] **Step 6: Commit**
 
@@ -326,6 +349,8 @@ Tests:
    and stores nothing.
 3. Enabled chat + @ message stores row and still calls `_handle_message`.
 4. Duplicate Feishu message id does not create a second row.
+5. Enabled chat + @ message is stored exactly once: webhook stores it
+   before `_handle_message`, and `_handle_message` must not store again.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -388,6 +413,10 @@ if parsed.chat_type == "group" and not parsed.is_at_bot:
 asyncio.create_task(_handle_message(parsed))
 return PlainTextResponse("ok")
 ```
+
+Ownership rule: `feishu_webhook` is the only place that stores inbound
+Feishu chat messages. `_handle_message` and downstream agent code must
+not write `chat_messages`; they only read memory through tools.
 
 Avoid duplicate DB lookups where possible, but correctness first.
 
@@ -579,6 +608,8 @@ Cover:
 - `get_people_memory("hellobit")` returns matching note
 - `suggest_people_for_topic(...)` returns "not enough signal" when no
   notes exist
+- conversational tool list does **not** include
+  `update_people_memory_note`
 - updater prompt rejects sensitive/personality/performance judgment
   in fixture output
 
@@ -606,19 +637,18 @@ def sanitize_people_note(note: str) -> str: ...
 it can remove obvious forbidden phrases and the prompt should carry the
 real boundary.
 
-- [ ] **Step 4: Add tools**
+- [ ] **Step 4: Add conversational tools**
 
 Tools:
 
 ```text
 get_people_memory(query, limit=5)
 suggest_people_for_topic(topic, limit=5)
-update_people_memory_note(person_key, note)
 ```
 
-`update_people_memory_note` should be hidden from normal user copy. It
-is callable by the agent when maintaining notes, but the prompt should
-prefer using it only after reading enough chat context.
+Do **not** register `update_people_memory_note` with the conversation
+MCP server. Note writes happen through `bot/chat_memory/people_loop.py`
+or an internal helper called by tests/background jobs only.
 
 - [ ] **Step 5: Prompt update**
 
@@ -662,6 +692,9 @@ Tests:
 - loop selects only enabled chats with recent messages
 - skips people with no new evidence
 - caps people/messages per run
+- enforces global daily rewrite cap
+- enforces per-note input/output token caps
+- debounces same-person rewrites within 10 minutes
 - writes note through `upsert_people_memory`
 - never sends Feishu messages
 
@@ -683,6 +716,11 @@ Loop defaults:
 - max chats per run: 10
 - max people per chat: 20
 - max messages per chat: 80
+- max note rewrites per day globally: 200
+- max input tokens per note rewrite: 4k
+- max output tokens per note rewrite: 600
+- max input tokens per run: 30k
+- same person debounce: 10 minutes
 - model: same lightweight model family used for classifier/gatekeeper
   unless current config says otherwise
 
@@ -690,6 +728,7 @@ The loop can be disabled by env:
 
 ```text
 PEOPLE_MEMORY_LOOP_ENABLED=false
+PEOPLE_MEMORY_DAILY_REWRITE_CAP=200
 ```
 
 - [ ] **Step 4: Wire into FastAPI lifespan**
@@ -716,7 +755,67 @@ git commit -m "feat(bot): refresh people memory in background"
 
 ---
 
-## 10. Task 8 — Phase 1 End-to-End Validation
+## 10. Task 8 — Chat Memory Retention Cleanup
+
+**Files:**
+- Create: `bot/chat_memory/cleanup_loop.py`
+- Modify: `bot/db/queries.py`
+- Modify: `bot/app.py`
+- Test: `bot/tests/test_chat_memory.py`
+
+- [ ] **Step 1: Write failing tests**
+
+Tests:
+
+- expired messages are deleted based on each chat's `retention_days`
+- disabled chats still honor retention
+- messages newer than the cutoff are preserved
+- cleanup run is capped so one large chat cannot block the loop
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run:
+
+```bash
+python -m pytest bot/tests/test_chat_memory.py -q
+```
+
+Expected: FAIL.
+
+- [ ] **Step 3: Implement cleanup helper and loop**
+
+Helper:
+
+```python
+def delete_expired_chat_messages(*, limit: int = 5000) -> int: ...
+```
+
+Loop defaults:
+
+- interval: 24 hours
+- delete limit per run: 5000 rows
+- disabled by env only for emergency:
+
+```text
+CHAT_MEMORY_CLEANUP_ENABLED=true
+```
+
+- [ ] **Step 4: Wire into FastAPI lifespan**
+
+Start next to other background tasks. The loop must not affect message
+capture if cleanup fails; log and retry on next interval.
+
+- [ ] **Step 5: Run tests and commit**
+
+```bash
+python -m pytest bot/tests/test_chat_memory.py -q
+git add bot/chat_memory/cleanup_loop.py bot/db/queries.py bot/app.py bot/tests/test_chat_memory.py
+git commit -m "feat(bot): clean up expired chat memory"
+```
+
+---
+
+## 11. Task 9 — Phase 1 End-to-End Validation
 
 **Files:**
 - No required code files unless tests expose gaps
@@ -766,6 +865,15 @@ Expected: one row returned.
 
 - [ ] **Step 4: Deploy bot to Railway staging/prod**
 
+First confirm the linked service:
+
+```bash
+railway status
+```
+
+Expected: target is the bot service/environment serving
+`/feishu/webhook`.
+
 Run:
 
 ```bash
@@ -796,7 +904,7 @@ git commit -m "docs: record 2.0c passive memory validation"
 
 ---
 
-## 11. Task 9 — Phase 2 Schema: Observer Candidates
+## 12. Task 10 — Phase 2 Schema: Observer Candidates
 
 Do this only after Phase 1 is stable.
 
@@ -810,10 +918,14 @@ Do this only after Phase 1 is stable.
 Assert table contains:
 
 - `observer_candidates`
+- `observer_candidates_target_check`
+- `observer_feedback`
 - `evidence_message_ids text[]`
 - `evidence_event_ids bigint[]`
 - `suggested_people text[]`
 - status check including `open`, `notified`, `suppressed`, `expired`
+- feedback kind check including `not_useful`, `suppress_candidate_type`,
+  `suppress_topic`, `disable_observer`
 
 - [ ] **Step 2: Add migration**
 
@@ -822,6 +934,8 @@ Create table per spec §6.3 plus indexes:
 - `observer_candidates_status_idx`
 - `observer_candidates_chat_open_idx`
 - `observer_candidates_expires_idx`
+- `observer_feedback_chat_kind_idx`
+- `observer_feedback_topic_idx`
 
 - [ ] **Step 3: Add DB helpers**
 
@@ -830,6 +944,8 @@ def open_observer_candidate(row: dict) -> int: ...
 def claim_observer_candidates(limit: int, claim_id: str) -> list[dict]: ...
 def mark_observer_candidate_notified(candidate_id: int, notification_id: int) -> None: ...
 def mark_observer_candidate_suppressed(candidate_id: int, reason: str) -> None: ...
+def record_observer_feedback(row: dict) -> int: ...
+def observer_feedback_for_chat(chat_id: str) -> list[dict]: ...
 ```
 
 - [ ] **Step 4: Run tests and commit**
@@ -837,14 +953,14 @@ def mark_observer_candidate_suppressed(candidate_id: int, reason: str) -> None: 
 ```bash
 python -m pytest bot/tests/test_observer.py -q
 git add backend/supabase/migrations/0025_observer_candidates.sql bot/db/queries.py bot/tests/test_observer.py
-git commit -m "feat(db): add observer candidates"
+git commit -m "feat(db): add observer candidates and feedback"
 ```
 
 ---
 
-## 12. Task 10 — Phase 2 Observer Loop
+## 13. Task 11 — Phase 2 Observer Loop
 
-Do this only after Task 9 and a separate user review.
+Do this only after Task 10 and a separate user review.
 
 **Files:**
 - Create: `bot/agent/observer.py`
@@ -860,6 +976,7 @@ Tests:
 - candidate output requires evidence message/event ids
 - low confidence mention candidates are suppressed
 - per-chat daily cap blocks second delivery
+- feedback table suppresses disabled candidate types/topics
 - observer never sends directly; it only opens candidates
 
 - [ ] **Step 2: Implement observer prompt and parser**
@@ -895,9 +1012,9 @@ git commit -m "feat(bot): add PMO observer candidates"
 
 ---
 
-## 13. Task 11 — Phase 2 Investigator and Delivery Integration
+## 14. Task 12 — Phase 2 Investigator and Delivery Integration
 
-Do this only after Task 10.
+Do this only after Task 11.
 
 **Files:**
 - Modify: `bot/agent/investigator_loop.py`
@@ -956,6 +1073,8 @@ Required before production:
 - [ ] `python -m pytest bot/tests -q` passes
 - [ ] migration 0024 applies to sandbox
 - [ ] sandbox SQL smoke passes
+- [ ] retention cleanup test passes
+- [ ] `railway status` confirms the bot service/environment before deploy
 - [ ] Railway deploy succeeds
 - [ ] Feishu e2e:
   - enable memory
