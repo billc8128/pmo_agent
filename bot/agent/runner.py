@@ -91,6 +91,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - External: read_doc, read_external_table, resolve_feishu_link, list_connected_repos, query_repo
 - Proactive: add_subscription, list_subscriptions, update_subscription, remove_subscription, grant_target_consent, revoke_target_consent, list_target_consents, request_target_consent, why_no_notification
 - Chat Memory: enable_chat_memory, disable_chat_memory, chat_memory_status, get_recent_chat_messages, search_chat_messages_with_context
+- People Memory: summarize_people_signal, suggest_people_for_topic
 
 # 选 tool 的策略（重要）
 
@@ -180,6 +181,15 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 
 回答 chat memory 问题时，要区分“已达成一致”和“有人提出但未确认”；不要编造 owner、deadline 或结论。工具返回里的 message_id 只作为内部定位，用户没要求 traceability 时不要塞进最终答案。
 
+# 成员认知
+
+当用户问“谁适合看这个 / 谁懂这个 / 这个方向找谁确认 / 你对某人的工作认知”这类问题时，使用 People Memory 工具：
+- summarize_people_signal：对当前群里出现过的成员，返回 topic-scoped 的成员信号摘要。
+- suggest_people_for_topic：基于当前群的成员信号，建议可先轻量询问的人。
+
+People Memory 是 PMO 的工作上下文认知，不是绩效评价。回答时只给和当前 topic 相关的简短理由，不要逐字暴露 people memory 的原始 note，不要输出 profile_id / open_id / person_key。建议措辞要保守，例如“可以先问问 X”或“X 可能有相关上下文”；不要替用户分派 owner，除非群聊记忆里已经明确达成 owner。
+People Memory 工具默认只看当前群出现过的人。不要尝试传 chat_id，也不要把一个群里的成员认知拿去回答另一个群的问题。
+
 创建/修改/删除主动通知规则是写操作，不是资料查询：
 - 用户让你“以后/每次/有进展时通知/告诉/发到某处”这类管理规则时，直接调用 add_subscription / update_subscription / remove_subscription，不要先调用 list_connected_repos、query_repo、get_recent_turns 或 get_project_overview 来调查内容是否存在。
 - add_subscription 的 description 应保留用户的自然语言需求本身；不要为了“确认项目”而把它改写成你调查后的结论。
@@ -258,6 +268,10 @@ async def _get_client(conversation_key: str) -> _PooledClient:
                     "mcp__pmo_meta__enable_chat_memory",
                     "mcp__pmo_meta__disable_chat_memory",
                     "mcp__pmo_meta__chat_memory_status",
+                    "mcp__pmo_meta__get_recent_chat_messages",
+                    "mcp__pmo_meta__search_chat_messages_with_context",
+                    "mcp__pmo_meta__summarize_people_signal",
+                    "mcp__pmo_meta__suggest_people_for_topic",
                     "mcp__pmo_calendar__schedule_meeting",
                     "mcp__pmo_calendar__cancel_meeting",
                     "mcp__pmo_calendar__list_my_meetings",

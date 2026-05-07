@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     investigator_max_turns: int = 6
     investigator_max_turns_context: int = 30
     aggregation_window_minutes: int = 30
+    people_memory_loop_enabled: bool = False
+    people_memory_loop_interval_seconds: int = 1800
+    people_memory_max_chats_per_run: int = 10
+    people_memory_max_messages_per_chat: int = 500
+    people_memory_min_messages: int = 10
+    people_memory_daily_update_cap: int = 200
+    people_memory_debounce_minutes: int = 10
 
     @property
     def cors_origins(self) -> List[str]:
