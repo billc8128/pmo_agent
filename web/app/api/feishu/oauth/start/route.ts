@@ -12,12 +12,9 @@
 
 import { NextResponse, type NextRequest } from 'next/server';
 import { serverActionClient } from '@/lib/supabase-server';
+import { buildFeishuAuthorizeUrl } from '@/lib/feishu-oauth';
 
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID!;
-// Feishu's authorize URL — the public-facing one (open.feishu.cn /
-// accounts.feishu.cn both work; we use the open.feishu.cn variant
-// because it serves the app-style consent screen for self-built apps).
-const AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
 
 export async function GET(request: NextRequest) {
   if (!FEISHU_APP_ID) {
@@ -43,13 +40,11 @@ export async function GET(request: NextRequest) {
   // from this same browser session.
   const state = crypto.randomUUID();
 
-  const params = new URLSearchParams({
-    app_id: FEISHU_APP_ID,
-    redirect_uri: redirectUri,
+  const resp = NextResponse.redirect(buildFeishuAuthorizeUrl({
+    appId: FEISHU_APP_ID,
+    redirectUri,
     state,
-  });
-
-  const resp = NextResponse.redirect(`${AUTHORIZE_URL}?${params.toString()}`);
+  }));
   resp.cookies.set('feishu_oauth_state', state, {
     httpOnly: true,
     sameSite: 'lax',
