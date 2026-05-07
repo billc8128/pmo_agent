@@ -725,7 +725,6 @@ def _chat_message_public_row(row: dict[str, Any]) -> dict[str, Any]:
         "message_id": row.get("feishu_message_id"),
         "sent_at": row.get("occurred_at"),
         "sender": row.get("sender_display_name") or row.get("sender_open_id"),
-        "sender_open_id": row.get("sender_open_id"),
         "text": row.get("text_redacted") or "",
         "is_at_bot": bool(row.get("is_at_bot")),
         "message_type": row.get("message_type") or "text",

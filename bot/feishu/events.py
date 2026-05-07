@@ -4,12 +4,12 @@ We rely on lark-oapi to handle URL-verification, AES decryption, and
 event signature validation. Above that, this module exposes a small
 typed representation of what business code cares about.
 
-Two kinds of events the bot acts on:
-  - p2p_chat:    user DM'd the bot. Always respond.
-  - group_chat:  user @-mentioned the bot in a group. Only respond when
-                 mentioned (lark hands us mentions as a separate field).
-Anything else — bot-to-bot messages, mentions of *other* bots, system
-events — we silently ignore.
+The parser preserves text, rich text, and safe shared-resource metadata for
+chat memory. Only conversational message types are allowed to invoke the agent:
+  - p2p_chat:    user DM'd the bot with text/rich text.
+  - group_chat:  user @-mentioned the bot with text/rich text.
+Non-conversational group messages can still be stored when chat memory is
+enabled, but they must not be treated as user questions.
 """
 from __future__ import annotations
 
@@ -67,6 +67,7 @@ class ParsedMessageEvent:
     mentions: list[dict[str, Any]] = field(default_factory=list)
     message_type: str = "text"
     content_metadata: dict[str, Any] = field(default_factory=dict)
+    is_conversational: bool = False
     bot_identity_ready: bool = True
     sender_is_bot: bool = False
 
@@ -202,6 +203,7 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
         mentions=mentions,
         message_type=msg_type,
         content_metadata=content_metadata,
+        is_conversational=msg_type in {"text", "post"},
         bot_identity_ready=bot_identity_ready,
         sender_is_bot=bool(self_oid and sender_open_id == self_oid),
     )
@@ -328,6 +330,11 @@ def _extract_message_text_and_metadata(msg_type: str, content: dict[str, Any]) -
     if msg_type == "share_user":
         name = str(content.get("name") or content.get("user_name") or "Shared user").strip()
         return f"Shared user: {name}", {"name": name}
+    if msg_type == "link":
+        title = str(content.get("title") or content.get("name") or "Shared link").strip()
+        url = str(content.get("url") or content.get("href") or content.get("link") or "").strip()
+        metadata = {k: v for k, v in {"title": title, "url": url}.items() if v}
+        return f"Shared link: {title}", metadata
     return "", {}
 
 

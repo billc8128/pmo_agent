@@ -380,6 +380,7 @@ def test_recent_chat_messages_excludes_deleted_and_bot_rows(monkeypatch):
 
     assert [row["message_id"] for row in rows] == ["om_1"]
     assert rows[0]["text"] == "kept"
+    assert "sender_open_id" not in rows[0]
 
 
 def _message_body(*, message_type="text", content=None, mentions=None, create_time="1778126400000"):
@@ -430,6 +431,7 @@ def test_parse_message_event_exposes_chat_memory_fields_for_text():
     assert parsed.mentions[0]["open_id"] == "ou_bot"
     assert parsed.bot_identity_ready is True
     assert parsed.is_at_bot is True
+    assert parsed.is_conversational is True
 
 
 def test_parse_message_event_preserves_post_text_and_metadata():
@@ -453,6 +455,7 @@ def test_parse_message_event_preserves_post_text_and_metadata():
     assert "Spec decision" in parsed.text
     assert "同意方案 A" in parsed.text
     assert "文档" in parsed.text
+    assert parsed.is_conversational is True
     assert parsed.content_metadata["links"] == [
         {"text": "文档", "href": "https://example.com/spec"}
     ]
@@ -475,6 +478,28 @@ def test_parse_message_event_preserves_file_metadata_without_binary_handles():
     assert "方案.pdf" in parsed.text
     assert parsed.content_metadata == {"file_name": "方案.pdf", "size": 1200}
     assert "file_key" not in parsed.content_metadata
+    assert parsed.is_conversational is False
+
+
+def test_parse_message_event_preserves_link_metadata_for_ingest_without_conversation():
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    link_content = {
+        "title": "vibelive 技术方案",
+        "url": "https://docs.example.com/vibelive",
+    }
+
+    parsed = events.parse_message_event(_message_body(message_type="link", content=link_content))
+
+    assert parsed is not None
+    assert parsed.message_type == "link"
+    assert parsed.text == "Shared link: vibelive 技术方案"
+    assert parsed.content_metadata == {
+        "title": "vibelive 技术方案",
+        "url": "https://docs.example.com/vibelive",
+    }
+    assert parsed.is_conversational is False
 
 
 def test_group_message_without_self_open_id_is_not_identity_ready():
@@ -1001,6 +1026,40 @@ async def test_feishu_webhook_at_group_message_stores_and_answers(monkeypatch):
     assert response.body == b"ok"
     assert stored == ["om_1"]
     assert handled == ["om_1"]
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_at_group_non_conversational_message_only_stores(monkeypatch):
+    import app as bot_app
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    body = _message_body(
+        message_type="file",
+        content={"file_name": "vibelive-spec.pdf"},
+        mentions=[{"id": {"open_id": "ou_bot"}, "name": "包工头"}],
+    )
+    body["header"]["event_id"] = "evt_chat_memory_at_file"
+    stored: list[str] = []
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: True)
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "should_schedule_storage", lambda chat_id: True)
+
+    async def store(parsed):
+        stored.append(parsed.message_id)
+        return True
+
+    async def fail_handle(parsed):
+        raise AssertionError("non-conversational messages must not enter the agent")
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "store_message_if_enabled", store)
+    monkeypatch.setattr(bot_app, "_handle_message", fail_handle)
+
+    response = await bot_app.feishu_webhook(_FakeRequest(body))
+    await asyncio.sleep(0)
+
+    assert response.body == b"ok"
+    assert stored == ["om_1"]
 
 
 @pytest.mark.anyio

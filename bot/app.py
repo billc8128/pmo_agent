@@ -145,6 +145,9 @@ async def feishu_webhook(request: Request):
             return PlainTextResponse("ok")
         return PlainTextResponse("group not addressed")
 
+    if not parsed.is_conversational:
+        return PlainTextResponse("ok" if scheduled_storage else "ignored")
+
     asyncio.create_task(_handle_message(parsed))
     return PlainTextResponse("ok")
 
