@@ -173,6 +173,27 @@ Phase 1 does **not** enable active observer. The status can show:
 
 > 主动观察：未开启
 
+`chat_memory_status` returns structured fields, not a prewritten
+paragraph:
+
+```json
+{
+  "enabled": true,
+  "enabled_at": "2026-05-07T15:05:36+08:00",
+  "enabled_by": "bcc",
+  "retention_days": 90,
+  "observer_enabled": false
+}
+```
+
+The conversational agent renders status with this fixed template:
+
+> 这个群的 PMO 记忆：已开启 / 未开启
+> 开启时间：...
+> 开启人：...
+> 保留期：... 天
+> 主动观察：已开启 / 未开启
+
 Open consent gap: Phase 1 does not implement per-member opt-out inside
 an opted-in chat. If the product needs stronger consent, add a
 `chat_memory_member_opt_outs` table before broad rollout. Until then,
@@ -373,6 +394,11 @@ Minimum patterns:
 - bank-card-like digit runs
 - IPv4 host + optional port when it appears near password / ssh /
   database context
+- host-injected prompt markers such as `[asker]`,
+  `[parent_notification]`, and `[IMAGE:...]`. When these appear in a
+  chat message, escape them before persistence, for example
+  `[asker]` -> `[chat_text:asker]`. A user-authored historical message
+  must never look like a current host-injected control block.
 
 Redaction is best-effort. The product copy must not claim "we can never
 store secrets"; it should say "the bot redacts common secret patterns
@@ -388,6 +414,12 @@ Conversational tool schemas must not include `chat_id`. If a model sends
 an unexpected `chat_id` key anyway, the tool layer rejects the call
 instead of silently ignoring it. This makes cross-chat prompt injection
 observable in tests.
+
+Tool outputs must be structured rows, not raw transcript blobs. A chat
+history row should be delivered as data like `{message_id, sender,
+sent_at, text}`, or rendered inside an unambiguous wrapper such as
+`<chat_msg ...>...</chat_msg>`. The model must be able to distinguish
+historical chat text from host-injected current-message metadata.
 
 #### `get_recent_chat_messages`
 
@@ -487,6 +519,11 @@ Typical chain:
 
 When answering from chat memory, the bot should:
 
+- Treat chat-memory questions ("刚才 / 前面 / 今天我们聊的 / 达成一致")
+  as current-chat-memory-only unless the user explicitly asks for repo,
+  turn, or public timeline data. If chat memory is disabled or the tools
+  return no evidence, say "这个群的 PMO 记忆里没找到明确记录" rather
+  than filling gaps from other tools.
 - Prefer retrieving a window around relevant messages rather than
   answering from a single hit
 - Say "我没看到明确结论" when the chat does not contain consensus
@@ -658,6 +695,26 @@ Daily caps and debounce checks are DB-backed via
 `people_memory_updates`, not process memory. A deploy/restart must not
 reset the day's update budget.
 
+### 5.3.1 Background evaluator
+
+The background loop separates "should this person be considered?" from
+"rewrite this person's note." First pass is deterministic and cheap:
+
+- person has at least 10 new messages since `people_loop_cursor`, or
+- person has not been evaluated in 24 hours and has meaningful new
+  mentions/replies, or
+- user asked a people-routing question involving this person
+
+This evaluator should avoid one LLM call per active person. It may use
+message counts, mentions, repo/project keywords, and elapsed time.
+
+### 5.3.2 Background writer
+
+Only evaluator-positive people enter the note writer. The writer may use
+a mid-tier model because it rewrites user-facing PMO memory, but it is
+bounded by the budgets above. Evaluation counts and writer counts should
+be logged separately so cost problems are diagnosable.
+
 ### 5.4 People tools
 
 #### `summarize_people_signal`
@@ -774,6 +831,15 @@ Observer produces zero or more candidates:
 
 Observer candidates are not notifications. They enter an investigator
 path that reads enough raw context and decides whether to notify.
+
+Confidence calibration:
+
+- `high`: at least three independent evidence items support the same
+  conclusion and no recent evidence contradicts it
+- `medium`: one or two strong evidence items support it, but context is
+  incomplete
+- `low`: plausible PMO concern, but evidence is thin; low-confidence
+  candidates must not create @ mentions
 
 ### 6.3 Candidate storage
 
@@ -956,16 +1022,25 @@ RLS: service-role only in the first version. User feedback is written
 through bot tools after the sender is resolved from the Feishu request
 context.
 
-### 6.5 Observer is not a rule engine
+### 6.5 Safety rules vs product judgment
 
-Do not add hard-coded rules like:
+Hard-code safety boundaries:
+
+- disabled chat / disabled observer flag
+- per-chat and per-user daily budgets
+- same `topic_key` suppression windows
+- low-confidence candidates cannot @ mention people
+- expired candidates are dropped
+
+Do not hard-code product judgment rules like:
 
 - if text contains "bug" then notify
 - if "push" then summarize
 - if user says "help" then @ owner
 
-The observer LLM decides whether a PMO should intervene. Deterministic
-code may enforce safety and budgets, but not product judgment.
+The observer LLM decides whether a PMO should intervene, who the PMO is
+speaking to, and what kind of brief is needed. Deterministic code
+enforces safety, budgets, permissions, and disabled states.
 
 ---
 
@@ -1019,6 +1094,27 @@ The cleanup job is part of Phase 1, not a later operations chore. If a
 chat's `retention_days` changes, the next cleanup run should apply the
 new value.
 
+Retention cutoff is based on `occurred_at`. `deleted_at` is a recall /
+privacy visibility flag: recalled rows are excluded immediately, then
+physically removed when they cross retention. If stronger recall privacy
+is required, add a separate short grace-period purge for `deleted_at is
+not null`.
+
+### 7.5 Observability
+
+Phase 1 must emit structured logs for:
+
+- chat memory store attempts, successes, duplicate skips, and failures
+- redaction pattern hit counts by category
+- chat-memory tool call counts and latency
+- people-loop evaluator counts, writer counts, token usage, and duration
+- cleanup-loop deleted row counts
+
+Phase 2 must also log observer candidate counts, budget-suppressed
+counts, feedback-suppressed counts, and delivery counts. Logger output
+is enough for the first version; no Prometheus dependency is required.
+Fire-and-forget background tasks must catch and log exceptions.
+
 ---
 
 ## 8. LLM prompt contracts
@@ -1038,6 +1134,13 @@ Add to system prompt:
 - If evidence is unclear, say so.
 - Do not create subscriptions when the user is asking about past chat
   context.
+- If a single message mixes retrospective context and subscription
+  intent, handle the retrospective part first. Example: "把刚才聊的
+  vibelive 决策以后都通知我" should call chat-memory retrieval, summarize
+  what was found, then ask for confirmation or create the subscription
+  using the user's confirmed wording. Do not blindly apply the older
+  "以后/每次 => add_subscription immediately" rule to mixed-intent
+  messages.
 - Do not ask tools to search another chat by id. Chat-memory tools are
   current-chat scoped.
 - Do not ask for raw people notes. Use topic-scoped people-signal tools.
