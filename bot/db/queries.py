@@ -475,6 +475,213 @@ def list_external_repos(query: str | None = None, limit: int = 20) -> list[dict[
     return rows[:limit]
 
 
+def is_chat_memory_enabled(chat_id: str) -> bool:
+    if not chat_id:
+        return False
+    row = (
+        sb_admin()
+        .table("chat_memory_settings")
+        .select("enabled")
+        .eq("chat_id", chat_id)
+        .maybe_single()
+        .execute()
+        .data
+    )
+    return bool(row and row.get("enabled"))
+
+
+def _insert_chat_memory_history(
+    *,
+    chat_id: str,
+    action: str,
+    user_id: str | None,
+    open_id: str | None,
+    old_value: dict[str, Any] | None = None,
+    new_value: dict[str, Any] | None = None,
+) -> None:
+    sb_admin().table("chat_memory_settings_history").insert(
+        {
+            "chat_id": chat_id,
+            "action": action,
+            "actor_user_id": user_id,
+            "actor_open_id": open_id,
+            "old_value": old_value,
+            "new_value": new_value,
+        }
+    ).execute()
+
+
+def enable_chat_memory(
+    chat_id: str,
+    *,
+    user_id: str | None,
+    open_id: str | None,
+    retention_days: int = 90,
+) -> dict[str, Any]:
+    retention = max(1, min(int(retention_days or 90), 730))
+    now = _utc_now_iso()
+    payload = {
+        "chat_id": chat_id,
+        "enabled": True,
+        "enabled_at": now,
+        "enabled_by_user_id": user_id,
+        "enabled_by_open_id": open_id,
+        "disabled_at": None,
+        "disabled_by_user_id": None,
+        "disabled_by_open_id": None,
+        "retention_days": retention,
+        "updated_at": now,
+    }
+    res = (
+        sb_admin()
+        .table("chat_memory_settings")
+        .upsert(payload, on_conflict="chat_id")
+        .execute()
+    )
+    row = (res.data or [payload])[0]
+    _insert_chat_memory_history(
+        chat_id=chat_id,
+        action="enable",
+        user_id=user_id,
+        open_id=open_id,
+        new_value={"enabled": True, "retention_days": retention},
+    )
+    return row
+
+
+def disable_chat_memory(
+    chat_id: str,
+    *,
+    user_id: str | None,
+    open_id: str | None,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    payload = {
+        "enabled": False,
+        "disabled_at": now,
+        "disabled_by_user_id": user_id,
+        "disabled_by_open_id": open_id,
+        "updated_at": now,
+    }
+    res = (
+        sb_admin()
+        .table("chat_memory_settings")
+        .update(payload)
+        .eq("chat_id", chat_id)
+        .execute()
+    )
+    row = (res.data or [{**payload, "chat_id": chat_id}])[0]
+    _insert_chat_memory_history(
+        chat_id=chat_id,
+        action="disable",
+        user_id=user_id,
+        open_id=open_id,
+        new_value={"enabled": False},
+    )
+    return row
+
+
+def chat_memory_status(chat_id: str) -> dict[str, Any] | None:
+    row = (
+        sb_admin()
+        .table("chat_memory_settings")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .maybe_single()
+        .execute()
+        .data
+    )
+    return row or None
+
+
+def insert_chat_message(row: dict[str, Any]) -> dict[str, Any] | None:
+    payload = dict(row)
+    if not payload.get("text_redacted"):
+        payload["text_redacted"] = "[REDACTED]"
+    res = (
+        sb_admin()
+        .table("chat_messages")
+        .upsert(payload, on_conflict="feishu_message_id")
+        .execute()
+    )
+    return (res.data or [payload])[0] if res is not None else payload
+
+
+def mark_chat_message_deleted(message_id: str) -> bool:
+    res = (
+        sb_admin()
+        .table("chat_messages")
+        .update({"deleted_at": _utc_now_iso()})
+        .eq("feishu_message_id", message_id)
+        .execute()
+    )
+    return bool(res and res.data)
+
+
+def update_chat_message_text(
+    message_id: str,
+    *,
+    text_redacted: str,
+    redacted_payload: dict[str, Any],
+    edited_at: str,
+) -> bool:
+    payload = {
+        "text_redacted": text_redacted or "[REDACTED]",
+        "redacted_payload": redacted_payload,
+        "edited_at": edited_at,
+    }
+    res = (
+        sb_admin()
+        .table("chat_messages")
+        .update(payload)
+        .eq("feishu_message_id", message_id)
+        .execute()
+    )
+    return bool(res and res.data)
+
+
+def _chat_message_public_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_id": row.get("feishu_message_id"),
+        "sent_at": row.get("occurred_at"),
+        "sender": row.get("sender_display_name") or row.get("sender_open_id"),
+        "sender_open_id": row.get("sender_open_id"),
+        "text": row.get("text_redacted") or "",
+        "is_at_bot": bool(row.get("is_at_bot")),
+        "message_type": row.get("message_type") or "text",
+        "content_metadata": row.get("content_metadata") or {},
+    }
+
+
+def get_recent_chat_messages(
+    chat_id: str,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 80,
+    sender: str | None = None,
+) -> list[dict[str, Any]]:
+    capped = max(1, min(int(limit or 80), 120))
+    q = (
+        sb_admin()
+        .table("chat_messages")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .is_("deleted_at", None)
+        .eq("sender_is_bot", False)
+        .order("occurred_at", desc=True)
+        .limit(capped)
+    )
+    if since:
+        q = q.gte("occurred_at", since)
+    if until:
+        q = q.lte("occurred_at", until)
+    if sender:
+        q = q.eq("sender_open_id", sender)
+    rows = q.execute().data or []
+    return [_chat_message_public_row(row) for row in rows]
+
+
 def recent_turns(
     user_id: str,
     *,
