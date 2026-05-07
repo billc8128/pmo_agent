@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def test_chat_redaction_patterns_cover_private_chat_shapes():
     from external.redaction import redact_text
@@ -31,3 +33,26 @@ def test_chat_redaction_patterns_cover_private_chat_shapes():
     assert "[parent_notification]" not in redacted
     assert "[IMAGE:img_123]" not in redacted
     assert "[chat_memory_escaped_marker:asker]" in redacted
+
+
+def test_migration_0024_creates_chat_memory_tables():
+    sql = Path("backend/supabase/migrations/0024_chat_memory.sql").read_text()
+
+    assert "create table if not exists public.chat_memory_settings" in sql
+    assert "create table if not exists public.chat_memory_settings_history" in sql
+    assert "create table if not exists public.chat_messages" in sql
+    assert "create table if not exists public.people_memory" in sql
+    assert "create table if not exists public.people_memory_updates" in sql
+    assert "feishu_message_id" in sql
+    assert "people_loop_cursor" in sql
+    assert "content_metadata" in sql
+    assert "sender_is_bot" in sql
+    assert "edited_at" in sql
+    assert "deleted_at" in sql
+    assert "references public.chat_memory_settings(chat_id) on delete cascade" in sql
+    assert "between 1 and 730" in sql
+    assert "to_tsvector('simple', text_redacted)" in sql
+    assert "people_memory_updates_source_time_idx" in sql
+    assert "people_memory_updates_person_time_idx" in sql
+    assert "comment on column public.chat_messages.redacted_payload" in sql
+    assert "redacted" in sql
