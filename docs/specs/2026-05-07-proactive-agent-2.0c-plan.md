@@ -12,23 +12,34 @@
 
 ## 0. Cut Points
 
-This plan has two release cuts:
+This plan has four release cuts:
 
-1. **2.0c Phase 1: Passive Memory**
-   - group opt-in
+1. **2.0c Phase 1A: Opt-in + ingest**
+   - group opt-in / opt-out
    - message storage
-   - chat retrieval tools
-   - people `pmo_notes`
-   - no proactive observer messages
+   - recall/edit privacy handling
+   - no LLM access to stored memory yet
 
-2. **2.0c Phase 2: Observer**
+2. **2.0c Phase 1B: Passive chat retrieval**
+   - scoped chat-memory tools
+   - prompt updates for "刚才 / 今天 / TODO" questions
+   - no people-note background loop yet
+
+3. **2.0c Phase 1C: People memory**
+   - simple `pmo_notes`
+   - topic-scoped people signal tools
+   - background update loop with DB-backed budgets
+
+4. **2.0c Phase 2: Observer**
    - observer candidates
    - trust budgets
    - investigator integration
    - proactive messages / mentions
 
-Do not implement Phase 2 until Phase 1 has passed real Feishu e2e and
-users have tried passive retrieval in at least one active group.
+Each cut should run in staging for at least 24 hours before enabling the
+next cut. Do not implement Phase 2 until Phase 1A/1B/1C have passed
+real Feishu e2e and users have tried passive retrieval in at least one
+active group.
 
 ---
 
@@ -42,12 +53,15 @@ users have tried passive retrieval in at least one active group.
   - `chat_messages`
   - `people_memory`
   - `people_memory_updates`
+  - people loop cursor fields
   - service-role-only RLS
   - indexes and comments
 
 - Future Phase 2 create: `backend/supabase/migrations/0025_observer_candidates.sql`
   - `observer_candidates`
   - `observer_feedback`
+  - shared delivery-target validator with 0023
+  - synthetic observer subscription helper
   - budget indexes
 
 ### Bot data layer
@@ -88,18 +102,23 @@ users have tried passive retrieval in at least one active group.
 
 - Modify: `bot/feishu/events.py`
   - ensure parsed event exposes message id, parent/root id, sender
-    display fields, mention metadata, timestamp
+    display fields, mention metadata, timestamp, message type,
+    supported content metadata, and bot-mention confidence
 
 ### Agent tools and prompts
 
+- Create: `bot/agent/tools_chat_memory.py`
+  - chat memory control and retrieval tool definitions/handlers
+- Create: `bot/agent/tools_people_memory.py`
+  - topic-scoped people signal tool definitions/handlers
 - Modify: `bot/agent/tools_meta.py`
-  - current meta MCP server already owns `get_recent_turns`,
-    subscriptions, and workspace/team lookup; chat/people memory
-    tools belong here unless implementation discovers a cleaner split
+  - import/register chat and people memory tools from the split modules
+  - do not grow this file with another 300-500 lines of handlers
 - Modify: `bot/agent/tools.py` only if the top-level tool bundle needs
   explicit wiring changes
   - add `get_recent_chat_messages`
   - add `search_chat_messages`
+  - add `search_chat_messages_with_context`
   - add `get_chat_window`
   - add `summarize_people_signal`
   - add `suggest_people_for_topic`
@@ -245,6 +264,8 @@ def test_0024_creates_chat_memory_tables():
     assert "create table if not exists public.people_memory" in sql
     assert "create table if not exists public.people_memory_updates" in sql
     assert "feishu_message_id" in sql
+    assert "people_loop_cursor" in sql
+    assert "content_metadata" in sql
     assert "sender_is_bot" in sql
     assert "edited_at" in sql
     assert "deleted_at" in sql
@@ -268,10 +289,14 @@ Expected: FAIL because migration does not exist.
 Create `0024_chat_memory.sql` with:
 
 - `chat_memory_settings` per spec §4.3
+  - includes `people_loop_cursor`
 - `chat_memory_settings_history` per spec §4.3
 - `chat_messages` per spec §4.4
   - `chat_id` references `chat_memory_settings(chat_id) on delete cascade`
-  - `sender_is_bot`, `edited_at`, `deleted_at`
+  - `sender_is_bot`, `message_type`, `content_metadata`, `edited_at`,
+    `deleted_at`
+  - `text_redacted` stores `[REDACTED]` rather than empty string when
+    the full visible text is redacted
 - `people_memory` per spec §5.1
   - includes `metadata jsonb` for note updater audit fields
 - `people_memory_updates` per spec §5.1
@@ -351,6 +376,8 @@ Cover:
 - `mark_chat_message_deleted(...)` sets deleted_at by message id
 - `update_chat_message_text(...)` updates text and edited_at by message id
 - `search_chat_messages(...)` constrains by chat_id
+- `search_chat_messages_with_context(...)` returns hits plus same-chat
+  windows
 - `get_chat_window(...)` never crosses chat_id
 - `upsert_people_memory(...)` writes by `person_key`
 - `record_people_memory_update(...)` writes audit rows
@@ -382,9 +409,10 @@ def mark_chat_message_deleted(message_id: str) -> bool: ...
 def update_chat_message_text(message_id: str, *, text_redacted: str, redacted_payload: dict, edited_at: str) -> bool: ...
 def get_recent_chat_messages(chat_id: str, *, since: str | None, until: str | None, limit: int = 80, sender: str | None = None) -> list[dict]: ...
 def search_chat_messages(chat_id: str, *, query: str, since: str | None, until: str | None, limit: int = 30) -> list[dict]: ...
+def search_chat_messages_with_context(chat_id: str, *, query: str, since: str | None, until: str | None, limit: int = 8, before: int = 8, after: int = 8) -> list[dict]: ...
 def get_chat_window(chat_id: str, *, anchor_message_id: str, before: int = 12, after: int = 12) -> list[dict]: ...
 def upsert_people_memory(person_key: str, **fields) -> dict: ...
-def people_memory_candidates(query: str, *, limit: int = 5) -> list[dict]: ...
+def people_memory_candidates(query: str, *, chat_id: str, limit: int = 5) -> list[dict]: ...
 def record_people_memory_update(person_key: str, *, update_source: str, model: str | None, input_tokens: int | None, output_tokens: int | None, old_note_hash: str | None, new_note_hash: str | None) -> dict: ...
 def people_memory_update_count(*, update_source: str, since: str) -> int: ...
 def merge_people_memory_identity(profile_id: str, feishu_open_id: str, *, display_name: str | None = None, handle: str | None = None) -> dict: ...
@@ -441,6 +469,10 @@ Tests:
    and excluded from default retrieval.
 8. Recall event sets `deleted_at`; edit event updates `text_redacted`
    and `edited_at`.
+9. `post` rich-text and shared-link/file metadata can be parsed into a
+   storable envelope without waking the conversational agent.
+10. Group message with bot identity unavailable returns `"not ready"`,
+    schedules no storage, and does not call `_handle_message`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -452,7 +484,7 @@ python -m pytest bot/tests/test_chat_memory.py -q
 
 Expected: FAIL.
 
-- [ ] **Step 3: Extend parsed Feishu event**
+- [ ] **Step 3: Extend parsed Feishu event as a standalone commit**
 
 Ensure `ParsedMessageEvent` exposes:
 
@@ -468,7 +500,24 @@ Ensure `ParsedMessageEvent` exposes:
 - `mentions`
 - `create_time` / occurred_at
 - `message_type`
+- `content_metadata` for supported shared link/chat/file facts
+- `bot_identity_ready` or equivalent confidence flag for `is_at_bot`
 - recall/edit event identifiers if Feishu supplies them
+
+Supported message boundary for Phase 1:
+
+- `text`: full redacted text
+- `post`: extracted rich-text plain text plus safe structured metadata
+- `share_chat` / link-like messages: title and URL metadata, if present
+- `file`: file name / title metadata only, no binary content
+- all other types: explicit `"unsupported"` / ignored path with tests
+
+Commit this parser-only step before changing webhook flow:
+
+```bash
+git add bot/feishu/events.py bot/tests/test_chat_memory.py
+git commit -m "feat(bot): parse Feishu chat memory envelopes"
+```
 
 - [ ] **Step 4: Implement ack-safe chat memory ingest**
 
@@ -504,6 +553,9 @@ Flow:
 parsed = feishu_events.parse_message_event(body)
 if parsed is None:
     return PlainTextResponse("ignored")
+
+if parsed.chat_type == "group" and not parsed.bot_identity_ready:
+    return PlainTextResponse("not ready")
 
 if parsed.chat_type == "group":
     enabled_hint = chat_memory_ingest.memory_enabled_hint(parsed.chat_id)
@@ -556,7 +608,8 @@ git commit -m "feat(bot): capture opted-in group messages"
 ## 7. Task 4 — Chat Memory Control Tools
 
 **Files:**
-- Modify: `bot/agent/tools_meta.py`
+- Create/modify: `bot/agent/tools_chat_memory.py`
+- Modify: `bot/agent/tools_meta.py` only to register/import the split module
 - Modify: `bot/agent/tools.py` only if needed for top-level wiring
 - Modify: `bot/agent/runner.py`
 - Test: `bot/tests/test_chat_memory.py`
@@ -620,7 +673,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add bot/agent/runner.py bot/agent/tools_meta.py bot/agent/tools.py bot/tests/test_chat_memory.py
+git add bot/agent/runner.py bot/agent/tools_chat_memory.py bot/agent/tools_meta.py bot/agent/tools.py bot/tests/test_chat_memory.py
 git commit -m "feat(bot): add chat memory control tools"
 ```
 
@@ -629,7 +682,8 @@ git commit -m "feat(bot): add chat memory control tools"
 ## 8. Task 5 — Passive Chat Retrieval Tools
 
 **Files:**
-- Modify: `bot/agent/tools_meta.py`
+- Modify: `bot/agent/tools_chat_memory.py`
+- Modify: `bot/agent/tools_meta.py` only to register/import the split module
 - Modify: `bot/agent/tools.py` only if needed for top-level wiring
 - Modify: `bot/agent/runner.py`
 - Test: `bot/tests/test_chat_memory.py`
@@ -640,6 +694,7 @@ Tests:
 
 - `get_recent_chat_messages` returns only current chat rows
 - `search_chat_messages` rejects caller-supplied `chat_id`
+- `search_chat_messages_with_context` rejects caller-supplied `chat_id`
 - `get_recent_chat_messages` rejects caller-supplied `chat_id`
 - `get_chat_window` rejects caller-supplied `chat_id`
 - `get_chat_window` returns ordered messages around anchor
@@ -665,6 +720,7 @@ Tool names and behavior:
 ```text
 get_recent_chat_messages(since?, until?, limit?, sender?)
 search_chat_messages(query, since?, until?, limit?)
+search_chat_messages_with_context(query, since?, until?, limit?, before?, after?)
 get_chat_window(anchor_message_id, before?, after?)
 ```
 
@@ -677,12 +733,20 @@ All tools:
 - return compact rows with timestamp, sender label, text, message_id
 - never expose raw payload
 
+`search_chat_messages_with_context` should be the preferred tool for
+natural language references such as "刚才那个"; it returns each hit plus
+same-chat context windows so the LLM does not need to invent an
+`anchor_message_id`.
+
 - [ ] **Step 4: Prompt update**
 
 Add rules:
 
 - For "刚才", "今天", "我们聊的", "达成一致", "TODO", "谁负责",
   use chat-memory tools before answering.
+- Prefer `search_chat_messages_with_context` for fuzzy references; use
+  `get_chat_window` only after a previous tool result gives an anchor
+  `message_id`.
 - If memory is disabled, say that and suggest enabling it.
 - Separate consensus from proposals.
 
@@ -709,7 +773,7 @@ Expected: all existing tests pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add bot/agent/runner.py bot/agent/tools_meta.py bot/agent/tools.py bot/db/queries.py bot/tests/test_chat_memory.py
+git add bot/agent/runner.py bot/agent/tools_chat_memory.py bot/agent/tools_meta.py bot/agent/tools.py bot/db/queries.py bot/tests/test_chat_memory.py
 git commit -m "feat(bot): add passive chat memory retrieval"
 ```
 
@@ -719,7 +783,8 @@ git commit -m "feat(bot): add passive chat memory retrieval"
 
 **Files:**
 - Create: `bot/chat_memory/people.py`
-- Modify: `bot/agent/tools_meta.py`
+- Create/modify: `bot/agent/tools_people_memory.py`
+- Modify: `bot/agent/tools_meta.py` only to register/import the split module
 - Modify: `bot/agent/tools.py` only if needed for top-level wiring
 - Modify: `bot/db/queries.py`
 - Test: `bot/tests/test_people_memory.py`
@@ -732,10 +797,14 @@ Cover:
 - unbound Feishu sender uses `feishu:{open_id}`
 - `summarize_people_signal("hellobit", topic=...)` returns a
   topic-scoped summary and never returns raw `pmo_notes`
+- `summarize_people_signal(...)` defaults to people observed in the
+  current chat
 - `suggest_people_for_topic(...)` returns "not enough signal" when no
   notes exist
 - `suggest_people_for_topic(...)` returns concise reasons, not raw note
   text
+- `suggest_people_for_topic(...)` does not recommend people only known
+  from another chat
 - conversational tool list does **not** include
   `update_people_memory_note`
 - conversational tool list does **not** include any raw
@@ -808,7 +877,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add bot/chat_memory/people.py bot/db/queries.py bot/agent/tools_meta.py bot/agent/tools.py bot/tests/test_people_memory.py
+git add bot/chat_memory/people.py bot/agent/tools_people_memory.py bot/db/queries.py bot/agent/tools_meta.py bot/agent/tools.py bot/tests/test_people_memory.py
 git commit -m "feat(bot): add PMO people memory notes"
 ```
 
@@ -884,6 +953,7 @@ git commit -m "feat(bot): merge people memory on Feishu binding"
 Tests:
 
 - loop selects only enabled chats with recent messages
+- loop selects messages after `chat_memory_settings.people_loop_cursor`
 - skips people with no new evidence
 - caps people/messages per run
 - enforces global daily rewrite cap
@@ -891,6 +961,7 @@ Tests:
 - debounces same-person rewrites within 10 minutes
 - writes note through `upsert_people_memory`
 - writes `people_memory_updates` audit row with source/model/token usage
+- advances `people_loop_cursor` only after a successful per-chat loop
 - daily cap is computed from `people_memory_updates`, so restart does
   not reset it
 - never sends Feishu messages
@@ -923,6 +994,11 @@ Loop defaults:
   '1 day'`
 - model: same lightweight model family used for classifier/gatekeeper
   unless current config says otherwise
+
+Cursor rule: each chat stores `people_loop_cursor`. The loop reads
+messages with `occurred_at > coalesce(people_loop_cursor, '-infinity')`
+plus a small overlap window if needed for context. It must not
+reprocess the same 80-message window forever.
 
 The loop can be disabled by env:
 
@@ -1144,6 +1220,8 @@ Assert table contains:
 - `observer_candidates_target_check`
 - `observer_feedback`
 - `is_valid_delivery_target` or equivalent shared target validator
+- `topic_key`
+- synthetic observer subscription helper or documented upsert path
 - `evidence_message_ids text[]`
 - `evidence_event_ids bigint[]`
 - `suggested_people text[]`
@@ -1158,6 +1236,10 @@ Create table per spec §6.3 plus indexes:
 - shared SQL target validator used by both `subscriptions` and
   `observer_candidates`; 0025 must replace or mirror 0023's
   `subs_target_check` through that helper
+- `topic_key text not null`, with `observer_candidates_chat_topic_time_idx`
+  on `(chat_id, topic_key, opened_at desc)`
+- helper/upsert path for synthetic observer subscription rows used to
+  satisfy `notifications.subscription_id not null`
 - `observer_candidates_status_idx`
 - `observer_candidates_chat_open_idx`
 - `observer_candidates_expires_idx`
@@ -1178,6 +1260,7 @@ def observer_feedback_for_chat(chat_id: str) -> list[dict]: ...
 def observer_notified_count_for_chat(chat_id: str, *, since: str) -> int: ...
 def observer_notified_count_for_target_user(open_id: str, *, since: str) -> int: ...
 def observer_recent_topic_notified(chat_id: str, topic_key: str, *, since: str) -> bool: ...
+def ensure_observer_subscription_for_target(chat_id: str, *, target_kind: str, target_id: str, target_user_open_id: str | None) -> str: ...
 ```
 
 - [ ] **Step 4: Run tests and commit**
@@ -1206,10 +1289,12 @@ Tests:
 
 - most observer runs produce no candidate
 - candidate output requires evidence message/event ids
+- candidate output requires stable `topic_key`
 - low confidence mention candidates are suppressed
 - per-chat daily cap blocks second delivery
 - per-user daily observer DM/@ cap blocks second delivery
-- same topic within 24h is suppressed using DB query
+- same `topic_key` within 24h is suppressed using DB query
+  against exact `topic_key`
 - budget survives loop restart because counts come from DB state
 - feedback table suppresses disabled candidate types/topics
 - observer never sends directly; it only opens candidates
@@ -1266,6 +1351,8 @@ Tests:
 - investigator can read evidence chat windows
 - renderer cannot add new facts outside investigator brief
 - target routing follows 2.0b target fields
+- observer notification rows use a synthetic observer subscription and
+  preserve `observer_candidates.notification_id`
 - feedback "这类提醒没用" suppresses future category
 
 - [ ] **Step 2: Add candidate claim path**
@@ -1286,8 +1373,14 @@ Before creating notification:
 
 - chat daily observer cap
 - user daily observer DM cap
-- same topic in last 24h
+- same `topic_key` in last 24h
 - disabled observer flag
+
+When creating notification:
+
+- call `ensure_observer_subscription_for_target(...)`
+- use that subscription id for `notifications.subscription_id`
+- link the created notification back to `observer_candidates.notification_id`
 
 - [ ] **Step 4: Run tests and commit**
 

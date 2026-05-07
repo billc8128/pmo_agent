@@ -52,10 +52,15 @@ until Phase 1 has enough real usage to tune trust and noise.
 ### In scope for Phase 1
 
 - Explicit opt-in / opt-out for recording a Feishu group
-- Store every text message in opted-in groups, including messages that
-  do not @ the bot
+- Store supported message facts in opted-in groups, including messages
+  that do not @ the bot:
+  - `text`
+  - `post` / rich-text as extracted redacted text
+  - shared-link / shared-chat / file metadata such as title, URL, and
+    file name, but not binary content
 - Redact obvious secrets before persistence
-- Keep original message text as the source of truth for later retrieval
+- Keep redacted message text and safe metadata as the fact layer for
+  later retrieval
 - Search tools for the current chat:
   - recent messages
   - keyword / semantic-ish search
@@ -82,7 +87,7 @@ until Phase 1 has enough real usage to tune trust and noise.
 - Recording groups without explicit opt-in
 - Recording DMs by default
 - Using private DM content to influence group-visible people notes
-- Files, images, voice, and reactions in the first cut
+- File/image/audio binary content and reactions in the first cut
 - Behavioral / performance judgment such as "X is unreliable" or "Y is
   slacking"
 - Auto-assigning tasks or modifying external systems
@@ -99,9 +104,9 @@ until Phase 1 has enough real usage to tune trust and noise.
    consented.
 2. **Silent means silent**. Non-@ messages in an enabled chat are stored
    and indexed only. They do not wake the conversational agent.
-3. **Raw chat text is the fact layer**. Summaries and people notes are
-   hints. Answers and proactive statements should be able to retrieve
-   supporting original messages.
+3. **Redacted chat messages are the fact layer**. Summaries and people
+   notes are hints. Answers and proactive statements should be able to
+   retrieve supporting redacted messages and safe metadata.
 4. **People memory is a PMO note, not a scorecard**. It is a natural
    language work-context note, not a structured ranking of humans.
 5. **Current chat by default**. A user asking in a chat can retrieve
@@ -119,10 +124,14 @@ until Phase 1 has enough real usage to tune trust and noise.
     lets one member enable memory must let any member disable it.
 11. **People notes are not directly disclosed**. Conversational tools
     expose topic-scoped people signals, not raw `pmo_notes`.
+12. **Bot-mention confidence gates storage**. If the bot cannot resolve
+    its own Feishu `open_id` for a group message, it must not guess
+    whether the message @s the bot. Return a short "not ready" ack and
+    do not store or answer that message.
 
 ---
 
-## 4. Phase 1A — Chat Memory
+## 4. Phase 1A/1B — Chat Memory
 
 ### 4.1 Opt-in UX
 
@@ -181,16 +190,23 @@ if parsed.chat_type == "group" and not parsed.is_at_bot:
 
 2.0c changes this to an ack-first flow:
 
-1. Parse the Feishu message event as today.
+1. Parse the Feishu message event into a neutral message envelope. Phase
+   1 supports `text`, `post`, shared-link/shared-chat metadata, and file
+   metadata. Unsupported message types can be ignored, but the decision
+   must be explicit in parser tests.
 2. Run existing webhook-level duplicate suppression
    (`event_id_of` / `already_seen`) before scheduling storage.
-3. If this is a group message, schedule best-effort storage in a
+3. If this is a group message and the bot identity cache is not ready,
+   return `"not ready"`. Do not store the message and do not call the
+   conversational agent; a wrong `is_at_bot` value is worse than missing
+   one memory row.
+4. If this is a group message, schedule best-effort storage in a
    background task. Storage must use a short TTL cache for
    `chat_memory_settings.enabled` and must not block the webhook ack.
-4. If it does not @ the bot, return `"stored"` if the cache says memory
+5. If it does not @ the bot, return `"stored"` if the cache says memory
    is enabled, otherwise `"group not addressed"`. Do not wait for the DB
    insert.
-5. If it @s the bot, continue into `_handle_message` as today.
+6. If it @s the bot, continue into `_handle_message` as today.
 
 Group messages in disabled chats still return `"group not addressed"`
 unless they @ the bot.
@@ -203,6 +219,12 @@ interactive reply path.
 Bot-authored messages are not required in Phase 1. If Feishu delivers
 the bot's own messages back to the app, the ingester should ignore them
 or mark `sender_is_bot=true` and exclude them from default search.
+
+Interactive behavior remains text-first: `_handle_message` only needs to
+answer for `text` / text-equivalent `post` messages in Phase 1. Shared
+files and links are persisted for later retrieval but do not have to
+wake the conversational agent unless Feishu presents them as text with a
+bot mention.
 
 Feishu recall/edit events are part of Phase 1 privacy semantics:
 
@@ -225,6 +247,7 @@ create table if not exists public.chat_memory_settings (
     disabled_by_open_id  text,
     retention_days       int not null default 90 check (retention_days between 1 and 730),
     observer_enabled     boolean not null default false,
+    people_loop_cursor   timestamptz,
     created_at           timestamptz not null default now(),
     updated_at           timestamptz not null default now()
 );
@@ -267,7 +290,10 @@ create table if not exists public.chat_messages (
     sender_open_id      text not null,
     sender_user_id      uuid references public.profiles(id) on delete set null,
     sender_display_name text,
-    message_type        text not null default 'text',
+    message_type        text not null default 'text' check (
+                          message_type in ('text', 'post', 'share_chat',
+                                           'file', 'link', 'unknown')
+                        ),
     text_redacted       text not null default '',
     is_at_bot           boolean not null default false,
     sender_is_bot       boolean not null default false,
@@ -275,6 +301,7 @@ create table if not exists public.chat_messages (
     root_message_id     text,
     mentions            jsonb not null default '[]'::jsonb,
     redacted_payload    jsonb not null default '{}'::jsonb,
+    content_metadata    jsonb not null default '{}'::jsonb,
     occurred_at         timestamptz not null,
     ingested_at         timestamptz not null default now(),
     edited_at           timestamptz,
@@ -302,7 +329,9 @@ create index chat_messages_deleted_idx
 
 `redacted_payload` is not the raw Feishu body. It is the parsed,
 redacted payload needed for debugging and future feature extraction.
-Raw encrypted event bodies are not stored.
+`content_metadata` stores safe structured facts such as shared-link
+title/URL, shared-chat title, or file name. Raw encrypted event bodies
+and file/image/audio bytes are not stored.
 
 Messages are idempotent by `feishu_message_id`. Re-delivery must not
 create duplicates. `event_id_of` / `already_seen` remains the first
@@ -312,6 +341,11 @@ cache.
 
 Retrieval tools exclude rows with `deleted_at is not null` and
 `sender_is_bot=true` by default.
+
+`text_redacted` should never be an empty string for a stored row. If
+all visible text is removed by redaction, store `[REDACTED]` so search
+and audit surfaces can distinguish "redacted content existed" from
+"there was no textual content."
 
 `to_tsvector('simple', ...)` is only a baseline index. It does not
 segment Chinese well, so Phase 1 relies on substring fallback for Chinese
@@ -406,6 +440,25 @@ Search should combine:
 Phase 1 does not require embeddings. If recall is poor, embeddings can
 be added later without changing the tool contract.
 
+#### `search_chat_messages_with_context`
+
+Preferred input for natural questions like "刚才那个方案怎么定的":
+
+```json
+{
+  "query": "vibelive 播放器方案",
+  "since": "2026-05-01T00:00:00+08:00",
+  "until": null,
+  "limit": 8,
+  "before": 8,
+  "after": 8
+}
+```
+
+Output returns each hit plus a same-chat message window around it. This
+is the default tool for "刚才 / 前面 / 那个" style questions because the
+LLM does not know Feishu `message_id` values upfront.
+
 #### `get_chat_window`
 
 Input:
@@ -422,6 +475,14 @@ Returns messages around the anchor in the same chat. This is the
 primary anti-hallucination tool: search finds candidates; window gives
 the conversation needed to answer.
 
+Typical chain:
+
+1. For a natural-language memory question, call
+   `search_chat_messages_with_context`.
+2. If the user points at a specific returned hit, call
+   `get_chat_window(anchor_message_id=...)` to expand context.
+3. Answer only after reading the window, not from a single search hit.
+
 ### 4.7 Answering contract
 
 When answering from chat memory, the bot should:
@@ -436,7 +497,7 @@ When answering from chat memory, the bot should:
 
 ---
 
-## 5. Phase 1B — People Memory
+## 5. Phase 1C — People Memory
 
 ### 5.1 Shape
 
@@ -469,6 +530,9 @@ create unique index people_memory_feishu_idx
     on public.people_memory (feishu_open_id)
     where feishu_open_id is not null;
 
+create index people_memory_last_observed_idx
+    on public.people_memory (last_observed_at desc);
+
 create table if not exists public.people_memory_updates (
     id             bigserial primary key,
     person_key     text not null references public.people_memory(person_key) on delete cascade,
@@ -498,6 +562,10 @@ create index people_memory_updates_person_time_idx
 
 If a `feishu:{open_id}` person later binds a PMO account, merge into
 `profile:{uuid}` and preserve / rewrite `pmo_notes`.
+
+People retrieval and suggestions are scoped to people observed in the
+current chat by default. Cross-chat people search is a separate
+permission surface and is out of scope for Phase 1.
 
 ### 5.1.1 Identity merge
 
@@ -605,7 +673,7 @@ Input:
 
 The tool reads matching raw `pmo_notes` server-side and returns a
 topic-scoped summary safe for conversational output. It must not return
-the raw note text.
+the raw note text. It defaults to people observed in the current chat.
 
 #### `suggest_people_for_topic`
 
@@ -619,7 +687,9 @@ Input:
 ```
 
 Returns candidate people with reasons derived from `pmo_notes` plus
-recent chat evidence.
+recent chat evidence. It defaults to people observed in the current
+chat and should not recommend someone known only from another chat
+unless a future permission design allows cross-chat people search.
 
 The tool should be conservative: if notes are thin, return "not enough
 signal" rather than guessing.
@@ -692,6 +762,7 @@ Observer produces zero or more candidates:
   "target_id": "oc_xxx",
   "target_user_open_id": null,
   "topic": "vibelive player dev push needs technical summary",
+  "topic_key": "vibelive:dev_push:tech_summary",
   "why_now": "The chat has an active request and a new repo push landed.",
   "evidence_message_ids": ["om_xxx"],
   "evidence_event_ids": [123],
@@ -725,6 +796,7 @@ create table if not exists public.observer_candidates (
     target_id              text not null,
     target_user_open_id    text,
     topic                  text not null,
+    topic_key              text not null,
     why_now                text,
     evidence_message_ids   text[] not null default '{}'::text[],
     evidence_event_ids     bigint[] not null default '{}'::bigint[],
@@ -768,9 +840,15 @@ create index observer_candidates_target_user_time_idx
       and status = 'notified';
 
 create index observer_candidates_chat_topic_time_idx
-    on public.observer_candidates (chat_id, topic, opened_at desc)
+    on public.observer_candidates (chat_id, topic_key, opened_at desc)
     where status = 'notified';
 ```
+
+`topic` is human-readable. `topic_key` is the stable dedupe key used for
+budgets and feedback, e.g. `vibelive:dev_push:tech_summary`. The
+observer prompt should produce a lowercase colon-separated slug with
+project/repo, event kind, and intent when those are known. Budget checks
+use exact `topic_key` match rather than fuzzy matching free text.
 
 Target semantics mirror 2.0b:
 
@@ -794,6 +872,26 @@ Later, if the implementation shows high overlap with
 schema separate so it does not destabilize subscription-driven
 notifications.
 
+### 6.3.1 Observer notifications and `subscription_id`
+
+`notifications.subscription_id` is `not null` in the 1.0c/2.0b schema.
+Do not make it nullable for observer delivery in 2.0c. Instead, create
+synthetic observer subscription rows on demand:
+
+- `scope_kind='chat'`
+- `scope_id=<source chat_id>`
+- `description='__system_observer__'`
+- `created_by=null`
+- `target_kind`, `target_id`, and `target_user_open_id` copied from the
+  observer candidate's validated target
+- metadata / comment marks the row as system-owned
+
+One synthetic row can be reused for the same source chat and delivery
+target. Observer-generated notification rows point at that synthetic
+subscription and also keep `observer_candidates.notification_id` for
+audit. This preserves the existing notification delivery path without
+pretending observer candidates are user-authored watch rules.
+
 ### 6.4 Trust budgets
 
 Defaults:
@@ -802,7 +900,8 @@ Defaults:
 - max 1 observer-generated DM per user per day
 - max 3 observer candidates investigated per chat per day
 - no observer @ mention if confidence is low
-- no observer delivery if the same topic was notified in the last 24h
+- no observer delivery if the same `topic_key` was notified in the last
+  24h
 
 Budgets are DB-backed. A deploy/restart must not reset observer caps.
 The implementation should count `observer_candidates` with
@@ -931,6 +1030,9 @@ Add to system prompt:
 - The current chat may have PMO memory.
 - For questions about "刚才 / 今天 / 我们聊的 / 达成一致 / todo / 谁适合",
   use chat-memory tools before answering.
+- For "刚才 / 前面 / 那个" questions, prefer
+  `search_chat_messages_with_context` first. Use `get_chat_window` only
+  after a search result gives you an anchor `message_id`.
 - For group memory, answer only from the current chat unless explicitly
   provided broader context.
 - If evidence is unclear, say so.
@@ -1063,3 +1165,7 @@ briefs.
 7. **Web self-inspection**: Phase 1.5 should add "what do you know about
    me?" and people-note correction UX. Phase 1 intentionally ships
    chat-only retrieval first.
+8. **Multi-IM identity model**: `feishu:{open_id}` is the only unbound
+   person prefix in 2.0c. If Slack or another IM is added, migrate to a
+   general `external:{platform}:{id}` identity model instead of adding
+   ad hoc prefixes indefinitely.
