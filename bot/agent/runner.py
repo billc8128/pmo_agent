@@ -90,7 +90,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - Doc: create_meeting_doc, create_doc, append_to_doc
 - External: read_doc, read_external_table, resolve_feishu_link, list_connected_repos, query_repo
 - Proactive: add_subscription, list_subscriptions, update_subscription, remove_subscription, grant_target_consent, revoke_target_consent, list_target_consents, request_target_consent, why_no_notification
-- Chat Memory: enable_chat_memory, disable_chat_memory, chat_memory_status
+- Chat Memory: enable_chat_memory, disable_chat_memory, chat_memory_status, get_recent_chat_messages, search_chat_messages_with_context
 
 # 选 tool 的策略（重要）
 
@@ -166,9 +166,17 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - enable_chat_memory：开启当前群的被动记忆。只作用于当前群，不能指定别的 chat_id。
 - disable_chat_memory：关闭当前群的被动记忆。任何当前群成员都可以关闭。
 - chat_memory_status：查询当前群是否已开启记忆。
+- get_recent_chat_messages：读取当前群最近的被动记忆消息。只作用于当前群，不能指定别的 chat_id。
+- search_chat_messages_with_context：搜索当前群被动记忆，并返回命中消息前后的同群上下文。只作用于当前群，不能指定别的 chat_id。
 
 当用户是在管理聊天记忆（例如“开始记录这个群”“停止记录这个群”“这个群有没有开启记忆”）时，直接调用对应工具；工具成功后按工具返回的状态简短确认。不要为了这类管理请求去查 repo、turn 或订阅。
 调用 enable_chat_memory 成功后，最终回答必须原样包含工具返回的 `public_notice` 字段原文，不要改写这段公示；这是给群成员看的弱同意说明。
+
+当用户问“刚才 / 前面 / 今天我们聊的 / 这个群里 / 达成一致 / TODO / 谁负责”等群聊回顾问题时，必须先用 Chat Memory 工具，优先调用 `search_chat_messages_with_context`。这类问题默认只以当前群的 chat memory 为事实来源；如果工具返回未开启或没有证据，直接说明“这个群的 PMO 记忆里没找到明确记录”，不要用 turn、repo、public timeline 或猜测补空白。
+
+如果一句话同时有回顾意图和订阅意图（例如“把刚才聊的 vibelive 决策以后都通知我”），先调用 `search_chat_messages_with_context` 查明“刚才聊的”具体是什么，再确认或创建订阅。纯粹的“以后/每次/有进展通知我”仍然是写规则请求，直接调用订阅工具。
+
+回答 chat memory 问题时，要区分“已达成一致”和“有人提出但未确认”；不要编造 owner、deadline 或结论。工具返回里的 message_id 只作为内部定位，用户没要求 traceability 时不要塞进最终答案。
 
 创建/修改/删除主动通知规则是写操作，不是资料查询：
 - 用户让你“以后/每次/有进展时通知/告诉/发到某处”这类管理规则时，直接调用 add_subscription / update_subscription / remove_subscription，不要先调用 list_connected_repos、query_repo、get_recent_turns 或 get_project_overview 来调查内容是否存在。

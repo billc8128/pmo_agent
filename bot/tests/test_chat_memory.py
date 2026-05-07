@@ -402,6 +402,78 @@ def test_recent_chat_messages_excludes_deleted_and_bot_rows(monkeypatch):
     assert "sender_open_id" not in rows[0]
 
 
+def test_search_chat_messages_with_context_uses_current_chat_and_chinese_substring(monkeypatch):
+    from db import queries
+
+    fake = _FakeSupabase()
+    fake.tables["chat_messages"] = [
+        {
+            "feishu_message_id": "om_1",
+            "chat_id": "oc_current",
+            "sender_display_name": "bcc",
+            "text_redacted": "vibelive 播放器方案确认了",
+            "occurred_at": "2026-05-07T10:00:00+08:00",
+            "deleted_at": None,
+            "sender_is_bot": False,
+        },
+        {
+            "feishu_message_id": "om_other",
+            "chat_id": "oc_other",
+            "sender_display_name": "other",
+            "text_redacted": "vibelive 播放器方案在别的群",
+            "occurred_at": "2026-05-07T10:01:00+08:00",
+            "deleted_at": None,
+            "sender_is_bot": False,
+        },
+        {
+            "feishu_message_id": "om_deleted",
+            "chat_id": "oc_current",
+            "sender_display_name": "bcc",
+            "text_redacted": "vibelive 已撤回",
+            "occurred_at": "2026-05-07T10:02:00+08:00",
+            "deleted_at": "2026-05-07T10:03:00+08:00",
+            "sender_is_bot": False,
+        },
+    ]
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    hits = queries.search_chat_messages_with_context("oc_current", query="播放器方案", limit=5, before=1, after=1)
+
+    assert len(hits) == 1
+    assert hits[0]["hit"]["message_id"] == "om_1"
+    assert [row["message_id"] for row in hits[0]["context"]] == ["om_1"]
+
+
+def test_search_chat_messages_with_context_anchor_returns_ordered_window(monkeypatch):
+    from db import queries
+
+    fake = _FakeSupabase()
+    fake.tables["chat_messages"] = [
+        {
+            "feishu_message_id": f"om_{i}",
+            "chat_id": "oc_current",
+            "sender_display_name": "bcc",
+            "text_redacted": f"消息 {i}",
+            "occurred_at": f"2026-05-07T10:0{i}:00+08:00",
+            "deleted_at": None,
+            "sender_is_bot": False,
+        }
+        for i in range(5)
+    ]
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    hits = queries.search_chat_messages_with_context(
+        "oc_current",
+        anchor_message_id="om_2",
+        before=1,
+        after=2,
+    )
+
+    assert len(hits) == 1
+    assert hits[0]["hit"]["message_id"] == "om_2"
+    assert [row["message_id"] for row in hits[0]["context"]] == ["om_1", "om_2", "om_3", "om_4"]
+
+
 def _message_body(*, message_type="text", content=None, mentions=None, create_time="1778126400000"):
     if content is None:
         content = {"text": "hi @_user_1"}
@@ -877,8 +949,15 @@ def test_chat_memory_tools_registered_in_meta_and_runner_prompt():
 
     names = {tool_def.name for tool_def in build_meta_tools(RequestContext())}
 
-    assert {"enable_chat_memory", "disable_chat_memory", "chat_memory_status"} <= names
+    assert {
+        "enable_chat_memory",
+        "disable_chat_memory",
+        "chat_memory_status",
+        "get_recent_chat_messages",
+        "search_chat_messages_with_context",
+    } <= names
     assert "mcp__pmo_meta__enable_chat_memory" in runner.SYSTEM_PROMPT or "enable_chat_memory" in runner.SYSTEM_PROMPT
+    assert "search_chat_messages_with_context" in runner.SYSTEM_PROMPT
     assert "开始记录这个群" in runner.SYSTEM_PROMPT
     assert "public_notice" in runner.SYSTEM_PROMPT
     assert "原样" in runner.SYSTEM_PROMPT
@@ -1007,6 +1086,77 @@ async def test_chat_memory_status_returns_structured_fields(monkeypatch):
         "observer_enabled": True,
         "chat_id": "oc_current",
     }
+
+
+@pytest.mark.anyio
+async def test_get_recent_chat_messages_tool_rejects_chat_id_and_uses_current_chat(monkeypatch):
+    from agent.request_context import RequestContext
+    from db import queries
+
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(queries, "chat_memory_status", lambda chat_id: {"enabled": True})
+    monkeypatch.setattr(
+        queries,
+        "get_recent_chat_messages",
+        lambda chat_id, **kwargs: calls.append((chat_id, kwargs["limit"]))
+        or [{"message_id": "om_1", "text": "当前群消息", "sent_at": "2026-05-07T10:00:00+08:00"}],
+    )
+
+    ctx = RequestContext(chat_type="group", chat_id="oc_current")
+    rejected = await _chat_memory_tool(ctx, "get_recent_chat_messages")({"chat_id": "oc_other"})
+    result = await _chat_memory_tool(ctx, "get_recent_chat_messages")({"limit": 999})
+    payload = content_payload(result)
+
+    assert rejected.get("isError") is True
+    assert "chat_id" in content_payload(rejected)["error"]
+    assert calls == [("oc_current", 120)]
+    assert payload["messages"][0]["message_id"] == "om_1"
+
+
+@pytest.mark.anyio
+async def test_search_chat_messages_with_context_tool_handles_disabled_and_search(monkeypatch):
+    from agent.request_context import RequestContext
+    from db import queries
+
+    calls: list[dict] = []
+
+    monkeypatch.setattr(queries, "chat_memory_status", lambda chat_id: {"enabled": chat_id == "oc_current"})
+    monkeypatch.setattr(
+        queries,
+        "search_chat_messages_with_context",
+        lambda chat_id, **kwargs: calls.append({"chat_id": chat_id, **kwargs})
+        or [
+            {
+                "hit": {"message_id": "om_2", "text": "vibelive 决策"},
+                "context": [{"message_id": "om_1", "text": "上一句"}, {"message_id": "om_2", "text": "vibelive 决策"}],
+            }
+        ],
+    )
+
+    disabled = await _chat_memory_tool(RequestContext(chat_type="group", chat_id="oc_disabled"), "search_chat_messages_with_context")({"query": "vibelive"})
+    ctx = RequestContext(chat_type="group", chat_id="oc_current")
+    result = await _chat_memory_tool(ctx, "search_chat_messages_with_context")(
+        {"query": "vibelive", "before": 99, "after": 99, "limit": 99}
+    )
+    rejected = await _chat_memory_tool(ctx, "search_chat_messages_with_context")({"query": "vibelive", "chat_id": "oc_other"})
+    payload = content_payload(result)
+
+    assert disabled.get("isError") is True
+    assert "未开启" in content_payload(disabled)["error"]
+    assert rejected.get("isError") is True
+    assert calls == [
+        {
+            "chat_id": "oc_current",
+            "query": "vibelive",
+            "anchor_message_id": None,
+            "since": None,
+            "until": None,
+            "limit": 8,
+            "before": 20,
+            "after": 20,
+        }
+    ]
+    assert payload["hits"][0]["hit"]["message_id"] == "om_2"
 
 
 @pytest.mark.anyio

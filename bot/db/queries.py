@@ -732,6 +732,132 @@ def _chat_message_public_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _chat_message_rows_for_chat(
+    chat_id: str,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 500,
+    order_desc: bool = False,
+) -> list[dict[str, Any]]:
+    q = (
+        sb_admin()
+        .table("chat_messages")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .is_("deleted_at", None)
+        .eq("sender_is_bot", False)
+        .order("occurred_at", desc=order_desc)
+        .limit(max(1, min(int(limit or 500), 1000)))
+    )
+    if since:
+        q = q.gte("occurred_at", since)
+    if until:
+        q = q.lte("occurred_at", until)
+    return q.execute().data or []
+
+
+def _chat_searchable_text(row: dict[str, Any]) -> str:
+    metadata = row.get("content_metadata") or {}
+    return " ".join(
+        part
+        for part in [
+            str(row.get("text_redacted") or ""),
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True) if metadata else "",
+            str(row.get("sender_display_name") or ""),
+        ]
+        if part
+    ).lower()
+
+
+def _chat_window_from_rows(
+    rows_asc: list[dict[str, Any]],
+    *,
+    anchor_message_id: str,
+    before: int,
+    after: int,
+) -> list[dict[str, Any]]:
+    idx = next(
+        (i for i, row in enumerate(rows_asc) if row.get("feishu_message_id") == anchor_message_id),
+        None,
+    )
+    if idx is None:
+        return []
+    start = max(0, idx - max(0, before))
+    end = min(len(rows_asc), idx + max(0, after) + 1)
+    return [_chat_message_public_row(row) for row in rows_asc[start:end]]
+
+
+def search_chat_messages_with_context(
+    chat_id: str,
+    *,
+    query: str | None = None,
+    anchor_message_id: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 8,
+    before: int = 8,
+    after: int = 8,
+) -> list[dict[str, Any]]:
+    capped_limit = max(1, min(int(limit or 8), 8))
+    capped_before = max(0, min(int(before or 0), 20))
+    capped_after = max(0, min(int(after or 0), 20))
+    rows_asc = _chat_message_rows_for_chat(
+        chat_id,
+        since=since,
+        until=until,
+        limit=1000,
+        order_desc=False,
+    )
+
+    if anchor_message_id:
+        anchor = next((row for row in rows_asc if row.get("feishu_message_id") == anchor_message_id), None)
+        if not anchor:
+            return []
+        return [
+            {
+                "hit": _chat_message_public_row(anchor),
+                "context": _chat_window_from_rows(
+                    rows_asc,
+                    anchor_message_id=anchor_message_id,
+                    before=capped_before,
+                    after=capped_after,
+                ),
+            }
+        ]
+
+    needle = (query or "").strip().lower()
+    if not needle:
+        return []
+    matches = [
+        row
+        for row in rows_asc
+        if needle in _chat_searchable_text(row)
+    ]
+    matches.sort(key=lambda row: str(row.get("occurred_at") or ""), reverse=True)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in matches:
+        message_id = row.get("feishu_message_id") or ""
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        out.append(
+            {
+                "hit": _chat_message_public_row(row),
+                "context": _chat_window_from_rows(
+                    rows_asc,
+                    anchor_message_id=message_id,
+                    before=capped_before,
+                    after=capped_after,
+                ),
+            }
+        )
+        if len(out) >= capped_limit:
+            break
+    return out
+
+
 def get_recent_chat_messages(
     chat_id: str,
     *,
