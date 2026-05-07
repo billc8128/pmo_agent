@@ -9,6 +9,7 @@ export type SubscriptionRuleRow = {
   created_at: string;
   updated_at: string | null;
   archived_at?: string | null;
+  created_by?: string | null;
   target_kind?: string | null;
   target_id?: string | null;
   target_user_open_id?: string | null;
@@ -52,12 +53,11 @@ export function toPublicNotificationRule(
   row: SubscriptionRuleRow,
   viewerUserId: string | null,
 ): PublicNotificationRule | null {
-  if (row.scope_kind !== 'user') return null;
   if (row.archived_at) return null;
 
   const owner = normalizeProfile(row.profiles);
   const description = validateRuleDescription(row.description ?? '');
-  const ownedByViewer = Boolean(viewerUserId && row.scope_id === viewerUserId);
+  const ownedByViewer = Boolean(viewerUserId && row.created_by === viewerUserId);
   return {
     viewKey: `${row.created_at}:${owner?.handle ?? 'unknown'}:${description.slice(0, 40)}`,
     subscriptionId: ownedByViewer ? row.id : null,

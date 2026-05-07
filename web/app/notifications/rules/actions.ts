@@ -59,8 +59,7 @@ export async function updateNotificationRule(formData: FormData) {
       updated_at: new Date().toISOString(),
     })
     .eq('id', id)
-    .eq('scope_kind', 'user')
-    .eq('scope_id', user.id)
+    .eq('created_by', user.id)
     .is('archived_at', null)
     .select('id')
     .maybeSingle();
@@ -90,8 +89,7 @@ export async function setNotificationRuleEnabled(id: string, enabled: boolean) {
       updated_at: new Date().toISOString(),
     })
     .eq('id', id)
-    .eq('scope_kind', 'user')
-    .eq('scope_id', user.id)
+    .eq('created_by', user.id)
     .is('archived_at', null)
     .select('id')
     .maybeSingle();
@@ -117,8 +115,7 @@ export async function archiveNotificationRule(id: string) {
       updated_at: now,
     })
     .eq('id', id)
-    .eq('scope_kind', 'user')
-    .eq('scope_id', user.id)
+    .eq('created_by', user.id)
     .is('archived_at', null)
     .select('id')
     .maybeSingle();
