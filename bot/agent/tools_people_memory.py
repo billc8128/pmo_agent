@@ -42,17 +42,17 @@ def _cap_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
 
 def build_people_memory_tools(ctx: RequestContext):
     @tool(
-        "summarize_people_signal",
-        "Summarize PMO people-memory signals for people observed in the current Feishu group. Returns topic-scoped summaries only, never raw notes. Does not accept chat_id.",
+        "get_people_context",
+        "Read already-distilled PMO people context for people observed in the current Feishu group. Returns topic-scoped context only, never internal ids. Does not accept chat_id.",
         {"query": str | None, "topic": str | None},
     )
-    async def summarize_people_signal(args: dict) -> dict[str, Any]:
+    async def get_people_context(args: dict) -> dict[str, Any]:
         started = time.monotonic()
         try:
             rejected = _reject_unexpected_chat_id(args)
             if rejected:
                 logger.warning(
-                    "people_memory_tool_rejected tool=summarize_people_signal reason=unexpected_chat_id chat=%s",
+                    "people_memory_tool_rejected tool=get_people_context reason=unexpected_chat_id chat=%s",
                     ctx.chat_id,
                 )
                 return rejected
@@ -67,7 +67,7 @@ def build_people_memory_tools(ctx: RequestContext):
                 if (summary := people.people_signal_summary(row, topic=topic))
             ]
             logger.info(
-                "people_memory_tool tool=summarize_people_signal chat=%s row_count=%d returned=%d latency_ms=%d",
+                "people_memory_tool tool=get_people_context chat=%s row_count=%d returned=%d latency_ms=%d",
                 chat_id,
                 len(rows),
                 len(summaries),
@@ -85,7 +85,7 @@ def build_people_memory_tools(ctx: RequestContext):
             return ok({"people": summaries[:10], "count": len(summaries[:10])})
         except Exception as e:
             logger.info(
-                "people_memory_tool tool=summarize_people_signal chat=%s error=%s latency_ms=%d",
+                "people_memory_tool tool=get_people_context chat=%s error=%s latency_ms=%d",
                 ctx.chat_id,
                 type(e).__name__,
                 int((time.monotonic() - started) * 1000),
@@ -146,4 +146,4 @@ def build_people_memory_tools(ctx: RequestContext):
             )
             return err(str(e))
 
-    return [summarize_people_signal, suggest_people_for_topic]
+    return [get_people_context, suggest_people_for_topic]

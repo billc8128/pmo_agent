@@ -173,14 +173,14 @@ def test_people_memory_tools_registered_without_raw_writer():
     names = {tool_def.name for tool_def in tool_defs}
     schemas = {tool_def.name: tool_def.input_schema for tool_def in tool_defs}
 
-    assert "summarize_people_signal" in names
+    assert "get_people_context" in names
     assert "suggest_people_for_topic" in names
     assert "update_people_memory_note" not in names
     assert "get_people_memory" not in names
-    assert "chat_id" not in schemas["summarize_people_signal"]
+    assert "chat_id" not in schemas["get_people_context"]
     assert "chat_id" not in schemas["suggest_people_for_topic"]
     runner_source = inspect.getsource(runner._get_client)
-    assert "mcp__pmo_meta__summarize_people_signal" in runner_source
+    assert "mcp__pmo_meta__get_people_context" in runner_source
     assert "mcp__pmo_meta__suggest_people_for_topic" in runner_source
     assert "不要逐字暴露 people memory" in runner.SYSTEM_PROMPT
 
@@ -237,7 +237,7 @@ def test_people_memory_for_chat_scopes_to_current_chat(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_summarize_people_signal_scopes_and_hides_raw_note(monkeypatch):
+async def test_get_people_context_scopes_and_hides_raw_note(monkeypatch):
     from agent.request_context import RequestContext
     from db import queries
 
@@ -257,7 +257,7 @@ async def test_summarize_people_signal_scopes_and_hides_raw_note(monkeypatch):
     )
 
     ctx = RequestContext(chat_type="group", chat_id="oc_current")
-    result = await _people_tool(ctx, "summarize_people_signal")(
+    result = await _people_tool(ctx, "get_people_context")(
         {"query": "Alice", "topic": "vibelive 播放器"}
     )
     payload = content_payload(result)
