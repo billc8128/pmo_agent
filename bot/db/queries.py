@@ -475,9 +475,9 @@ def list_external_repos(query: str | None = None, limit: int = 20) -> list[dict[
     return rows[:limit]
 
 
-def is_chat_memory_enabled(chat_id: str) -> bool:
+def chat_memory_enabled_state(chat_id: str) -> bool | None:
     if not chat_id:
-        return False
+        return None
     row = (
         sb_admin()
         .table("chat_memory_settings")
@@ -487,7 +487,13 @@ def is_chat_memory_enabled(chat_id: str) -> bool:
         .execute()
         .data
     )
-    return bool(row and row.get("enabled"))
+    if row is None:
+        return None
+    return bool(row.get("enabled"))
+
+
+def is_chat_memory_enabled(chat_id: str) -> bool:
+    return chat_memory_enabled_state(chat_id) is True
 
 
 def _insert_chat_memory_history(
@@ -520,6 +526,42 @@ def enable_chat_memory(
 ) -> dict[str, Any]:
     retention = max(1, min(int(retention_days or 90), 730))
     now = _utc_now_iso()
+    current = chat_memory_status(chat_id)
+    if current and current.get("enabled") is True:
+        current_retention = int(current.get("retention_days") or 90)
+        cleanup_payload: dict[str, Any] = {}
+        if current.get("disabled_at") is not None:
+            cleanup_payload["disabled_at"] = None
+        if current.get("disabled_by_user_id") is not None:
+            cleanup_payload["disabled_by_user_id"] = None
+        if current.get("disabled_by_open_id") is not None:
+            cleanup_payload["disabled_by_open_id"] = None
+        if current_retention == retention and not cleanup_payload:
+            return current
+        payload = {
+            **cleanup_payload,
+            "retention_days": retention,
+            "updated_at": now,
+        }
+        res = (
+            sb_admin()
+            .table("chat_memory_settings")
+            .update(payload)
+            .eq("chat_id", chat_id)
+            .execute()
+        )
+        row = (res.data or [{**current, **payload}])[0]
+        if current_retention != retention:
+            _insert_chat_memory_history(
+                chat_id=chat_id,
+                action="retention_change",
+                user_id=user_id,
+                open_id=open_id,
+                old_value={"retention_days": current_retention},
+                new_value={"retention_days": retention},
+            )
+        return row
+
     payload = {
         "chat_id": chat_id,
         "enabled": True,
@@ -544,6 +586,7 @@ def enable_chat_memory(
         action="enable",
         user_id=user_id,
         open_id=open_id,
+        old_value={"enabled": bool(current.get("enabled"))} if current else None,
         new_value={"enabled": True, "retention_days": retention},
     )
     return row
@@ -556,26 +599,60 @@ def disable_chat_memory(
     open_id: str | None,
 ) -> dict[str, Any]:
     now = _utc_now_iso()
+    current = chat_memory_status(chat_id)
+    if current and current.get("enabled") is False:
+        cleanup_payload: dict[str, Any] = {}
+        if current.get("enabled_at") is not None:
+            cleanup_payload["enabled_at"] = None
+        if current.get("enabled_by_user_id") is not None:
+            cleanup_payload["enabled_by_user_id"] = None
+        if current.get("enabled_by_open_id") is not None:
+            cleanup_payload["enabled_by_open_id"] = None
+        if not cleanup_payload:
+            return current
+        cleanup_payload["updated_at"] = now
+        res = (
+            sb_admin()
+            .table("chat_memory_settings")
+            .update(cleanup_payload)
+            .eq("chat_id", chat_id)
+            .execute()
+        )
+        return (res.data or [{**current, **cleanup_payload}])[0]
+
     payload = {
+        "chat_id": chat_id,
         "enabled": False,
+        "enabled_at": None,
+        "enabled_by_user_id": None,
+        "enabled_by_open_id": None,
         "disabled_at": now,
         "disabled_by_user_id": user_id,
         "disabled_by_open_id": open_id,
         "updated_at": now,
     }
-    res = (
-        sb_admin()
-        .table("chat_memory_settings")
-        .update(payload)
-        .eq("chat_id", chat_id)
-        .execute()
-    )
-    row = (res.data or [{**payload, "chat_id": chat_id}])[0]
+    if current:
+        res = (
+            sb_admin()
+            .table("chat_memory_settings")
+            .update(payload)
+            .eq("chat_id", chat_id)
+            .execute()
+        )
+    else:
+        res = (
+            sb_admin()
+            .table("chat_memory_settings")
+            .upsert(payload, on_conflict="chat_id")
+            .execute()
+        )
+    row = (res.data or [payload])[0]
     _insert_chat_memory_history(
         chat_id=chat_id,
         action="disable",
         user_id=user_id,
         open_id=open_id,
+        old_value={"enabled": bool(current.get("enabled"))} if current else None,
         new_value={"enabled": False},
     )
     return row

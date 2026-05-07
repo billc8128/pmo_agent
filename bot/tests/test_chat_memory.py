@@ -244,6 +244,46 @@ def test_chat_memory_setting_helpers_write_history(monkeypatch):
     ]
 
 
+def test_chat_memory_settings_are_idempotent_and_reset_current_actor_fields(monkeypatch):
+    from db import queries
+
+    fake = _FakeSupabase()
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    queries.enable_chat_memory("oc_1", user_id="profile-1", open_id="ou_1", retention_days=30)
+    queries.enable_chat_memory("oc_1", user_id="profile-1", open_id="ou_1", retention_days=30)
+    disabled = queries.disable_chat_memory("oc_1", user_id="profile-2", open_id="ou_2")
+    disabled_again = queries.disable_chat_memory("oc_1", user_id="profile-2", open_id="ou_2")
+
+    assert [row["action"] for row in fake.tables["chat_memory_settings_history"]] == [
+        "enable",
+        "disable",
+    ]
+    assert disabled["enabled"] is False
+    assert disabled_again["enabled"] is False
+    assert disabled["enabled_at"] is None
+    assert disabled["enabled_by_user_id"] is None
+    assert disabled["enabled_by_open_id"] is None
+    assert disabled["disabled_by_user_id"] == "profile-2"
+    assert disabled["disabled_by_open_id"] == "ou_2"
+
+
+def test_chat_memory_enabled_state_distinguishes_enabled_disabled_unconfigured(monkeypatch):
+    from db import queries
+
+    fake = _FakeSupabase()
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    assert queries.chat_memory_enabled_state("oc_missing") is None
+    queries.enable_chat_memory("oc_enabled", user_id=None, open_id="ou_1")
+    queries.enable_chat_memory("oc_disabled", user_id=None, open_id="ou_1")
+    queries.disable_chat_memory("oc_disabled", user_id=None, open_id="ou_2")
+
+    assert queries.chat_memory_enabled_state("oc_enabled") is True
+    assert queries.chat_memory_enabled_state("oc_disabled") is False
+    assert queries.is_chat_memory_enabled("oc_missing") is False
+
+
 def test_chat_message_helpers_are_idempotent_and_support_recall_edit(monkeypatch):
     from db import queries
 
@@ -501,7 +541,7 @@ async def test_store_message_if_enabled_redacts_and_inserts(monkeypatch):
     from feishu.events import ParsedMessageEvent
 
     inserted: list[dict] = []
-    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: chat_id == "oc_1")
+    monkeypatch.setattr(queries, "chat_memory_enabled_state", lambda chat_id: chat_id == "oc_1")
     monkeypatch.setattr(queries, "insert_chat_message", lambda row: inserted.append(row) or row)
 
     stored = await ingest.store_message_if_enabled(
@@ -541,7 +581,7 @@ async def test_store_message_if_enabled_keeps_file_text_empty_and_uses_metadata(
     from feishu.events import ParsedMessageEvent
 
     inserted: list[dict] = []
-    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: True)
+    monkeypatch.setattr(queries, "chat_memory_enabled_state", lambda chat_id: True)
     monkeypatch.setattr(queries, "insert_chat_message", lambda row: inserted.append(row) or row)
 
     stored = await ingest.store_message_if_enabled(
@@ -557,6 +597,7 @@ async def test_store_message_if_enabled_keeps_file_text_empty_and_uses_metadata(
             is_at_bot=False,
             message_type="file",
             content_metadata={"file_name": "方案.pdf"},
+            occurred_at="2026-05-07T10:00:00+00:00",
         )
     )
 
@@ -572,7 +613,7 @@ async def test_store_message_if_enabled_skips_disabled_chat(monkeypatch):
     from db import queries
     from feishu.events import ParsedMessageEvent
 
-    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: False)
+    monkeypatch.setattr(queries, "chat_memory_enabled_state", lambda chat_id: False)
     monkeypatch.setattr(queries, "insert_chat_message", lambda row: (_ for _ in ()).throw(AssertionError("must not insert")))
 
     stored = await ingest.store_message_if_enabled(
@@ -594,12 +635,65 @@ async def test_store_message_if_enabled_skips_disabled_chat(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_store_message_if_enabled_rejects_unconfigured_chat_and_caches_false(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageEvent
+
+    monkeypatch.setattr(queries, "chat_memory_enabled_state", lambda chat_id: None)
+    monkeypatch.setattr(queries, "insert_chat_message", lambda row: (_ for _ in ()).throw(AssertionError("must not insert")))
+
+    stored = await ingest.store_message_if_enabled(
+        ParsedMessageEvent(
+            event_id="evt-unconfigured",
+            chat_id="oc_unconfigured",
+            chat_type="group",
+            sender_open_id="ou_sender",
+            sender_chat_member_id=None,
+            message_id="om_unconfigured",
+            parent_message_id="",
+            text="hello",
+            is_at_bot=False,
+        )
+    )
+
+    assert stored is False
+    assert ingest.should_schedule_storage("oc_unconfigured") is False
+
+
+@pytest.mark.anyio
+async def test_store_message_if_enabled_rejects_missing_occurred_at(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageEvent
+
+    monkeypatch.setattr(queries, "chat_memory_enabled_state", lambda chat_id: True)
+    monkeypatch.setattr(queries, "insert_chat_message", lambda row: (_ for _ in ()).throw(AssertionError("must not insert")))
+
+    stored = await ingest.store_message_if_enabled(
+        ParsedMessageEvent(
+            event_id="evt-no-time",
+            chat_id="oc_1",
+            chat_type="group",
+            sender_open_id="ou_sender",
+            sender_chat_member_id=None,
+            message_id="om_no_time",
+            parent_message_id="",
+            text="hello",
+            is_at_bot=False,
+        )
+    )
+
+    assert stored is False
+
+
+@pytest.mark.anyio
 async def test_store_message_if_enabled_skips_bot_sender(monkeypatch):
     from chat_memory import ingest
     from db import queries
     from feishu.events import ParsedMessageEvent
 
-    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: True)
+    monkeypatch.setattr(queries, "chat_memory_enabled_state", lambda chat_id: True)
     monkeypatch.setattr(queries, "insert_chat_message", lambda row: (_ for _ in ()).throw(AssertionError("must not insert")))
 
     stored = await ingest.store_message_if_enabled(
@@ -740,6 +834,29 @@ async def test_enable_chat_memory_uses_current_chat_and_returns_notice(monkeypat
 
 
 @pytest.mark.anyio
+async def test_enable_chat_memory_defaults_retention_to_90(monkeypatch):
+    from agent.request_context import RequestContext
+    from chat_memory import ingest
+    from db import queries
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        queries,
+        "enable_chat_memory",
+        lambda chat_id, *, user_id, open_id, retention_days: calls.append(retention_days)
+        or {"chat_id": chat_id, "enabled": True, "retention_days": retention_days},
+    )
+    monkeypatch.setattr(ingest, "invalidate_chat_memory_cache", lambda chat_id=None: None)
+
+    ctx = RequestContext(chat_type="group", chat_id="oc_current", sender_open_id="ou_actor", asker_user_id="profile-1")
+    result = await _chat_memory_tool(ctx, "enable_chat_memory")({})
+    payload = content_payload(result)
+
+    assert calls == [90]
+    assert payload["settings"]["retention_days"] == 90
+
+
+@pytest.mark.anyio
 async def test_disable_chat_memory_uses_current_chat_for_any_member(monkeypatch):
     from agent.request_context import RequestContext
     from chat_memory import ingest
@@ -779,6 +896,7 @@ async def test_chat_memory_status_returns_structured_fields(monkeypatch):
             "enabled_by_user_id": "profile-1",
             "enabled_by_open_id": "ou_actor",
             "retention_days": 90,
+            "observer_enabled": True,
         },
     )
 
@@ -791,7 +909,7 @@ async def test_chat_memory_status_returns_structured_fields(monkeypatch):
         "enabled_at": "2026-05-07T10:00:00+00:00",
         "enabled_by": {"user_id": "profile-1", "open_id": "ou_actor"},
         "retention_days": 90,
-        "observer_enabled": False,
+        "observer_enabled": True,
         "chat_id": "oc_current",
     }
 
@@ -967,7 +1085,37 @@ async def test_feishu_webhook_applies_message_mutation_without_agent(monkeypatch
     )
 
     response = await bot_app.feishu_webhook(_FakeRequest(body))
-    await asyncio.sleep(0)
 
     assert response.body == b"ok"
     assert applied == ["om_recalled"]
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_message_mutation_failure_returns_500(monkeypatch):
+    import app as bot_app
+
+    body = {
+        "header": {"event_id": "evt_webhook_recall_fail", "event_type": "im.message.recalled_v1"},
+        "event": {
+            "message": {
+                "message_id": "om_recalled",
+                "chat_id": "oc_1",
+                "chat_type": "group",
+            }
+        },
+    }
+
+    async def fail_apply(mutation):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "apply_message_mutation", fail_apply)
+    monkeypatch.setattr(
+        bot_app,
+        "_handle_message",
+        lambda parsed: (_ for _ in ()).throw(AssertionError("mutation events must not enter agent")),
+    )
+
+    response = await bot_app.feishu_webhook(_FakeRequest(body))
+
+    assert response.status_code == 500
+    assert response.body == b"mutation error"

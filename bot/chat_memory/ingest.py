@@ -94,11 +94,21 @@ async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
         )
         return False
 
-    enabled = queries.is_chat_memory_enabled(ev.chat_id)
-    _cache_set(ev.chat_id, enabled)
-    if not enabled:
+    state = queries.chat_memory_enabled_state(ev.chat_id)
+    _cache_set(ev.chat_id, state is True)
+    if state is not True:
+        reason = "unconfigured" if state is None else "disabled"
         logger.info(
-            "chat_memory_ingest_skipped chat=%s message=%s reason=disabled",
+            "chat_memory_ingest_skipped chat=%s message=%s reason=%s",
+            ev.chat_id,
+            ev.message_id,
+            reason,
+        )
+        return False
+
+    if not ev.occurred_at:
+        logger.warning(
+            "chat_memory_ingest_skipped chat=%s message=%s reason=missing_occurred_at",
             ev.chat_id,
             ev.message_id,
         )
@@ -127,7 +137,7 @@ async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
         "mentions": ev.mentions,
         "is_at_bot": ev.is_at_bot,
         "sender_is_bot": ev.sender_is_bot,
-        "occurred_at": ev.occurred_at or _now_iso(),
+        "occurred_at": ev.occurred_at,
     }
     queries.insert_chat_message(row)
     logger.info(

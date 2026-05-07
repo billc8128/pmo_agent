@@ -33,7 +33,7 @@ def _status_payload(row: dict[str, Any] | None, chat_id: str) -> dict[str, Any]:
             "open_id": row.get("enabled_by_open_id"),
         },
         "retention_days": int(row.get("retention_days") or 90),
-        "observer_enabled": False,
+        "observer_enabled": bool(row.get("observer_enabled")),
         "chat_id": chat_id,
     }
 
@@ -42,7 +42,7 @@ def build_chat_memory_tools(ctx: RequestContext):
     @tool(
         "enable_chat_memory",
         "Enable passive PMO chat memory for the current Feishu group. Uses the current chat only; does not accept arbitrary chat_id.",
-        {"retention_days": int},
+        {"retention_days": int | None},
     )
     async def enable_chat_memory(args: dict) -> dict[str, Any]:
         try:
@@ -118,4 +118,3 @@ def build_chat_memory_tools(ctx: RequestContext):
             return err(str(e))
 
     return [enable_chat_memory, disable_chat_memory, chat_memory_status]
-

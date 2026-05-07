@@ -116,7 +116,16 @@ async def feishu_webhook(request: Request):
     # depend on the bot's own open_id because no @-mention decision is involved.
     mutation = feishu_events.parse_message_mutation_event(body)
     if mutation is not None:
-        asyncio.create_task(_apply_chat_memory_mutation(mutation))
+        try:
+            await chat_memory_ingest.apply_message_mutation(mutation)
+        except Exception:
+            logger.exception(
+                "chat memory mutation failed: chat=%s message=%s action=%s",
+                mutation.chat_id,
+                mutation.message_id,
+                mutation.action,
+            )
+            return PlainTextResponse("mutation error", status_code=500)
         return PlainTextResponse("ok")
 
     parsed = feishu_events.parse_message_event(body)
@@ -148,18 +157,6 @@ async def _store_chat_memory_message(parsed: feishu_events.ParsedMessageEvent) -
             "chat memory background ingest failed: chat=%s message=%s",
             parsed.chat_id,
             parsed.message_id,
-        )
-
-
-async def _apply_chat_memory_mutation(mutation: feishu_events.ParsedMessageMutationEvent) -> None:
-    try:
-        await chat_memory_ingest.apply_message_mutation(mutation)
-    except Exception:
-        logger.exception(
-            "chat memory mutation failed: chat=%s message=%s action=%s",
-            mutation.chat_id,
-            mutation.message_id,
-            mutation.action,
         )
 
 
