@@ -364,9 +364,10 @@ def test_redaction_covers_common_external_secret_shapes():
         "hook=https://open.feishu.cn/open-apis/bot/v2/hook/12345678-1234-1234-1234-1234567890ab",
     ]
 
-    redacted, count = redact_text("\n".join(samples))
+    redacted, categories = redact_text("\n".join(samples))
 
-    assert count >= len(samples)
+    assert sum(categories.values()) >= len(samples)
+    assert categories["token"] >= len(samples)
     assert "eyJhbGciOi" not in redacted
     assert "sk_" + "live_" not in redacted
     assert "Bearer ghp_" not in redacted

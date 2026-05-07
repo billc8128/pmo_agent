@@ -44,6 +44,11 @@ def _bump(categories: dict[str, int], category: str, count: int) -> None:
         categories[category] = categories.get(category, 0) + count
 
 
+def _merge_categories(target: dict[str, int], source: dict[str, int]) -> None:
+    for category, count in source.items():
+        _bump(target, category, count)
+
+
 def _luhn_valid(digits: str) -> bool:
     if len(digits) < 13 or len(digits) > 19 or not digits.isdigit():
         return False
@@ -103,29 +108,27 @@ def redact_text_with_categories(value: str) -> tuple[str, dict[str, int]]:
     return redacted, categories
 
 
-def redact_text(value: str) -> tuple[str, int]:
-    redacted, categories = redact_text_with_categories(value)
-    count = sum(categories.values())
-    return redacted, count
+def redact_text(value: str) -> tuple[str, dict[str, int]]:
+    return redact_text_with_categories(value)
 
 
-def redact_payload(value: Any) -> tuple[Any, int]:
+def redact_payload(value: Any) -> tuple[Any, dict[str, int]]:
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, list):
-        total = 0
+        categories: dict[str, int] = {}
         out = []
         for item in value:
-            redacted, count = redact_payload(item)
+            redacted, item_categories = redact_payload(item)
             out.append(redacted)
-            total += count
-        return out, total
+            _merge_categories(categories, item_categories)
+        return out, categories
     if isinstance(value, dict):
-        total = 0
+        categories: dict[str, int] = {}
         out: dict[str, Any] = {}
         for key, item in value.items():
-            redacted, count = redact_payload(item)
+            redacted, item_categories = redact_payload(item)
             out[key] = redacted
-            total += count
-        return out, total
-    return value, 0
+            _merge_categories(categories, item_categories)
+        return out, categories
+    return value, {}

@@ -74,9 +74,9 @@ async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: 
     redaction_hits_total = 0
     for row in rows[:30] if isinstance(rows, list) else []:
         patch = row.get("patch") or ""
-        redacted_patch, redaction_hits = redact_text(patch) if patch else ("", 0)
+        redacted_patch, redaction_categories = redact_text(patch) if patch else ("", {})
         patch_excerpt = redacted_patch[:200]
-        redaction_hits_total += redaction_hits
+        redaction_hits_total += sum(redaction_categories.values())
         files.append(
             {
                 "path": row.get("filename") or row.get("path") or "",
@@ -342,7 +342,8 @@ async def _fetch_file(
     if isinstance(row, list):
         raise ValueError("path is a directory, use kind=tree")
     content = _decode_content_blob(row)
-    redacted, redaction_hits = redact_text(content)
+    redacted, redaction_categories = redact_text(content)
+    redaction_hits = sum(redaction_categories.values())
     truncated = len(redacted) > max_chars
     if truncated:
         redacted = redacted[:max_chars] + f"\n\n[... file truncated, {len(redacted) - max_chars} chars omitted]"

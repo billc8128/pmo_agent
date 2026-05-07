@@ -154,11 +154,12 @@ def test_chat_redaction_patterns_cover_private_chat_shapes():
         ]
     )
 
-    redacted, count = redact_text(text)
+    redacted, text_categories = redact_text(text)
     categorized_redacted, categories = redact_text_with_categories(text)
 
-    assert count >= 8
+    assert sum(text_categories.values()) >= 8
     assert categorized_redacted == redacted
+    assert text_categories == categories
     assert categories["email"] == 1
     assert categories["phone"] >= 1
     assert categories["id_card"] == 1
@@ -186,6 +187,24 @@ def test_chat_redaction_does_not_redact_arbitrary_long_numbers_as_payment_cards(
 
     assert "1234567890123" in redacted
     assert categories.get("payment_card", 0) == 0
+
+
+def test_redact_payload_returns_categories_recursively():
+    from external.redaction import redact_payload
+
+    payload = {
+        "body": "contact albert@vibelive.com",
+        "nested": ["token=abc123", {"hook": "https://open.feishu.cn/open-apis/bot/v2/hook/secret-token"}],
+    }
+
+    redacted, categories = redact_payload(payload)
+
+    assert redacted["body"] == "contact [REDACTED]"
+    assert redacted["nested"][0] == "token=[REDACTED]"
+    assert redacted["nested"][1]["hook"] == "[REDACTED]"
+    assert categories["email"] == 1
+    assert categories["assignment"] == 1
+    assert categories["token"] == 1
 
 
 def test_migration_0024_creates_chat_memory_tables():
@@ -679,6 +698,7 @@ async def test_store_message_if_enabled_redacts_content_metadata(monkeypatch):
     assert stored is True
     assert inserted[0]["content_metadata"]["url"] == "[REDACTED]"
     assert inserted[0]["redacted_payload"]["content_metadata"]["url"] == "[REDACTED]"
+    assert inserted[0]["redacted_payload"]["redaction_categories"]["token"] == 1
     assert inserted[0]["redacted_payload"]["metadata_redaction_count"] == 1
 
 

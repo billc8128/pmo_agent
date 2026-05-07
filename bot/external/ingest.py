@@ -130,7 +130,8 @@ async def ingest_external_event(
     log_provider = safe_log_value(provider)
     log_event_type = safe_log_value(event_type)
     log_delivery_id = safe_log_value(delivery_id)
-    payload, redaction_hits = redact_payload(payload)
+    payload, redaction_categories = redact_payload(payload)
+    redaction_hits = sum(redaction_categories.values())
     archive_id = queries.archive_external_delivery(
         provider=provider,
         delivery_id=delivery_id,
@@ -139,12 +140,13 @@ async def ingest_external_event(
         raw_headers=_safe_headers(headers or {}),
     )
     logger.info(
-        "webhook.archived provider=%s event_type=%s delivery_id=%s archive_id=%s redaction_hits=%s",
+        "webhook.archived provider=%s event_type=%s delivery_id=%s archive_id=%s redaction_hits=%s redaction_categories=%s",
         log_provider,
         log_event_type,
         log_delivery_id,
         archive_id,
         redaction_hits,
+        redaction_categories,
     )
 
     try:
