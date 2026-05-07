@@ -442,6 +442,25 @@ async def shutdown_all() -> None:
         _pool.clear()
 
 
+async def shutdown_conversation(conversation_key: str) -> None:
+    """Disconnect and evict one pooled SDK client.
+
+    Used when the app-level Feishu request times out. Without this,
+    the user sees a timeout card while the underlying SDK process can
+    keep receiving tool-use blocks and mutate state after the UI has
+    already failed.
+    """
+    async with _pool_lock:
+        slot = _pool.pop(conversation_key, None)
+    if slot is None:
+        return
+    try:
+        await slot.client.disconnect()
+    except Exception:
+        pass
+    logger.info("agent: shutdown client for %s", conversation_key)
+
+
 async def gc_idle_clients() -> int:
     """Periodic cleanup. Returns count freed."""
     now = time.monotonic()

@@ -154,6 +154,9 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
     if await _maybe_handle_target_consent_reply(ev, sender_identity):
         return
 
+    if await _maybe_handle_group_subscription_command(ev, sender_identity):
+        return
+
     parent_notification = None
     if ev.parent_message_id:
         try:
@@ -250,6 +253,7 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
             conversation_key,
             settings.agent_max_duration_seconds,
         )
+        await agent_runner.shutdown_conversation(conversation_key)
         await feishu_client.patch_card(
             card_message_id,
             cards.error_card(
@@ -279,6 +283,94 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
     #    naturally.
     final_text = answer_text or "(空回答 — 试试换个问法?)"
     await _send_answer_with_images(parent_message_id=ev.message_id, text=final_text)
+
+
+_GROUP_TARGET_HINTS = (
+    "这个群",
+    "本群",
+    "群里",
+    "群内",
+    "当前群",
+    "发到群",
+    "发给群",
+    "发在群",
+)
+
+_SUBSCRIPTION_INTENT_HINTS = (
+    "每次",
+    "有新",
+    "新push",
+    "push",
+    "pr",
+    "merge",
+    "通知",
+    "告诉",
+    "发到",
+    "发给",
+    "进展",
+)
+
+_SUBSCRIPTION_NEGATION_HINTS = (
+    "不要",
+    "别",
+    "取消",
+    "删除",
+    "停止",
+    "停用",
+    "别再",
+)
+
+
+async def _maybe_handle_group_subscription_command(
+    ev: feishu_events.ParsedMessageEvent,
+    sender_identity: dict | None,
+) -> bool:
+    """Fast-path obvious "send this proactive rule to this group" commands.
+
+    Letting the general PMO agent handle this path is both slow and
+    risky: it may spend most of the 120s budget investigating repos,
+    then issue multiple write-tool calls. This handler only catches the
+    narrow command shape where routing is explicit: current group scope
+    and current group target.
+    """
+    if ev.chat_type != "group":
+        return False
+    text = ev.text.strip()
+    if not text:
+        return False
+    text_lower = text.lower()
+    if any(hint in text for hint in _SUBSCRIPTION_NEGATION_HINTS):
+        return False
+    if not any(hint in text for hint in _GROUP_TARGET_HINTS):
+        return False
+    if not any(hint in text_lower for hint in _SUBSCRIPTION_INTENT_HINTS):
+        return False
+
+    asyncio.create_task(feishu_client.add_reaction(ev.message_id, "Get"))
+
+    if not sender_identity or not sender_identity.get("user_id"):
+        await feishu_client.reply_text(
+            ev.message_id,
+            "你还没绑定 pmo_agent 账号，先去 https://pmo-agent-sigma.vercel.app/me 绑定飞书账号后再创建主动通知规则。",
+        )
+        return True
+
+    row = db_queries.add_subscription(
+        scope_kind="chat",
+        scope_id=ev.chat_id,
+        description=text,
+        created_by=sender_identity["user_id"],
+        chat_id=ev.chat_id,
+        target_kind="chat",
+        target_id=ev.chat_id,
+    )
+    desc = text if len(text) <= 120 else text[:117] + "..."
+    suffix = f"\n规则 ID：{row.get('id')}" if row.get("id") else ""
+    await feishu_client.reply_text(
+        ev.message_id,
+        f"已设置 ✅ 这条规则会发到这个群：{desc}{suffix}",
+    )
+    return True
 
 
 async def _maybe_handle_target_consent_reply(
