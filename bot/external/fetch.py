@@ -24,6 +24,13 @@ def _auth_headers(provider: str) -> dict[str, str]:
     return {}
 
 
+def _normalize_provider(provider: str) -> str:
+    provider = (provider or "").strip().lower()
+    if provider not in {"github", "gitea"}:
+        raise ValueError("provider must be github or gitea")
+    return provider
+
+
 def _api_base(provider: str) -> str:
     if provider == "gitea":
         return (settings.gitea_api_url or "").rstrip("/") or "https://gitea.com/api/v1"
@@ -38,6 +45,7 @@ def _validate_repo_full_name(repo_full_name: str) -> str:
 
 
 async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: int) -> dict[str, Any]:
+    provider = _normalize_provider(provider)
     repo_full_name = _validate_repo_full_name(repo_full_name)
     base = _api_base(provider)
     url = f"{base}/repos/{repo_full_name}/pulls/{pr_number}/files"
@@ -73,6 +81,70 @@ async def _fetch_pr_files_remote(provider: str, repo_full_name: str, pr_number: 
         redaction_hits_total,
     )
     return result
+
+
+async def list_pull_requests(
+    provider: str,
+    repo_full_name: str,
+    *,
+    state: str = "all",
+    limit: int = 10,
+) -> dict[str, Any]:
+    provider = _normalize_provider(provider)
+    repo_full_name = _validate_repo_full_name(repo_full_name)
+    state = (state or "all").strip().lower()
+    if state not in {"open", "closed", "all"}:
+        state = "all"
+    limit = max(1, min(int(limit or 10), 30))
+    base = _api_base(provider)
+    url = f"{base}/repos/{repo_full_name}/pulls"
+    params: dict[str, Any] = {
+        "state": state,
+        "sort": "updated",
+        "direction": "desc",
+    }
+    if provider == "github":
+        params["per_page"] = limit
+    else:
+        params["limit"] = limit
+    async with httpx.AsyncClient(timeout=20) as client:
+        res = await _get_with_retries(client, url, headers=_auth_headers(provider), params=params)
+        res.raise_for_status()
+        rows = res.json()
+    pull_requests = [_normalize_pr_row(row) for row in (rows[:limit] if isinstance(rows, list) else [])]
+    logger.info(
+        "external.list_pull_requests provider=%s repo=%s state=%s count=%s",
+        safe_log_value(provider),
+        safe_log_value(repo_full_name),
+        safe_log_value(state),
+        len(pull_requests),
+    )
+    return {
+        "provider": provider,
+        "repo_full_name": repo_full_name,
+        "pull_requests": pull_requests,
+        "count": len(pull_requests),
+    }
+
+
+def _normalize_pr_row(row: dict[str, Any]) -> dict[str, Any]:
+    user = row.get("user") if isinstance(row.get("user"), dict) else {}
+    head = row.get("head") if isinstance(row.get("head"), dict) else {}
+    base = row.get("base") if isinstance(row.get("base"), dict) else {}
+    return {
+        "number": row.get("number"),
+        "title": row.get("title"),
+        "state": row.get("state"),
+        "url": row.get("html_url") or row.get("url"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "merged_at": row.get("merged_at"),
+        "closed_at": row.get("closed_at"),
+        "actor_login": user.get("login"),
+        "head_ref": head.get("ref"),
+        "head_sha": head.get("sha"),
+        "base_ref": base.get("ref"),
+    }
 
 
 async def _get_with_retries(client: httpx.AsyncClient, url: str, **kwargs: Any) -> httpx.Response:
@@ -112,6 +184,7 @@ async def fetch_pr_files(
     paths_filter: list[str] | None = None,
     head_sha: str | None = None,
 ) -> dict[str, Any]:
+    provider = _normalize_provider(provider)
     repo_full_name = _validate_repo_full_name(repo_full_name)
     cache_key = f"{repo_full_name}/{pr_number}/{head_sha}" if head_sha else f"{repo_full_name}/{pr_number}"
     cached = queries.lookup_external_resource(provider, "pr_files", cache_key)

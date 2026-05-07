@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from agent.request_context import RequestContext
@@ -10,6 +11,13 @@ from agent.tools_external import _external_table_calls, build_external_tools
 
 def _tool(ctx: RequestContext, name: str):
     return next(t for t in build_external_tools(ctx) if t.name == name).handler
+
+
+def test_external_tools_include_repo_pull_request_tools():
+    names = [tool_def.name for tool_def in build_external_tools(RequestContext())]
+
+    assert "list_connected_repos" in names
+    assert "list_pull_requests" in names
 
 
 def test_resolve_wiki_redirects(monkeypatch):
@@ -127,3 +135,61 @@ def test_read_external_table_prunes_empty_old_conversation_entries(monkeypatch):
 
     assert "isError" not in out
     assert "old-conv" not in _external_table_calls
+
+
+def test_list_connected_repos_returns_mapped_repos(monkeypatch):
+    from agent import tools_external
+
+    monkeypatch.setattr(
+        tools_external,
+        "queries",
+        SimpleNamespace(
+            list_external_repos=lambda query=None, limit=20: [
+                {
+                    "provider": "gitea",
+                    "repo_full_name": "ailab/vibelive",
+                    "project_root": "gitea:ailab/vibelive",
+                }
+            ]
+        ),
+        raising=False,
+    )
+
+    out = asyncio.run(
+        _tool(RequestContext(), "list_connected_repos")({"query": "vibelive", "limit": 5})
+    )
+
+    payload = json.loads(out["content"][0]["text"])
+    assert payload == {
+        "repos": [
+            {
+                "provider": "gitea",
+                "repo_full_name": "ailab/vibelive",
+                "project_root": "gitea:ailab/vibelive",
+            }
+        ]
+    }
+
+
+def test_list_pull_requests_uses_external_provider_fetch(monkeypatch):
+    from agent import tools_external
+
+    fetcher = AsyncMock(
+        return_value={
+            "provider": "gitea",
+            "repo_full_name": "ailab/vibelive",
+            "pull_requests": [{"number": 88, "title": "WIP: portable chat", "state": "open"}],
+        }
+    )
+    monkeypatch.setattr(tools_external, "external_fetch", SimpleNamespace(list_pull_requests=fetcher), raising=False)
+
+    out = asyncio.run(
+        _tool(RequestContext(), "list_pull_requests")(
+            {"provider": "Gitea", "repo_full_name": "AILAB/VibeLive", "state": "all", "limit": 1}
+        )
+    )
+
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["repo_full_name"] == "ailab/vibelive"
+    assert payload["pull_requests"][0]["number"] == 88
+    fetcher.assert_awaited_once_with(provider="gitea", repo_full_name="ailab/vibelive", state="all", limit=1)

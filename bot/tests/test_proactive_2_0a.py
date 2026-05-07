@@ -1445,6 +1445,80 @@ def test_fetch_pr_files_remote_retries_rate_limit(monkeypatch):
     assert FakeAsyncClient.attempts == 2
 
 
+def test_list_pull_requests_remote_normalizes_gitea_response(monkeypatch):
+    from external import fetch
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "number": 88,
+                    "title": "WIP: Keep Space Chat portable across IM backends",
+                    "state": "open",
+                    "html_url": "https://git.hoxigames.xyz/ailab/vibelive/pulls/88",
+                    "created_at": "2026-05-07T04:00:00Z",
+                    "updated_at": "2026-05-07T05:00:00Z",
+                    "user": {"login": "bichenchen"},
+                    "head": {"ref": "portable-chat", "sha": "head-sha"},
+                    "base": {"ref": "main"},
+                }
+            ]
+
+    class FakeAsyncClient:
+        calls: list[dict[str, object]] = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            type(self).calls.append({"url": url, "kwargs": kwargs})
+            return FakeResponse()
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(fetch.list_pull_requests("Gitea", "AILAB/VibeLive", state="all", limit=1))
+
+    assert result == {
+        "provider": "gitea",
+        "repo_full_name": "ailab/vibelive",
+        "pull_requests": [
+            {
+                "number": 88,
+                "title": "WIP: Keep Space Chat portable across IM backends",
+                "state": "open",
+                "url": "https://git.hoxigames.xyz/ailab/vibelive/pulls/88",
+                "created_at": "2026-05-07T04:00:00Z",
+                "updated_at": "2026-05-07T05:00:00Z",
+                "merged_at": None,
+                "closed_at": None,
+                "actor_login": "bichenchen",
+                "head_ref": "portable-chat",
+                "head_sha": "head-sha",
+                "base_ref": "main",
+            }
+        ],
+        "count": 1,
+    }
+    assert FakeAsyncClient.calls[0]["url"].endswith("/repos/ailab/vibelive/pulls")
+    assert FakeAsyncClient.calls[0]["kwargs"]["params"] == {
+        "state": "all",
+        "sort": "updated",
+        "direction": "desc",
+        "limit": 1,
+    }
+
+
 def test_investigator_fetch_pr_files_passes_head_sha_from_event(monkeypatch):
     source = Path("bot/agent/investigator.py").read_text()
 

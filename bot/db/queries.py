@@ -447,6 +447,29 @@ def external_repos_for_project_root(project_root: str) -> list[dict[str, Any]]:
     )
 
 
+def list_external_repos(query: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 20), 100))
+    res = (
+        sb_admin()
+        .table("external_repos")
+        .select("provider,repo_full_name,project_root,created_by,created_at,updated_at")
+        .order("provider")
+        .order("repo_full_name")
+        .limit(500)
+        .execute()
+    )
+    rows = getattr(res, "data", None) or []
+    needle = (query or "").strip().lower()
+    if needle:
+        rows = [
+            row
+            for row in rows
+            if needle in str(row.get("repo_full_name") or "").lower()
+            or needle in str(row.get("project_root") or "").lower()
+        ]
+    return rows[:limit]
+
+
 def recent_turns(
     user_id: str,
     *,

@@ -8,6 +8,8 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from agent.request_context import RequestContext
 from agent.tool_utils import err, ok
+from db import queries
+from external import fetch as external_fetch
 from feishu import bitable, docx, links, wiki
 
 
@@ -101,7 +103,42 @@ def build_external_tools(ctx: RequestContext):
         calls.append(now)
         return ok(result)
 
-    return [resolve_feishu_link, read_doc, read_external_table]
+    @tool(
+        "list_connected_repos",
+        "List GitHub/Gitea repositories connected to the PMO agent. Use query for project names like vibelive.",
+        {"query": str, "limit": int},
+    )
+    async def list_connected_repos(args: dict) -> dict[str, Any]:
+        try:
+            limit = min(max(int(args.get("limit") or 20), 1), 100)
+            rows = queries.list_external_repos(query=args.get("query") or None, limit=limit)
+            return ok({"repos": rows})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "list_pull_requests",
+        "List recent pull requests for a connected GitHub/Gitea repository. Pass provider and repo_full_name from list_connected_repos.",
+        {"provider": str, "repo_full_name": str, "state": str, "limit": int},
+    )
+    async def list_pull_requests(args: dict) -> dict[str, Any]:
+        try:
+            provider = (args.get("provider") or "").strip().lower()
+            repo_full_name = (args.get("repo_full_name") or "").strip().lower()
+            state = (args.get("state") or "all").strip().lower()
+            limit = min(max(int(args.get("limit") or 10), 1), 30)
+            return ok(
+                await external_fetch.list_pull_requests(
+                    provider=provider,
+                    repo_full_name=repo_full_name,
+                    state=state,
+                    limit=limit,
+                )
+            )
+        except Exception as e:
+            return err(str(e))
+
+    return [resolve_feishu_link, read_doc, read_external_table, list_connected_repos, list_pull_requests]
 
 
 def _prune_external_table_calls(now: float) -> None:
