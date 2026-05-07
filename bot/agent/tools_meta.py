@@ -10,6 +10,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from agent import imaging, permissions
 from agent.request_context import RequestContext
 from agent.tools_chat_memory import build_chat_memory_tools
+from agent.tools_people_memory import build_people_memory_tools
 from agent.tool_utils import err, ok
 from db import queries
 
@@ -569,7 +570,7 @@ def build_meta_tools(ctx: RequestContext):
         request_target_consent,
         why_no_notification,
         resolve_subject_mention,
-    ] + build_chat_memory_tools(ctx)
+    ] + build_chat_memory_tools(ctx) + build_people_memory_tools(ctx)
 
 
 async def _undo_row(row: dict[str, Any]) -> dict[str, Any]:

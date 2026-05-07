@@ -7,6 +7,7 @@ turns them into tool error messages the LLM can react to.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta, timezone
@@ -902,6 +903,262 @@ def get_recent_chat_messages(
         q = q.eq("sender_open_id", sender)
     rows = q.execute().data or []
     return [_chat_message_public_row(row) for row in rows]
+
+
+_PEOPLE_QUERY_TOKEN_RE = re.compile(r"[a-zA-Z0-9_./:-]{2,}|[\u4e00-\u9fff]{2,}")
+
+
+def _note_matches_query(row: dict[str, Any], query: str | None) -> bool:
+    needle = (query or "").strip().lower()
+    if not needle:
+        return True
+    haystack = " ".join(
+        str(part or "")
+        for part in [
+            row.get("display_name"),
+            row.get("handle"),
+            row.get("pmo_notes"),
+            row.get("person_key"),
+        ]
+    ).lower()
+    if needle in haystack:
+        return True
+    terms = [m.group(0).lower() for m in _PEOPLE_QUERY_TOKEN_RE.finditer(needle)]
+    return bool(terms) and all(term in haystack for term in terms[:6])
+
+
+def people_memory_for_chat(
+    chat_id: str,
+    *,
+    query: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Return internal people-memory rows for people observed in one chat.
+
+    This helper intentionally returns pmo_notes for server-side summarizers.
+    User-facing tool wrappers must never return those raw notes directly.
+    """
+    capped = max(1, min(int(limit or 20), 50))
+    observed = (
+        sb_admin()
+        .table("chat_messages")
+        .select("sender_open_id,sender_user_id,sender_display_name,occurred_at")
+        .eq("chat_id", chat_id)
+        .is_("deleted_at", None)
+        .eq("sender_is_bot", False)
+        .order("occurred_at", desc=True)
+        .limit(1000)
+        .execute()
+        .data
+        or []
+    )
+    profile_ids = {row.get("sender_user_id") for row in observed if row.get("sender_user_id")}
+    open_ids = {row.get("sender_open_id") for row in observed if row.get("sender_open_id")}
+    allowed_keys = {f"profile:{pid}" for pid in profile_ids} | {f"feishu:{oid}" for oid in open_ids}
+    if not allowed_keys and not open_ids and not profile_ids:
+        return []
+    rows: list[dict[str, Any]] = []
+    if allowed_keys:
+        rows.extend(
+            sb_admin()
+            .table("people_memory")
+            .select("*")
+            .in_("person_key", list(allowed_keys))
+            .order("last_observed_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        )
+    # Be tolerant of older rows whose person_key did not get normalized
+    # but whose identity columns are already populated.
+    known = {row.get("person_key") for row in rows}
+    if profile_ids:
+        for row in (
+            sb_admin()
+            .table("people_memory")
+            .select("*")
+            .in_("profile_id", list(profile_ids))
+            .order("last_observed_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        ):
+            if row.get("person_key") not in known:
+                rows.append(row)
+                known.add(row.get("person_key"))
+    if open_ids:
+        for row in (
+            sb_admin()
+            .table("people_memory")
+            .select("*")
+            .in_("feishu_open_id", list(open_ids))
+            .order("last_observed_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        ):
+            if row.get("person_key") not in known:
+                rows.append(row)
+                known.add(row.get("person_key"))
+    rows.sort(key=lambda row: str(row.get("last_observed_at") or ""), reverse=True)
+    matched = [row for row in rows if _note_matches_query(row, query)]
+    return matched[:capped]
+
+
+def get_people_memory(person_key: str) -> dict[str, Any] | None:
+    if not person_key:
+        return None
+    return (
+        sb_admin()
+        .table("people_memory")
+        .select("*")
+        .eq("person_key", person_key)
+        .maybe_single()
+        .execute()
+        .data
+        or None
+    )
+
+
+def upsert_people_memory(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload["updated_at"] = _utc_now_iso()
+    res = (
+        sb_admin()
+        .table("people_memory")
+        .upsert(payload, on_conflict="person_key")
+        .execute()
+    )
+    return (res.data or [payload])[0]
+
+
+def delete_people_memory(person_key: str) -> bool:
+    res = (
+        sb_admin()
+        .table("people_memory")
+        .delete()
+        .eq("person_key", person_key)
+        .execute()
+    )
+    return bool(res and res.data)
+
+
+def _note_hash(note: str | None) -> str:
+    return hashlib.sha256((note or "").encode("utf-8")).hexdigest()
+
+
+def record_people_memory_update(
+    person_key: str,
+    *,
+    source: str,
+    old_note: str | None,
+    new_note: str | None,
+    model: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "person_key": person_key,
+        "update_source": source,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "old_note_hash": _note_hash(old_note),
+        "new_note_hash": _note_hash(new_note),
+    }
+    res = sb_admin().table("people_memory_updates").insert(payload).execute()
+    return (res.data or [payload])[0]
+
+
+def recent_people_memory_update_count(source: str, *, since_iso: str) -> int:
+    rows = (
+        sb_admin()
+        .table("people_memory_updates")
+        .select("id")
+        .eq("update_source", source)
+        .gte("created_at", since_iso)
+        .limit(10000)
+        .execute()
+        .data
+        or []
+    )
+    return len(rows)
+
+
+def recent_people_memory_update_for_person(person_key: str, *, since_iso: str) -> bool:
+    rows = (
+        sb_admin()
+        .table("people_memory_updates")
+        .select("id")
+        .eq("person_key", person_key)
+        .gte("created_at", since_iso)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return bool(rows)
+
+
+def enabled_chat_memory_settings_for_people_loop(limit: int = 10) -> list[dict[str, Any]]:
+    return (
+        sb_admin()
+        .table("chat_memory_settings")
+        .select("*")
+        .eq("enabled", True)
+        .order("updated_at", desc=True)
+        .limit(max(1, min(int(limit or 10), 100)))
+        .execute()
+        .data
+        or []
+    )
+
+
+def chat_messages_after_cursor(
+    chat_id: str,
+    *,
+    cursor: str | None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    q = (
+        sb_admin()
+        .table("chat_messages")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .is_("deleted_at", None)
+        .eq("sender_is_bot", False)
+        .order("occurred_at", desc=False)
+        .limit(max(1, min(int(limit or 500), 1000)))
+    )
+    if cursor:
+        q = q.gt("occurred_at", cursor)
+    return q.execute().data or []
+
+
+def advance_people_loop_cursor(chat_id: str, cursor: str) -> None:
+    (
+        sb_admin()
+        .table("chat_memory_settings")
+        .update({"people_loop_cursor": cursor, "updated_at": _utc_now_iso()})
+        .eq("chat_id", chat_id)
+        .execute()
+    )
+
+
+def backfill_chat_messages_sender_user_id(feishu_open_id: str, profile_id: str) -> int:
+    if not feishu_open_id or not profile_id:
+        return 0
+    res = (
+        sb_admin()
+        .table("chat_messages")
+        .update({"sender_user_id": profile_id})
+        .eq("sender_open_id", feishu_open_id)
+        .execute()
+    )
+    return len(res.data or [])
 
 
 def recent_turns(

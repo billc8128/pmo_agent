@@ -35,6 +35,8 @@ from feishu import events as feishu_events
 from feishu import post_format
 from feishu.client import feishu_client
 from chat_memory import ingest as chat_memory_ingest
+from chat_memory import identity as people_identity
+from chat_memory import people_loop
 from external.webhooks import router as external_webhook_router
 
 logging.basicConfig(
@@ -70,12 +72,20 @@ async def lifespan(app: FastAPI):
     decider_task = asyncio.create_task(decider_loop.run_forever())
     investigator_task = asyncio.create_task(investigator_loop.run_forever())
     delivery_task = asyncio.create_task(delivery_loop.run_forever())
+    people_memory_task = asyncio.create_task(people_loop.run_forever())
     try:
         yield
     finally:
-        for task in (gc_task, decider_task, investigator_task, delivery_task):
+        for task in (gc_task, decider_task, investigator_task, delivery_task, people_memory_task):
             task.cancel()
-        await asyncio.gather(gc_task, decider_task, investigator_task, delivery_task, return_exceptions=True)
+        await asyncio.gather(
+            gc_task,
+            decider_task,
+            investigator_task,
+            delivery_task,
+            people_memory_task,
+            return_exceptions=True,
+        )
         await agent_runner.shutdown_all()
         logger.info("pmo-bot stopped")
 
@@ -191,6 +201,17 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         # Service role missing? Permission issue? Don't kill the request
         # — just log and proceed without identity context.
         logger.warning("feishu_links lookup failed for %s: %s", ev.sender_open_id, e)
+
+    if sender_identity and ev.sender_open_id:
+        try:
+            people_identity.merge_people_memory_identity(
+                profile_id=sender_identity.get("user_id"),
+                feishu_open_id=ev.sender_open_id,
+                display_name=sender_identity.get("display_name") or sender_identity.get("feishu_name"),
+                handle=sender_identity.get("handle"),
+            )
+        except Exception as e:
+            logger.warning("people memory identity merge failed for %s: %s", ev.sender_open_id, e)
 
     if await _maybe_handle_target_consent_reply(ev, sender_identity):
         return
