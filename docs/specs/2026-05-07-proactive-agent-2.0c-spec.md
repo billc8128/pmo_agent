@@ -294,6 +294,8 @@ RLS: service-role only in Phase 1. User-facing reads/writes happen
 through bot tools or authenticated web server actions after checking
 chat membership.
 
+### 4.3.1 Settings audit history
+
 `chat_memory_settings` stores current state only. Every enable, disable,
 retention change, observer toggle, and clear-history action appends a
 row to `chat_memory_settings_history`; current-state timestamps may be
@@ -397,8 +399,10 @@ Minimum patterns:
 - host-injected prompt markers such as `[asker]`,
   `[parent_notification]`, and `[IMAGE:...]`. When these appear in a
   chat message, escape them before persistence, for example
-  `[asker]` -> `[chat_text:asker]`. A user-authored historical message
-  must never look like a current host-injected control block.
+  `[asker]` -> `[chat_memory_escaped_marker:asker]`, and record the
+  marker category in `redacted_payload.escaped_markers`. A user-authored
+  historical message must never look like a current host-injected
+  control block.
 
 Redaction is best-effort. The product copy must not claim "we can never
 store secrets"; it should say "the bot redacts common secret patterns
@@ -450,7 +454,7 @@ Output:
 }
 ```
 
-#### `search_chat_messages`
+#### `search_chat_messages_with_context`
 
 Input:
 
@@ -459,7 +463,10 @@ Input:
   "query": "vibelive 播放器 todo",
   "since": "2026-05-01T00:00:00+08:00",
   "until": null,
-  "limit": 30
+  "limit": 8,
+  "before": 8,
+  "after": 8,
+  "anchor_message_id": null
 }
 ```
 
@@ -472,48 +479,14 @@ Search should combine:
 Phase 1 does not require embeddings. If recall is poor, embeddings can
 be added later without changing the tool contract.
 
-#### `search_chat_messages_with_context`
-
-Preferred input for natural questions like "刚才那个方案怎么定的":
-
-```json
-{
-  "query": "vibelive 播放器方案",
-  "since": "2026-05-01T00:00:00+08:00",
-  "until": null,
-  "limit": 8,
-  "before": 8,
-  "after": 8
-}
-```
-
 Output returns each hit plus a same-chat message window around it. This
 is the default tool for "刚才 / 前面 / 那个" style questions because the
 LLM does not know Feishu `message_id` values upfront.
 
-#### `get_chat_window`
-
-Input:
-
-```json
-{
-  "anchor_message_id": "om_xxx",
-  "before": 12,
-  "after": 12
-}
-```
-
-Returns messages around the anchor in the same chat. This is the
-primary anti-hallucination tool: search finds candidates; window gives
-the conversation needed to answer.
-
-Typical chain:
-
-1. For a natural-language memory question, call
-   `search_chat_messages_with_context`.
-2. If the user points at a specific returned hit, call
-   `get_chat_window(anchor_message_id=...)` to expand context.
-3. Answer only after reading the window, not from a single search hit.
+If `anchor_message_id` is provided, the tool skips query search and
+returns a same-chat window around that anchor. This replaces a separate
+`get_chat_window` conversational tool; atomic search/window helpers may
+exist internally, but the LLM-facing API should be one tool.
 
 ### 4.7 Answering contract
 
@@ -947,16 +920,32 @@ synthetic observer subscription rows on demand:
 - `scope_kind='chat'`
 - `scope_id=<source chat_id>`
 - `description='__system_observer__'`
-- `created_by=null`
+- `created_by=<system profile id>` when the current schema requires it,
+  otherwise `created_by=null` is allowed. Migration 0025 must inspect
+  the actual `subscriptions` NOT NULL columns before choosing.
 - `target_kind`, `target_id`, and `target_user_open_id` copied from the
   observer candidate's validated target
-- metadata / comment marks the row as system-owned
+- `metadata->>'system' = 'observer'`
+- `metadata->>'source' = '2.0c_observer'`
 
 One synthetic row can be reused for the same source chat and delivery
 target. Observer-generated notification rows point at that synthetic
 subscription and also keep `observer_candidates.notification_id` for
 audit. This preserves the existing notification delivery path without
 pretending observer candidates are user-authored watch rules.
+
+Synthetic observer subscriptions are internal rows:
+
+- `list_subscriptions` must filter them out.
+- `update_subscription` and `remove_subscription` must reject them even
+  if a user guesses the id.
+- User-facing web views must filter `metadata->>'system' is null` unless
+  explicitly rendering an admin/system diagnostics view.
+
+RLS interaction: synthetic rows are intentionally invisible to ordinary
+user reads. Any notification UI that joins `notifications` to
+`subscriptions` must handle a missing subscription row as "system
+observer" rather than treating the notification as orphaned or broken.
 
 ### 6.4 Trust budgets
 
@@ -1110,6 +1099,10 @@ Phase 1 must emit structured logs for:
 - people-loop evaluator counts, writer counts, token usage, and duration
 - cleanup-loop deleted row counts
 
+Logs must never include raw message text, `text_redacted`,
+`redacted_payload`, raw `pmo_notes`, or secret values. Log ids, lengths,
+counts, categories, durations, and reasons.
+
 Phase 2 must also log observer candidate counts, budget-suppressed
 counts, feedback-suppressed counts, and delivery counts. Logger output
 is enough for the first version; no Prometheus dependency is required.
@@ -1127,8 +1120,8 @@ Add to system prompt:
 - For questions about "刚才 / 今天 / 我们聊的 / 达成一致 / todo / 谁适合",
   use chat-memory tools before answering.
 - For "刚才 / 前面 / 那个" questions, prefer
-  `search_chat_messages_with_context` first. Use `get_chat_window` only
-  after a search result gives you an anchor `message_id`.
+  `search_chat_messages_with_context` first. If you need to expand a
+  specific hit, call the same tool with `anchor_message_id`.
 - For group memory, answer only from the current chat unless explicitly
   provided broader context.
 - If evidence is unclear, say so.

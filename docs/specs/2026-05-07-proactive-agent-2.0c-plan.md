@@ -41,6 +41,19 @@ next cut. Do not implement Phase 2 until Phase 1A/1B/1C have passed
 real Feishu e2e and users have tried passive retrieval in at least one
 active group.
 
+Cut gates:
+
+| Transition | Entry / exit criteria |
+|------------|-----------------------|
+| 1A -> 1B | 24h staging run; no uncaught ingest exceptions; at least one enabled group has >=10 successfully stored messages; redaction category logs are present; Feishu webhook p95 ack latency <1.5s |
+| 1B -> 1C | chat-memory regression suite passes; no-evidence and disabled-memory answers do not fall back to turn/repo tools; prompt regression fixtures preserve old subscription/repo behavior |
+| 1C -> Phase 2 | people-loop writer calls stay under daily cap; people-loop logs evaluator/writer counts and token usage; no raw `pmo_notes` exposed in conversational outputs |
+| Phase 2 delivery enable | observer runs in shadow mode for 3 days; DB-backed budget counters work; false-positive review accepted by the maintainer |
+
+If a cut fails its gate, patch or roll back and restart that cut's
+24-hour observation window. Do not self-approve an empty 1A staging run:
+1B requires real ingested chat data.
+
 ---
 
 ## 1. File Map
@@ -117,9 +130,7 @@ active group.
 - Modify: `bot/agent/tools.py` only if the top-level tool bundle needs
   explicit wiring changes
   - add `get_recent_chat_messages`
-  - add `search_chat_messages`
   - add `search_chat_messages_with_context`
-  - add `get_chat_window`
   - add `summarize_people_signal`
   - add `suggest_people_for_topic`
   - add `enable_chat_memory`, `disable_chat_memory`, `chat_memory_status`
@@ -425,7 +436,7 @@ Expected: FAIL because helpers are missing.
 
 - [ ] **Step 3: Implement helpers in `queries.py`**
 
-Helper signatures:
+Internal helper signatures:
 
 ```python
 def is_chat_memory_enabled(chat_id: str) -> bool: ...
@@ -448,6 +459,10 @@ def merge_people_memory_identity(profile_id: str, feishu_open_id: str, *, displa
 
 Keep all helpers service-role only. Do not expose arbitrary chat_id to
 LLM tools without request-context scoping.
+
+`search_chat_messages` and `get_chat_window` are internal query helpers
+only. The conversational MCP surface exposes
+`search_chat_messages_with_context` as the single search/window tool.
 
 - [ ] **Step 4: Run tests**
 
@@ -624,6 +639,12 @@ python -m pytest bot/tests/test_chat_memory.py -q
 
 Expected: PASS.
 
+- [ ] **Step 6.5: Add task-local observability**
+
+Before committing, add structured logs for storage attempts, duplicate
+skips, disabled-chat skips, unsupported message types, and background
+task exceptions. Logs must include ids/counts/reasons, not message text.
+
 - [ ] **Step 7: Commit**
 
 ```bash
@@ -680,6 +701,8 @@ chat_memory_status()
 
 They must use `RequestContext.chat_id` and `RequestContext.chat_type`.
 They must reject arbitrary chat_id arguments.
+All handler implementation belongs in `tools_chat_memory.py`.
+`tools_meta.py` may only import/register these definitions.
 
 - [ ] **Step 4: Prompt update**
 
@@ -699,6 +722,12 @@ python -m pytest bot/tests/test_chat_memory.py -q
 ```
 
 Expected: PASS.
+
+- [ ] **Step 5.5: Add task-local observability**
+
+Before committing, add structured logs for memory status changes:
+action, chat_id, actor identity, retention_days, and result. Do not log
+message text or raw Feishu payloads.
 
 - [ ] **Step 6: Commit**
 
@@ -723,11 +752,10 @@ git commit -m "feat(bot): add chat memory control tools"
 Tests:
 
 - `get_recent_chat_messages` returns only current chat rows
-- `search_chat_messages` rejects caller-supplied `chat_id`
 - `search_chat_messages_with_context` rejects caller-supplied `chat_id`
 - `get_recent_chat_messages` rejects caller-supplied `chat_id`
-- `get_chat_window` rejects caller-supplied `chat_id`
-- `get_chat_window` returns ordered messages around anchor
+- `search_chat_messages_with_context(anchor_message_id=...)` returns
+  ordered messages around anchor
 - disabled chat returns a clear "memory not enabled" error
 - Chinese substring query works even if FTS misses
 - deleted/recalled rows are excluded by default
@@ -761,9 +789,7 @@ Tool names and behavior:
 
 ```text
 get_recent_chat_messages(since?, until?, limit?, sender?)
-search_chat_messages(query, since?, until?, limit?)
-search_chat_messages_with_context(query, since?, until?, limit?, before?, after?)
-get_chat_window(anchor_message_id, before?, after?)
+search_chat_messages_with_context(query?, anchor_message_id?, since?, until?, limit?, before?, after?)
 ```
 
 All tools:
@@ -771,14 +797,19 @@ All tools:
 - use current chat_id from request context
 - do not include `chat_id` in their schema
 - reject unexpected `chat_id` keys if the model sends one anyway
-- cap limit (`recent` max 120, `search` max 50, `window` max 50 total)
+- cap limit (`recent` max 120, `search_with_context` max 8 hits and
+  max 50 window rows per hit)
 - return compact rows with timestamp, sender label, text, message_id
 - never expose raw payload
+All handler implementation belongs in `tools_chat_memory.py`.
+`tools_meta.py` may only import/register these definitions.
 
 `search_chat_messages_with_context` should be the preferred tool for
 natural language references such as "刚才那个"; it returns each hit plus
 same-chat context windows so the LLM does not need to invent an
-`anchor_message_id`.
+`anchor_message_id`. If `anchor_message_id` is supplied, it returns a
+window around that message instead of running query search. Do not
+expose a separate LLM-facing `get_chat_window` tool.
 
 - [ ] **Step 4: Prompt update**
 
@@ -786,9 +817,9 @@ Add rules:
 
 - For "刚才", "今天", "我们聊的", "达成一致", "TODO", "谁负责",
   use chat-memory tools before answering.
-- Prefer `search_chat_messages_with_context` for fuzzy references; use
-  `get_chat_window` only after a previous tool result gives an anchor
-  `message_id`.
+- Prefer `search_chat_messages_with_context` for fuzzy references; call
+  the same tool with `anchor_message_id` when a previous result gives an
+  anchor `message_id`.
 - Reconcile with the existing proactive-subscription prompt: pure
   "以后/每次/有进展通知" remains a write request; mixed "刚才/今天 +
   以后/每次" retrieves chat memory first, then confirms the subscription
@@ -825,6 +856,13 @@ python -m pytest bot/tests -q
 ```
 
 Expected: all existing tests pass.
+
+- [ ] **Step 6.5: Add task-local observability**
+
+Before committing, add structured logs for chat-memory tool calls:
+tool name, chat_id, row count, hit count, latency, disabled-memory
+reason, and rejected unexpected `chat_id` attempts. Never log
+`text_redacted`.
 
 - [ ] **Step 7: Commit**
 
@@ -908,6 +946,9 @@ or an internal helper called by tests/background jobs only.
 
 Do **not** register a raw-note read tool. Raw `pmo_notes` stay
 server-side.
+
+All handler implementation belongs in `tools_people_memory.py`.
+`tools_meta.py` may only import/register these definitions.
 
 - [ ] **Step 5: Prompt update**
 
@@ -1090,6 +1131,13 @@ python -m pytest bot/tests/test_people_memory.py bot/tests/test_proactive_notifi
 
 Expected: PASS.
 
+- [ ] **Step 5.5: Add task-local observability**
+
+Before committing, add people-loop logs for run start/end, selected
+chat count, evaluator-positive count, writer count, skipped reasons,
+token usage, cursor advancement, and failures. Do not log message text
+or raw `pmo_notes`.
+
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -1149,17 +1197,31 @@ CHAT_MEMORY_CLEANUP_ENABLED=true
 Start next to other background tasks. The loop must not affect message
 capture if cleanup fails; log and retry on next interval.
 
-- [ ] **Step 5: Run tests and commit**
+- [ ] **Step 5: Run tests**
+
+Run:
 
 ```bash
 python -m pytest bot/tests/test_chat_memory.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 5.5: Add task-local observability**
+
+Before committing, add cleanup logs for run start/end, deleted row
+count, per-chat limit hit, and failures. Do not log message text.
+
+- [ ] **Step 6: Commit**
+
+```bash
 git add bot/chat_memory/cleanup_loop.py bot/db/queries.py bot/app.py bot/tests/test_chat_memory.py
 git commit -m "feat(bot): clean up expired chat memory"
 ```
 
 ---
 
-## 13. Task 10 — Phase 1 Observability
+## 13. Task 10 — Phase 1 Observability Audit
 
 **Files:**
 - Modify: `bot/chat_memory/ingest.py`
@@ -1168,7 +1230,7 @@ git commit -m "feat(bot): clean up expired chat memory"
 - Modify: `bot/chat_memory/cleanup_loop.py`
 - Test: `bot/tests/test_chat_memory.py`, `bot/tests/test_people_memory.py`
 
-- [ ] **Step 1: Add structured logging tests**
+- [ ] **Step 1: Add structured logging audit tests**
 
 Cover:
 
@@ -1181,10 +1243,12 @@ Cover:
 - cleanup logs deleted row count
 - fire-and-forget background task exceptions are caught and logged
 
-- [ ] **Step 2: Implement logs**
+- [ ] **Step 2: Fill observability gaps**
 
-Use existing Python `logger` infrastructure. Do not add Prometheus or a
-new metrics dependency in Phase 1.
+Earlier tasks add logs in their own scope. This task audits the full
+Phase 1 path and fills missed branches. Use existing Python `logger`
+infrastructure. Do not add Prometheus or a new metrics dependency in
+Phase 1.
 
 - [ ] **Step 3: Run tests and commit**
 
@@ -1327,6 +1391,10 @@ Assert table contains:
 - `is_valid_delivery_target` or equivalent shared target validator
 - `topic_key`
 - synthetic observer subscription helper or documented upsert path
+- tests proving `list_subscriptions` hides synthetic observer rows and
+  `update_subscription` / `remove_subscription` reject them
+- test proving notification UI tolerates missing synthetic subscription
+  join as "system observer"
 - `evidence_message_ids text[]`
 - `evidence_event_ids bigint[]`
 - `suggested_people text[]`
@@ -1345,6 +1413,14 @@ Create table per spec §6.3 plus indexes:
   on `(chat_id, topic_key, opened_at desc)`
 - helper/upsert path for synthetic observer subscription rows used to
   satisfy `notifications.subscription_id not null`
+- schema preflight that selects the actual `subscriptions` NOT NULL
+  columns before inserting synthetic rows. If `created_by` or a future
+  owner column is required, create/reuse a `__system__` profile and use
+  that id rather than relying on null.
+- synthetic rows marked by `metadata->>'system' = 'observer'` and
+  `metadata->>'source' = '2.0c_observer'`
+- user-facing subscription helpers filter out synthetic rows, and
+  update/remove reject them even when the id is known
 - `observer_candidates_status_idx`
 - `observer_candidates_chat_open_idx`
 - `observer_candidates_expires_idx`
