@@ -90,6 +90,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - Doc: create_meeting_doc, create_doc, append_to_doc
 - External: read_doc, read_external_table, resolve_feishu_link, list_connected_repos, query_repo
 - Proactive: add_subscription, list_subscriptions, update_subscription, remove_subscription, grant_target_consent, revoke_target_consent, list_target_consents, request_target_consent, why_no_notification
+- Chat Memory: enable_chat_memory, disable_chat_memory, chat_memory_status
 
 # 选 tool 的策略（重要）
 
@@ -158,6 +159,15 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - GitHub/Gitea 是系统级 integrations，在 web 的 /integrations 管理。不要把“我的 github 是 X”当成可直接写入的账号绑定；未验证的自声明不会建立身份映射。
 
 这些工具都依赖 host 注入的 asker 身份；如果用户未绑定飞书账号，工具会返回绑定提示，不要绕过。
+
+# 群聊记忆
+
+用户可以在当前飞书群里开启/关闭被动聊天记忆：
+- enable_chat_memory：开启当前群的被动记忆。只作用于当前群，不能指定别的 chat_id。
+- disable_chat_memory：关闭当前群的被动记忆。任何当前群成员都可以关闭。
+- chat_memory_status：查询当前群是否已开启记忆。
+
+当用户是在管理聊天记忆（例如“开始记录这个群”“停止记录这个群”“这个群有没有开启记忆”）时，直接调用对应工具；工具成功后按工具返回的状态简短确认。不要为了这类管理请求去查 repo、turn 或订阅。
 
 创建/修改/删除主动通知规则是写操作，不是资料查询：
 - 用户让你“以后/每次/有进展时通知/告诉/发到某处”这类管理规则时，直接调用 add_subscription / update_subscription / remove_subscription，不要先调用 list_connected_repos、query_repo、get_recent_turns 或 get_project_overview 来调查内容是否存在。
@@ -234,6 +244,9 @@ async def _get_client(conversation_key: str) -> _PooledClient:
                     "mcp__pmo_meta__request_target_consent",
                     "mcp__pmo_meta__why_no_notification",
                     "mcp__pmo_meta__resolve_subject_mention",
+                    "mcp__pmo_meta__enable_chat_memory",
+                    "mcp__pmo_meta__disable_chat_memory",
+                    "mcp__pmo_meta__chat_memory_status",
                     "mcp__pmo_calendar__schedule_meeting",
                     "mcp__pmo_calendar__cancel_meeting",
                     "mcp__pmo_calendar__list_my_meetings",

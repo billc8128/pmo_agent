@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.tool_utils import content_payload
+
 
 class _FakeSupabase:
     def __init__(self) -> None:
@@ -591,6 +593,125 @@ class _FakeRequest:
 
     async def json(self):
         return self._body
+
+
+def _chat_memory_tool(ctx, name: str):
+    from agent.tools_chat_memory import build_chat_memory_tools
+
+    return next(t for t in build_chat_memory_tools(ctx) if t.name == name).handler
+
+
+def test_chat_memory_tools_registered_in_meta_and_runner_prompt():
+    from agent import runner
+    from agent.request_context import RequestContext
+    from agent.tools_meta import build_meta_tools
+
+    names = {tool_def.name for tool_def in build_meta_tools(RequestContext())}
+
+    assert {"enable_chat_memory", "disable_chat_memory", "chat_memory_status"} <= names
+    assert "mcp__pmo_meta__enable_chat_memory" in runner.SYSTEM_PROMPT or "enable_chat_memory" in runner.SYSTEM_PROMPT
+    assert "开始记录这个群" in runner.SYSTEM_PROMPT
+
+
+@pytest.mark.anyio
+async def test_enable_chat_memory_rejects_non_group_context():
+    from agent.request_context import RequestContext
+
+    result = await _chat_memory_tool(RequestContext(chat_type="p2p", chat_id="ou_chat"), "enable_chat_memory")({})
+
+    assert result.get("isError") is True
+    assert "群聊" in content_payload(result)["error"]
+
+
+@pytest.mark.anyio
+async def test_enable_chat_memory_uses_current_chat_and_returns_notice(monkeypatch):
+    from agent.request_context import RequestContext
+    from chat_memory import ingest
+    from db import queries
+
+    calls: list[tuple[str, str | None, str | None, int]] = []
+    invalidated: list[str] = []
+    monkeypatch.setattr(
+        queries,
+        "enable_chat_memory",
+        lambda chat_id, *, user_id, open_id, retention_days: calls.append(
+            (chat_id, user_id, open_id, retention_days)
+        )
+        or {
+            "chat_id": chat_id,
+            "enabled": True,
+            "retention_days": retention_days,
+            "enabled_at": "2026-05-07T10:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(ingest, "invalidate_chat_memory_cache", lambda chat_id=None: invalidated.append(chat_id))
+
+    ctx = RequestContext(chat_type="group", chat_id="oc_current", sender_open_id="ou_actor", asker_user_id="profile-1")
+    result = await _chat_memory_tool(ctx, "enable_chat_memory")({"retention_days": 120, "chat_id": "oc_attacker"})
+    payload = content_payload(result)
+
+    assert calls == [("oc_current", "profile-1", "ou_actor", 120)]
+    assert invalidated == ["oc_current"]
+    assert payload["status"] == "enabled"
+    assert payload["chat_id"] == "oc_current"
+    assert "任何群成员" in payload["public_notice"]
+
+
+@pytest.mark.anyio
+async def test_disable_chat_memory_uses_current_chat_for_any_member(monkeypatch):
+    from agent.request_context import RequestContext
+    from chat_memory import ingest
+    from db import queries
+
+    calls: list[tuple[str, str | None, str | None]] = []
+    invalidated: list[str] = []
+    monkeypatch.setattr(
+        queries,
+        "disable_chat_memory",
+        lambda chat_id, *, user_id, open_id: calls.append((chat_id, user_id, open_id))
+        or {"chat_id": chat_id, "enabled": False},
+    )
+    monkeypatch.setattr(ingest, "invalidate_chat_memory_cache", lambda chat_id=None: invalidated.append(chat_id))
+
+    ctx = RequestContext(chat_type="group", chat_id="oc_current", sender_open_id="ou_anyone", asker_user_id=None)
+    result = await _chat_memory_tool(ctx, "disable_chat_memory")({"chat_id": "oc_attacker"})
+    payload = content_payload(result)
+
+    assert calls == [("oc_current", None, "ou_anyone")]
+    assert invalidated == ["oc_current"]
+    assert payload["status"] == "disabled"
+
+
+@pytest.mark.anyio
+async def test_chat_memory_status_returns_structured_fields(monkeypatch):
+    from agent.request_context import RequestContext
+    from db import queries
+
+    monkeypatch.setattr(
+        queries,
+        "chat_memory_status",
+        lambda chat_id: {
+            "chat_id": chat_id,
+            "enabled": True,
+            "enabled_at": "2026-05-07T10:00:00+00:00",
+            "enabled_by_user_id": "profile-1",
+            "enabled_by_open_id": "ou_actor",
+            "retention_days": 90,
+        },
+    )
+
+    ctx = RequestContext(chat_type="group", chat_id="oc_current")
+    result = await _chat_memory_tool(ctx, "chat_memory_status")({"chat_id": "oc_attacker"})
+    payload = content_payload(result)
+
+    assert payload == {
+        "enabled": True,
+        "enabled_at": "2026-05-07T10:00:00+00:00",
+        "enabled_by": {"user_id": "profile-1", "open_id": "ou_actor"},
+        "retention_days": 90,
+        "observer_enabled": False,
+        "chat_id": "oc_current",
+    }
 
 
 @pytest.mark.anyio
