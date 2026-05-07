@@ -438,17 +438,24 @@ Group-aware UX: chat-mediated rule creation + ACL gates.
 End-to-end smoke: "in #vibelive group, set rule 'tell albert in
 DM when his PR breaks the build'; wire works."
 
-### 2.0c — Axis 3: judgment-driven observer (10-15 days)
+### 2.0c — Axis 3: chat memory + judgment-driven observer (10-15 days)
 
-Team state snapshot job. Observer LLM call. Speech-act schema
-plumbed through investigator → renderer. Trust budget +
-"useful?" feedback. End-to-end: observe team for a week, see
-how many speech acts fire, tune.
+Two-phase landing:
+
+1. **Passive memory foundation**: opt-in Feishu group message
+   capture, chat-memory retrieval tools, and lightweight PMO
+   people notes. This lets the bot answer "基于刚才聊的信息，有
+   哪些 TODO" and "这个问题该找谁" without speaking unprompted.
+2. **Active observer**: observer LLM call over chat memory +
+   people memory + repo/turn events. Speech-act schema plumbed
+   through investigator → renderer. Trust budget + "useful?"
+   feedback. End-to-end: observe team for a week, see how many
+   speech acts fire, tune.
 
 This is **explicitly the longest and riskiest** of the three.
-Don't start until 2.0a + 2.0b are stable AND we've watched 1-2
-weeks of usage data to know what kinds of "spontaneous PMO
-moments" users actually want.
+Don't enable active observer until 2.0a + 2.0b are stable AND
+Phase 1 passive memory has enough usage data to know what kinds
+of "spontaneous PMO moments" users actually want.
 
 ---
 
