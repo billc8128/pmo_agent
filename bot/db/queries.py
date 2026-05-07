@@ -737,7 +737,7 @@ def _chat_message_rows_for_chat(
     *,
     since: str | None = None,
     until: str | None = None,
-    limit: int = 500,
+    limit: int = 1000,
     order_desc: bool = False,
 ) -> list[dict[str, Any]]:
     q = (
@@ -748,7 +748,7 @@ def _chat_message_rows_for_chat(
         .is_("deleted_at", None)
         .eq("sender_is_bot", False)
         .order("occurred_at", desc=order_desc)
-        .limit(max(1, min(int(limit or 500), 1000)))
+        .limit(max(1, min(int(limit or 1000), 1000)))
     )
     if since:
         q = q.gte("occurred_at", since)
@@ -757,13 +757,27 @@ def _chat_message_rows_for_chat(
     return q.execute().data or []
 
 
+def _default_chat_search_since_iso() -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+
+def _chat_metadata_value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return " ".join(_chat_metadata_value_text(v) for v in value.values() if v is not None)
+    if isinstance(value, list):
+        return " ".join(_chat_metadata_value_text(v) for v in value if v is not None)
+    return str(value)
+
+
 def _chat_searchable_text(row: dict[str, Any]) -> str:
     metadata = row.get("content_metadata") or {}
     return " ".join(
         part
         for part in [
             str(row.get("text_redacted") or ""),
-            json.dumps(metadata, ensure_ascii=False, sort_keys=True) if metadata else "",
+            _chat_metadata_value_text(metadata) if metadata else "",
             str(row.get("sender_display_name") or ""),
         ]
         if part
@@ -799,12 +813,15 @@ def search_chat_messages_with_context(
     before: int = 8,
     after: int = 8,
 ) -> list[dict[str, Any]]:
-    capped_limit = max(1, min(int(limit or 8), 8))
-    capped_before = max(0, min(int(before or 0), 20))
-    capped_after = max(0, min(int(after or 0), 20))
+    capped_limit = max(1, min(int(limit or 8), 10))
+    capped_before = max(0, min(int(before or 0), 10))
+    capped_after = max(0, min(int(after or 0), 10))
+    effective_since = since
+    if not anchor_message_id and not effective_since:
+        effective_since = _default_chat_search_since_iso()
     rows_asc = _chat_message_rows_for_chat(
         chat_id,
-        since=since,
+        since=effective_since,
         until=until,
         limit=1000,
         order_desc=False,

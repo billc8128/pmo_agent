@@ -182,7 +182,7 @@ def build_chat_memory_tools(ctx: RequestContext):
 
     @tool(
         "search_chat_messages_with_context",
-        "Search current Feishu group chat memory and return each hit with same-chat context. Use for '刚才/今天/我们聊的/TODO/达成一致' questions. Does not accept chat_id.",
+        "Search current Feishu group chat memory and return each hit with same-chat context. Context includes the hit itself. Use for '刚才/今天/我们聊的/TODO/达成一致' questions. Does not accept chat_id.",
         {
             "query": str | None,
             "anchor_message_id": str | None,
@@ -209,9 +209,9 @@ def build_chat_memory_tools(ctx: RequestContext):
             anchor_message_id = (args.get("anchor_message_id") or "").strip() or None
             if not query and not anchor_message_id:
                 return err("query or anchor_message_id is required")
-            limit = _cap_int(args.get("limit"), default=8, minimum=1, maximum=8)
-            before = _cap_int(args.get("before"), default=8, minimum=0, maximum=20)
-            after = _cap_int(args.get("after"), default=8, minimum=0, maximum=20)
+            limit = _cap_int(args.get("limit"), default=8, minimum=1, maximum=10)
+            before = _cap_int(args.get("before"), default=8, minimum=0, maximum=10)
+            after = _cap_int(args.get("after"), default=8, minimum=0, maximum=10)
             hits = queries.search_chat_messages_with_context(
                 chat_id,
                 query=query or None,

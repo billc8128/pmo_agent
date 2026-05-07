@@ -444,6 +444,71 @@ def test_search_chat_messages_with_context_uses_current_chat_and_chinese_substri
     assert [row["message_id"] for row in hits[0]["context"]] == ["om_1"]
 
 
+def test_search_chat_messages_with_context_defaults_to_recent_window(monkeypatch):
+    from datetime import datetime, timezone
+
+    from db import queries
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 5, 7, 12, 0, tzinfo=tz or timezone.utc)
+
+    fake = _FakeSupabase()
+    fake.tables["chat_messages"] = [
+        {
+            "feishu_message_id": "om_old",
+            "chat_id": "oc_current",
+            "sender_display_name": "bcc",
+            "text_redacted": "vibelive 太旧的讨论",
+            "occurred_at": "2026-04-20T10:00:00+00:00",
+            "deleted_at": None,
+            "sender_is_bot": False,
+        },
+        {
+            "feishu_message_id": "om_recent",
+            "chat_id": "oc_current",
+            "sender_display_name": "bcc",
+            "text_redacted": "vibelive 最近的讨论",
+            "occurred_at": "2026-05-06T10:00:00+00:00",
+            "deleted_at": None,
+            "sender_is_bot": False,
+        },
+    ]
+    monkeypatch.setattr(queries, "datetime", FixedDateTime)
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    hits = queries.search_chat_messages_with_context("oc_current", query="vibelive")
+
+    assert [hit["hit"]["message_id"] for hit in hits] == ["om_recent"]
+
+
+def test_search_chat_messages_with_context_searches_metadata_values_not_keys(monkeypatch):
+    from db import queries
+
+    fake = _FakeSupabase()
+    fake.tables["chat_messages"] = [
+        {
+            "feishu_message_id": "om_file",
+            "chat_id": "oc_current",
+            "sender_display_name": "bcc",
+            "message_type": "file",
+            "text_redacted": "",
+            "content_metadata": {"file_name": "vibelive-spec.pdf", "size": 1200},
+            "occurred_at": "2026-05-07T10:00:00+08:00",
+            "deleted_at": None,
+            "sender_is_bot": False,
+        }
+    ]
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    value_hits = queries.search_chat_messages_with_context("oc_current", query="vibelive-spec", since="2026-05-01T00:00:00+00:00")
+    key_hits = queries.search_chat_messages_with_context("oc_current", query="file_name", since="2026-05-01T00:00:00+00:00")
+
+    assert [hit["hit"]["message_id"] for hit in value_hits] == ["om_file"]
+    assert key_hits == []
+
+
 def test_search_chat_messages_with_context_anchor_returns_ordered_window(monkeypatch):
     from db import queries
 
@@ -947,7 +1012,9 @@ def test_chat_memory_tools_registered_in_meta_and_runner_prompt():
     from agent.request_context import RequestContext
     from agent.tools_meta import build_meta_tools
 
-    names = {tool_def.name for tool_def in build_meta_tools(RequestContext())}
+    tool_defs = build_meta_tools(RequestContext())
+    names = {tool_def.name for tool_def in tool_defs}
+    schemas = {tool_def.name: tool_def.input_schema for tool_def in tool_defs}
 
     assert {
         "enable_chat_memory",
@@ -956,8 +1023,12 @@ def test_chat_memory_tools_registered_in_meta_and_runner_prompt():
         "get_recent_chat_messages",
         "search_chat_messages_with_context",
     } <= names
+    assert "chat_id" not in schemas["get_recent_chat_messages"]
+    assert "chat_id" not in schemas["search_chat_messages_with_context"]
     assert "mcp__pmo_meta__enable_chat_memory" in runner.SYSTEM_PROMPT or "enable_chat_memory" in runner.SYSTEM_PROMPT
     assert "search_chat_messages_with_context" in runner.SYSTEM_PROMPT
+    assert "默认查最近 7 天" in runner.SYSTEM_PROMPT
+    assert "anchor_message_id 模式" in runner.SYSTEM_PROMPT
     assert "开始记录这个群" in runner.SYSTEM_PROMPT
     assert "public_notice" in runner.SYSTEM_PROMPT
     assert "原样" in runner.SYSTEM_PROMPT
@@ -1151,9 +1222,9 @@ async def test_search_chat_messages_with_context_tool_handles_disabled_and_searc
             "anchor_message_id": None,
             "since": None,
             "until": None,
-            "limit": 8,
-            "before": 20,
-            "after": 20,
+            "limit": 10,
+            "before": 10,
+            "after": 10,
         }
     ]
     assert payload["hits"][0]["hit"]["message_id"] == "om_2"
