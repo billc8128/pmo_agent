@@ -40,7 +40,10 @@ def merge_people_memory_identity(
         (feishu_row or {}).get("pmo_notes") or "",
     )
     base = dict(profile_row or feishu_row or {})
-    metadata = dict(base.get("metadata") or {})
+    metadata = {
+        **((feishu_row or {}).get("metadata") or {}),
+        **((profile_row or {}).get("metadata") or {}),
+    }
     merge_sources = list(metadata.get("merge_sources") or [])
     if feishu_key not in merge_sources:
         merge_sources.append(feishu_key)

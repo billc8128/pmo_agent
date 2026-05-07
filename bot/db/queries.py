@@ -957,24 +957,54 @@ def people_memory_for_chat(
     allowed_keys = {f"profile:{pid}" for pid in profile_ids} | {f"feishu:{oid}" for oid in open_ids}
     if not allowed_keys and not open_ids and not profile_ids:
         return []
-    rows = (
-        sb_admin()
-        .table("people_memory")
-        .select("*")
-        .order("last_observed_at", desc=True)
-        .limit(500)
-        .execute()
-        .data
-        or []
-    )
-    scoped = [
-        row
-        for row in rows
-        if row.get("person_key") in allowed_keys
-        or row.get("profile_id") in profile_ids
-        or row.get("feishu_open_id") in open_ids
-    ]
-    matched = [row for row in scoped if _note_matches_query(row, query)]
+    rows: list[dict[str, Any]] = []
+    if allowed_keys:
+        rows.extend(
+            sb_admin()
+            .table("people_memory")
+            .select("*")
+            .in_("person_key", list(allowed_keys))
+            .order("last_observed_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        )
+    # Be tolerant of older rows whose person_key did not get normalized
+    # but whose identity columns are already populated.
+    known = {row.get("person_key") for row in rows}
+    if profile_ids:
+        for row in (
+            sb_admin()
+            .table("people_memory")
+            .select("*")
+            .in_("profile_id", list(profile_ids))
+            .order("last_observed_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        ):
+            if row.get("person_key") not in known:
+                rows.append(row)
+                known.add(row.get("person_key"))
+    if open_ids:
+        for row in (
+            sb_admin()
+            .table("people_memory")
+            .select("*")
+            .in_("feishu_open_id", list(open_ids))
+            .order("last_observed_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        ):
+            if row.get("person_key") not in known:
+                rows.append(row)
+                known.add(row.get("person_key"))
+    rows.sort(key=lambda row: str(row.get("last_observed_at") or ""), reverse=True)
+    matched = [row for row in rows if _note_matches_query(row, query)]
     return matched[:capped]
 
 

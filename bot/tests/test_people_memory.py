@@ -236,6 +236,49 @@ def test_people_memory_for_chat_scopes_to_current_chat(monkeypatch):
     assert [row["person_key"] for row in rows] == ["profile:profile-alice"]
 
 
+def test_people_memory_for_chat_uses_key_filter_without_global_500_row_miss(monkeypatch):
+    from db import queries
+
+    fake = _FakeSupabase()
+    fake.tables["chat_messages"] = [
+        {
+            "chat_id": "oc_current",
+            "sender_open_id": "ou_target",
+            "sender_user_id": None,
+            "sender_display_name": "Target",
+            "occurred_at": "2026-05-07T10:00:00+00:00",
+            "deleted_at": None,
+            "sender_is_bot": False,
+        }
+    ]
+    fake.tables["people_memory"] = [
+        {
+            "person_key": f"feishu:ou_other_{i}",
+            "profile_id": None,
+            "feishu_open_id": f"ou_other_{i}",
+            "display_name": f"Other {i}",
+            "pmo_notes": "irrelevant",
+            "last_observed_at": f"2026-05-07T11:{i % 60:02d}:00+00:00",
+        }
+        for i in range(600)
+    ]
+    fake.tables["people_memory"].append(
+        {
+            "person_key": "feishu:ou_target",
+            "profile_id": None,
+            "feishu_open_id": "ou_target",
+            "display_name": "Target",
+            "pmo_notes": "Target 懂 vibelive 播放器。",
+            "last_observed_at": "2026-04-01T00:00:00+00:00",
+        }
+    )
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    rows = queries.people_memory_for_chat("oc_current", query="播放器", limit=10)
+
+    assert [row["person_key"] for row in rows] == ["feishu:ou_target"]
+
+
 @pytest.mark.anyio
 async def test_get_people_context_scopes_and_hides_raw_note(monkeypatch):
     from agent.request_context import RequestContext
@@ -266,6 +309,7 @@ async def test_get_people_context_scopes_and_hides_raw_note(monkeypatch):
     assert payload["count"] == 1
     assert payload["people"][0]["person"] == "Alice / @alice"
     assert "pmo_notes" not in payload["people"][0]
+    assert "person_key" not in payload["people"][0]
     assert "RAW_PRIVATE_NOTE" not in str(payload)
 
 
@@ -308,7 +352,25 @@ async def test_suggest_people_for_topic_does_not_cross_chat_and_is_conservative(
     assert payload["candidates"][0]["person"] == "Alice / @alice"
     assert payload["candidates"][0]["confidence"] in {"medium", "high"}
     assert all("pmo_notes" not in candidate for candidate in payload["candidates"])
+    assert all("person_key" not in candidate for candidate in payload["candidates"])
     assert all(candidate["person"] != "Thin / @thin" for candidate in payload["candidates"])
+
+
+def test_compose_background_note_replaces_stale_context_instead_of_appending():
+    from chat_memory import people
+
+    note = people.compose_background_note(
+        display_name="Alice",
+        existing_note="Alice 最近在群聊中反复出现的工作上下文：旧项目 登录页 排查。",
+        messages=[
+            {"text_redacted": "vibelive 播放器方案确认"},
+            {"text_redacted": "Agora RTC stats 方案落地"},
+        ],
+    )
+
+    assert "vibelive 播放器方案确认" in note
+    assert "Agora RTC stats 方案落地" in note
+    assert "旧项目" not in note
 
 
 def test_merge_people_memory_identity_moves_feishu_note_to_profile_and_backfills(monkeypatch):
@@ -344,6 +406,47 @@ def test_merge_people_memory_identity_moves_feishu_note_to_profile_and_backfills
     assert [row["person_key"] for row in fake.tables["people_memory"]] == ["profile:profile-alice"]
     assert fake.tables["chat_messages"][0]["sender_user_id"] == "profile-alice"
     assert fake.tables["people_memory_updates"][0]["update_source"] == "identity_merge"
+
+
+def test_merge_people_memory_identity_preserves_profile_and_feishu_metadata(monkeypatch):
+    from chat_memory import identity
+    from db import queries
+
+    fake = _FakeSupabase()
+    fake.tables["people_memory"] = [
+        {
+            "person_key": "profile:profile-alice",
+            "profile_id": "profile-alice",
+            "feishu_open_id": "ou_old",
+            "display_name": "Alice",
+            "handle": "alice",
+            "pmo_notes": "profile note",
+            "metadata": {"profile_only": True, "shared": "profile"},
+        },
+        {
+            "person_key": "feishu:ou_alice",
+            "profile_id": None,
+            "feishu_open_id": "ou_alice",
+            "display_name": "Alice F",
+            "handle": None,
+            "pmo_notes": "feishu note",
+            "metadata": {"feishu_only": True, "shared": "feishu"},
+        },
+    ]
+    fake.tables["chat_messages"] = []
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+
+    merged = identity.merge_people_memory_identity(
+        profile_id="profile-alice",
+        feishu_open_id="ou_alice",
+        display_name="Alice",
+        handle="alice",
+    )
+
+    assert merged["metadata"]["profile_only"] is True
+    assert merged["metadata"]["feishu_only"] is True
+    assert merged["metadata"]["shared"] == "profile"
+    assert "feishu:ou_alice" in merged["metadata"]["merge_sources"]
 
 
 def test_people_loop_updates_notes_once_and_advances_cursor(monkeypatch):

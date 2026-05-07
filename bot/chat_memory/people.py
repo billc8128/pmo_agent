@@ -84,7 +84,6 @@ def people_signal_summary(row: dict[str, Any], *, topic: str) -> dict[str, Any] 
         summary = "有一定历史协作信号，但当前 topic 的证据不够强，适合先轻量确认。"
     return {
         "person": label,
-        "person_key": row.get("person_key"),
         "summary": summary,
         "confidence": confidence,
         "last_observed_at": row.get("last_observed_at"),
@@ -107,8 +106,4 @@ def compose_background_note(
         return sanitize_note(existing_note, max_chars=max_chars)
     prefix = f"{display_name or '这位成员'} 最近在群聊中反复出现的工作上下文："
     new_context = "；".join(snippets)
-    if existing_note:
-        combined = f"{sanitize_note(existing_note, max_chars=450)}\n{prefix}{new_context}"
-    else:
-        combined = f"{prefix}{new_context}"
-    return sanitize_note(combined, max_chars=max_chars)
+    return sanitize_note(f"{prefix}{new_context}", max_chars=max_chars)
