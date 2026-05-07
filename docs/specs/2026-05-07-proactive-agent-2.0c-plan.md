@@ -38,8 +38,10 @@ users have tried passive retrieval in at least one active group.
 
 - Create: `backend/supabase/migrations/0024_chat_memory.sql`
   - `chat_memory_settings`
+  - `chat_memory_settings_history`
   - `chat_messages`
   - `people_memory`
+  - `people_memory_updates`
   - service-role-only RLS
   - indexes and comments
 
@@ -53,20 +55,26 @@ users have tried passive retrieval in at least one active group.
 - Modify: `bot/db/queries.py`
   - chat memory settings helpers
   - chat message insert/search/window helpers
-  - people memory get/upsert helpers
+  - people memory signal/upsert/audit helpers
+  - Feishu identity merge helper
   - Phase 2 observer candidate helpers later
 
-- Create: `bot/chat_memory/redaction.py` or reuse existing
-  `bot/external/redaction.py`
-  - shared redaction wrapper for Feishu chat text
+- Modify: `bot/external/redaction.py`
+  - extend shared redaction for chat privacy patterns
 
 - Create: `bot/chat_memory/ingest.py`
   - idempotent conversion from Feishu parsed message to
     `chat_messages` row
+  - async ack-first storage task
 
 - Create: `bot/chat_memory/people.py`
   - `person_key` resolution
   - people-note update prompt wrapper
+  - summary-only people signal formatter
+
+- Create: `bot/chat_memory/identity.py`
+  - merge `feishu:{open_id}` people memory into `profile:{uuid}`
+    when Feishu binding becomes known
 
 - Create: `bot/chat_memory/cleanup_loop.py`
   - retention cleanup for expired `chat_messages`
@@ -93,7 +101,7 @@ users have tried passive retrieval in at least one active group.
   - add `get_recent_chat_messages`
   - add `search_chat_messages`
   - add `get_chat_window`
-  - add `get_people_memory`
+  - add `summarize_people_signal`
   - add `suggest_people_for_topic`
   - add `enable_chat_memory`, `disable_chat_memory`, `chat_memory_status`
 
@@ -167,7 +175,58 @@ is explicit.
 
 ---
 
-## 3. Task 1 — Migration 0024: Chat and People Memory
+## 3. Task 0 — Extend Shared Redaction for Chat Privacy
+
+**Files:**
+- Modify: `bot/external/redaction.py`
+- Test: `bot/tests/test_chat_memory.py`
+
+- [ ] **Step 1: Write failing redaction tests**
+
+Add fixtures for chat-specific sensitive data:
+
+- `albert@vibelive.com`
+- `13800138000`
+- `+86 13800138000`
+- Chinese resident ID-like value
+- bank-card-like digit run
+- `ssh root@1.2.3.4:22 password=abc123`
+
+Expected: redacted text does not contain the sensitive value.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run:
+
+```bash
+python -m pytest bot/tests/test_chat_memory.py::test_chat_redaction_patterns -q
+```
+
+Expected: FAIL for currently uncovered patterns.
+
+- [ ] **Step 3: Extend redaction patterns**
+
+Update `bot/external/redaction.py` with conservative patterns for:
+
+- email addresses
+- Chinese mainland mobile numbers and E.164 phone numbers
+- Chinese resident ID numbers
+- bank-card-like 13-19 digit runs
+- IPv4 host + optional port when near ssh/password/database context
+
+Prefer over-redaction to under-redaction for chat memory.
+
+- [ ] **Step 4: Run tests and commit**
+
+```bash
+python -m pytest bot/tests/test_chat_memory.py::test_chat_redaction_patterns -q
+git add bot/external/redaction.py bot/tests/test_chat_memory.py
+git commit -m "feat(bot): extend redaction for chat memory"
+```
+
+---
+
+## 4. Task 1 — Migration 0024: Chat and People Memory
 
 **Files:**
 - Create: `backend/supabase/migrations/0024_chat_memory.sql`
@@ -181,9 +240,14 @@ Add tests that read the migration file and assert:
 def test_0024_creates_chat_memory_tables():
     sql = Path("backend/supabase/migrations/0024_chat_memory.sql").read_text()
     assert "create table if not exists public.chat_memory_settings" in sql
+    assert "create table if not exists public.chat_memory_settings_history" in sql
     assert "create table if not exists public.chat_messages" in sql
     assert "create table if not exists public.people_memory" in sql
+    assert "create table if not exists public.people_memory_updates" in sql
     assert "feishu_message_id" in sql
+    assert "sender_is_bot" in sql
+    assert "edited_at" in sql
+    assert "deleted_at" in sql
     assert "references public.chat_memory_settings(chat_id) on delete cascade" in sql
     assert "between 1 and 730" in sql
     assert "to_tsvector('simple', text_redacted)" in sql
@@ -204,10 +268,13 @@ Expected: FAIL because migration does not exist.
 Create `0024_chat_memory.sql` with:
 
 - `chat_memory_settings` per spec §4.3
+- `chat_memory_settings_history` per spec §4.3
 - `chat_messages` per spec §4.4
   - `chat_id` references `chat_memory_settings(chat_id) on delete cascade`
+  - `sender_is_bot`, `edited_at`, `deleted_at`
 - `people_memory` per spec §5.1
   - includes `metadata jsonb` for note updater audit fields
+- `people_memory_updates` per spec §5.1
 - comments stating stored payloads are redacted, not raw Feishu bodies
 - RLS enabled with no public policies
 - indexes:
@@ -215,8 +282,11 @@ Create `0024_chat_memory.sql` with:
   - `chat_messages_sender_time_idx`
   - `chat_messages_parent_idx`
   - `chat_messages_text_fts_idx`
+  - `chat_messages_deleted_idx`
   - `people_memory_profile_idx`
   - `people_memory_feishu_idx`
+  - `people_memory_updates_source_time_idx`
+  - `people_memory_updates_person_time_idx`
 
 - [ ] **Step 4: Run migration shape tests**
 
@@ -263,7 +333,7 @@ git commit -m "feat(db): add chat and people memory tables"
 
 ---
 
-## 4. Task 2 — DB Query Helpers
+## 5. Task 2 — DB Query Helpers
 
 **Files:**
 - Modify: `bot/db/queries.py`
@@ -276,11 +346,17 @@ Cover:
 - `is_chat_memory_enabled(chat_id)` returns False on no row
 - `enable_chat_memory(...)` upserts enabled row
 - `disable_chat_memory(...)` sets enabled False and disabled fields
+- enable/disable appends `chat_memory_settings_history`
 - `insert_chat_message(...)` uses idempotent upsert / ignore duplicate
+- `mark_chat_message_deleted(...)` sets deleted_at by message id
+- `update_chat_message_text(...)` updates text and edited_at by message id
 - `search_chat_messages(...)` constrains by chat_id
 - `get_chat_window(...)` never crosses chat_id
 - `upsert_people_memory(...)` writes by `person_key`
-- `get_people_memory(...)` returns objective fields + note
+- `record_people_memory_update(...)` writes audit rows
+- `people_memory_update_count(...)` is DB-backed over 24h
+- `merge_people_memory_identity(...)` is idempotent and backfills recent
+  `chat_messages.sender_user_id`
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -302,11 +378,16 @@ def enable_chat_memory(chat_id: str, *, user_id: str | None, open_id: str | None
 def disable_chat_memory(chat_id: str, *, user_id: str | None, open_id: str | None) -> dict: ...
 def chat_memory_status(chat_id: str) -> dict | None: ...
 def insert_chat_message(row: dict) -> dict | None: ...
+def mark_chat_message_deleted(message_id: str) -> bool: ...
+def update_chat_message_text(message_id: str, *, text_redacted: str, redacted_payload: dict, edited_at: str) -> bool: ...
 def get_recent_chat_messages(chat_id: str, *, since: str | None, until: str | None, limit: int = 80, sender: str | None = None) -> list[dict]: ...
 def search_chat_messages(chat_id: str, *, query: str, since: str | None, until: str | None, limit: int = 30) -> list[dict]: ...
 def get_chat_window(chat_id: str, *, anchor_message_id: str, before: int = 12, after: int = 12) -> list[dict]: ...
 def upsert_people_memory(person_key: str, **fields) -> dict: ...
-def get_people_memory(query: str, *, limit: int = 5) -> list[dict]: ...
+def people_memory_candidates(query: str, *, limit: int = 5) -> list[dict]: ...
+def record_people_memory_update(person_key: str, *, update_source: str, model: str | None, input_tokens: int | None, output_tokens: int | None, old_note_hash: str | None, new_note_hash: str | None) -> dict: ...
+def people_memory_update_count(*, update_source: str, since: str) -> int: ...
+def merge_people_memory_identity(profile_id: str, feishu_open_id: str, *, display_name: str | None = None, handle: str | None = None) -> dict: ...
 ```
 
 Keep all helpers service-role only. Do not expose arbitrary chat_id to
@@ -331,7 +412,7 @@ git commit -m "feat(bot): add chat memory query helpers"
 
 ---
 
-## 5. Task 3 — Feishu Message Capture Without Waking Agent
+## 6. Task 3 — Feishu Message Capture Without Waking Agent
 
 **Files:**
 - Modify: `bot/feishu/events.py`
@@ -343,14 +424,23 @@ git commit -m "feat(bot): add chat memory query helpers"
 
 Tests:
 
-1. Enabled chat + non-@ group message stores row and returns `"stored"`
-   without calling `_handle_message`.
+1. Enabled chat + non-@ group message schedules a background store task,
+   returns `"stored"` immediately, and does not call `_handle_message`.
 2. Disabled chat + non-@ group message returns `"group not addressed"`
-   and stores nothing.
-3. Enabled chat + @ message stores row and still calls `_handle_message`.
-4. Duplicate Feishu message id does not create a second row.
-5. Enabled chat + @ message is stored exactly once: webhook stores it
-   before `_handle_message`, and `_handle_message` must not store again.
+   without awaiting a DB write.
+3. Enabled chat + @ message schedules storage and still calls
+   `_handle_message`.
+4. Duplicate Feishu `event_id` stopped by `already_seen` does not
+   schedule storage.
+5. Duplicate Feishu message id does not create a second row when the
+   background writer runs twice.
+6. Enabled chat + @ message is stored exactly once: webhook schedules
+   storage before `_handle_message`, and `_handle_message` must not
+   store again.
+7. Bot-authored messages are ignored or stored with `sender_is_bot=true`
+   and excluded from default retrieval.
+8. Recall event sets `deleted_at`; edit event updates `text_redacted`
+   and `edited_at`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -378,20 +468,30 @@ Ensure `ParsedMessageEvent` exposes:
 - `mentions`
 - `create_time` / occurred_at
 - `message_type`
+- recall/edit event identifiers if Feishu supplies them
 
-- [ ] **Step 4: Implement `chat_memory.ingest.store_message_if_enabled`**
+- [ ] **Step 4: Implement ack-safe chat memory ingest**
 
 Pseudo-code:
 
 ```python
-def store_message_if_enabled(ev: ParsedMessageEvent, sender_identity: dict | None = None) -> bool:
+def memory_enabled_hint(chat_id: str) -> bool:
+    # 30s process-local TTL cache. Returns True only when cache says
+    # enabled; cache miss should not block webhook ack.
+    ...
+
+def should_schedule_storage(chat_id: str) -> bool:
+    # True when cache says enabled OR cache is missing/stale.
+    # False only when cache has a fresh disabled value.
+    ...
+
+async def store_message_if_enabled(ev: ParsedMessageEvent, sender_identity: dict | None = None) -> None:
     if ev.chat_type != "group":
-        return False
-    if not queries.is_chat_memory_enabled(ev.chat_id):
-        return False
+        return
+    if not await queries.is_chat_memory_enabled_async(ev.chat_id):
+        return
     row = build_chat_message_row(ev, sender_identity)
     queries.insert_chat_message(row)
-    return True
 ```
 
 Use redacted text. Do not store raw encrypted event body.
@@ -405,10 +505,13 @@ parsed = feishu_events.parse_message_event(body)
 if parsed is None:
     return PlainTextResponse("ignored")
 
-stored = await maybe_store_message(parsed)
+if parsed.chat_type == "group":
+    enabled_hint = chat_memory_ingest.memory_enabled_hint(parsed.chat_id)
+    if chat_memory_ingest.should_schedule_storage(parsed.chat_id):
+        asyncio.create_task(chat_memory_ingest.store_message_if_enabled(parsed))
 
 if parsed.chat_type == "group" and not parsed.is_at_bot:
-    return PlainTextResponse("stored" if stored else "group not addressed")
+    return PlainTextResponse("stored" if enabled_hint else "group not addressed")
 
 asyncio.create_task(_handle_message(parsed))
 return PlainTextResponse("ok")
@@ -418,7 +521,18 @@ Ownership rule: `feishu_webhook` is the only place that stores inbound
 Feishu chat messages. `_handle_message` and downstream agent code must
 not write `chat_messages`; they only read memory through tools.
 
-Avoid duplicate DB lookups where possible, but correctness first.
+The storage path runs after `event_id_of` / `already_seen`; duplicate
+webhook events should not schedule storage. `feishu_message_id` unique
+remains the DB idempotency backstop.
+
+`event_id` and `feishu_message_id` are different identifiers. The
+current parser handles one user-facing message per
+`im.message.receive_v1` event; if Feishu later sends batched messages,
+the event-level duplicate gate still wraps the whole delivery and the
+message-level unique key dedupes each row.
+
+Storage is best-effort. Supabase latency/failure must not delay Feishu
+ack.
 
 - [ ] **Step 6: Run tests**
 
@@ -439,7 +553,7 @@ git commit -m "feat(bot): capture opted-in group messages"
 
 ---
 
-## 6. Task 4 — Chat Memory Control Tools
+## 7. Task 4 — Chat Memory Control Tools
 
 **Files:**
 - Modify: `bot/agent/tools_meta.py`
@@ -453,7 +567,12 @@ Cover:
 
 - `enable_chat_memory` fails outside group chat
 - `enable_chat_memory` writes current chat_id only
+- `enable_chat_memory` returns public notice copy explaining that any
+  member can stop recording
 - `disable_chat_memory` writes current chat_id only
+- `disable_chat_memory` is allowed for any current chat member, not only
+  the original enabler
+- enable/disable appends settings history
 - `chat_memory_status` returns enabled/disabled text fields
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -507,7 +626,7 @@ git commit -m "feat(bot): add chat memory control tools"
 
 ---
 
-## 7. Task 5 — Passive Chat Retrieval Tools
+## 8. Task 5 — Passive Chat Retrieval Tools
 
 **Files:**
 - Modify: `bot/agent/tools_meta.py`
@@ -520,10 +639,14 @@ git commit -m "feat(bot): add chat memory control tools"
 Tests:
 
 - `get_recent_chat_messages` returns only current chat rows
-- `search_chat_messages` does not accept caller-supplied chat_id
+- `search_chat_messages` rejects caller-supplied `chat_id`
+- `get_recent_chat_messages` rejects caller-supplied `chat_id`
+- `get_chat_window` rejects caller-supplied `chat_id`
 - `get_chat_window` returns ordered messages around anchor
 - disabled chat returns a clear "memory not enabled" error
 - Chinese substring query works even if FTS misses
+- deleted/recalled rows are excluded by default
+- bot-authored rows are excluded by default
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -548,6 +671,8 @@ get_chat_window(anchor_message_id, before?, after?)
 All tools:
 
 - use current chat_id from request context
+- do not include `chat_id` in their schema
+- reject unexpected `chat_id` keys if the model sends one anyway
 - cap limit (`recent` max 120, `search` max 50, `window` max 50 total)
 - return compact rows with timestamp, sender label, text, message_id
 - never expose raw payload
@@ -590,7 +715,7 @@ git commit -m "feat(bot): add passive chat memory retrieval"
 
 ---
 
-## 8. Task 6 — People Memory Helpers and Tools
+## 9. Task 6 — People Memory Helpers and Tools
 
 **Files:**
 - Create: `bot/chat_memory/people.py`
@@ -605,11 +730,16 @@ Cover:
 
 - `person_key_for_identity(profile_id=...) == "profile:{id}"`
 - unbound Feishu sender uses `feishu:{open_id}`
-- `get_people_memory("hellobit")` returns matching note
+- `summarize_people_signal("hellobit", topic=...)` returns a
+  topic-scoped summary and never returns raw `pmo_notes`
 - `suggest_people_for_topic(...)` returns "not enough signal" when no
   notes exist
+- `suggest_people_for_topic(...)` returns concise reasons, not raw note
+  text
 - conversational tool list does **not** include
   `update_people_memory_note`
+- conversational tool list does **not** include any raw
+  `get_people_memory` note reader
 - updater prompt rejects sensitive/personality/performance judgment
   in fixture output
 
@@ -631,6 +761,7 @@ Functions:
 def person_key_for_identity(*, profile_id: str | None, feishu_open_id: str | None) -> str: ...
 def build_people_note_prompt(old_note: str, context: list[dict]) -> str: ...
 def sanitize_people_note(note: str) -> str: ...
+def summarize_people_signal_from_note(note: str, *, topic: str) -> str: ...
 ```
 
 `sanitize_people_note` should not pretend to solve safety completely;
@@ -642,7 +773,7 @@ real boundary.
 Tools:
 
 ```text
-get_people_memory(query, limit=5)
+summarize_people_signal(query, topic)
 suggest_people_for_topic(topic, limit=5)
 ```
 
@@ -650,11 +781,16 @@ Do **not** register `update_people_memory_note` with the conversation
 MCP server. Note writes happen through `bot/chat_memory/people_loop.py`
 or an internal helper called by tests/background jobs only.
 
+Do **not** register a raw-note read tool. Raw `pmo_notes` stay
+server-side.
+
 - [ ] **Step 5: Prompt update**
 
 Add:
 
 - People memory is a work-context note, not a scorecard.
+- Use `summarize_people_signal` / `suggest_people_for_topic`; do not ask
+  for raw people notes.
 - Suggest people politely; do not assign ownership unless the chat
   explicitly did.
 - Do not use private DM context for group recommendations.
@@ -678,7 +814,65 @@ git commit -m "feat(bot): add PMO people memory notes"
 
 ---
 
-## 9. Task 7 — Background People Memory Updater
+## 10. Task 7 — Feishu Identity Merge for People Memory
+
+**Files:**
+- Create: `bot/chat_memory/identity.py`
+- Modify: `bot/db/queries.py`
+- Modify: Feishu OAuth callback or binding path
+- Test: `bot/tests/test_people_memory.py`
+
+- [ ] **Step 1: Write failing tests**
+
+Tests:
+
+- `feishu:{open_id}` row moves into `profile:{uuid}` when a Feishu link
+  is created
+- if profile row already has an empty note, Feishu note is preserved
+- if both rows have notes, both source notes are preserved in
+  `metadata.merge_sources` and a rewrite is scheduled
+- running merge twice does not duplicate note text
+- recent `chat_messages.sender_user_id` backfills for matching
+  `sender_open_id`
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run:
+
+```bash
+python -m pytest bot/tests/test_people_memory.py::test_people_memory_identity_merge -q
+```
+
+Expected: FAIL.
+
+- [ ] **Step 3: Implement merge helper**
+
+Implement:
+
+```python
+def merge_people_memory_identity(profile_id: str, feishu_open_id: str, *, display_name: str | None = None, handle: str | None = None) -> dict: ...
+```
+
+The helper is idempotent and follows spec §5.1.1.
+
+- [ ] **Step 4: Wire trigger point**
+
+Call merge after the Feishu binding/OAuth flow successfully links
+`feishu_open_id` to a profile. If the bot also learns the link during
+message handling, it may enqueue the same merge helper; idempotency
+handles duplicates.
+
+- [ ] **Step 5: Run tests and commit**
+
+```bash
+python -m pytest bot/tests/test_people_memory.py -q
+git add bot/chat_memory/identity.py bot/db/queries.py bot/tests/test_people_memory.py
+git commit -m "feat(bot): merge people memory on Feishu binding"
+```
+
+---
+
+## 11. Task 8 — Background People Memory Updater
 
 **Files:**
 - Create: `bot/chat_memory/people_loop.py`
@@ -696,6 +890,9 @@ Tests:
 - enforces per-note input/output token caps
 - debounces same-person rewrites within 10 minutes
 - writes note through `upsert_people_memory`
+- writes `people_memory_updates` audit row with source/model/token usage
+- daily cap is computed from `people_memory_updates`, so restart does
+  not reset it
 - never sends Feishu messages
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -721,6 +918,9 @@ Loop defaults:
 - max output tokens per note rewrite: 600
 - max input tokens per run: 30k
 - same person debounce: 10 minutes
+- budget gate query: count rows in `people_memory_updates` where
+  `update_source='background_loop'` and `created_at > now() - interval
+  '1 day'`
 - model: same lightweight model family used for classifier/gatekeeper
   unless current config says otherwise
 
@@ -755,7 +955,7 @@ git commit -m "feat(bot): refresh people memory in background"
 
 ---
 
-## 10. Task 8 — Chat Memory Retention Cleanup
+## 12. Task 9 — Chat Memory Retention Cleanup
 
 **Files:**
 - Create: `bot/chat_memory/cleanup_loop.py`
@@ -815,7 +1015,7 @@ git commit -m "feat(bot): clean up expired chat memory"
 
 ---
 
-## 11. Task 9 — Phase 1 End-to-End Validation
+## 13. Task 10 — Phase 1 End-to-End Validation
 
 **Files:**
 - No required code files unless tests expose gaps
@@ -894,6 +1094,14 @@ In a group:
 3. Verify bot does not reply to ordinary messages.
 4. Ask: `@包工头 基于我们刚才聊的信息，有哪些达成一致的 TODO?`
 5. Expected: bot uses chat-memory tools and answers from the messages.
+6. Verify the bot's own opt-in notice / answer messages are not returned
+   by default retrieval.
+7. Recall one ordinary message in Feishu, then ask about that topic.
+   Expected: bot does not quote the recalled text.
+8. Edit one ordinary message if Feishu edit events are enabled.
+   Expected: bot retrieves the edited text, not the original.
+9. Send `@包工头 停止记录这个群` from a different member than the one who
+   enabled memory. Expected: memory is disabled.
 
 - [ ] **Step 6: Commit any verification doc updates**
 
@@ -904,7 +1112,22 @@ git commit -m "docs: record 2.0c passive memory validation"
 
 ---
 
-## 12. Task 10 — Phase 2 Schema: Observer Candidates
+## 14. Phase 1.5 — Deferred Web UX
+
+Not part of Phase 1 implementation. Track separately after passive chat
+memory is working in Feishu:
+
+- `/me` or People page: "what does PMO know about me?"
+- user correction flow for their own people signal
+- chat memory status page gated by verified chat membership
+- no raw `pmo_notes` exposure without a dedicated review
+
+Do not add these casually during Phase 1; web membership checks are a
+separate permission surface.
+
+---
+
+## 15. Task 11 — Phase 2 Schema: Observer Candidates
 
 Do this only after Phase 1 is stable.
 
@@ -920,6 +1143,7 @@ Assert table contains:
 - `observer_candidates`
 - `observer_candidates_target_check`
 - `observer_feedback`
+- `is_valid_delivery_target` or equivalent shared target validator
 - `evidence_message_ids text[]`
 - `evidence_event_ids bigint[]`
 - `suggested_people text[]`
@@ -931,9 +1155,14 @@ Assert table contains:
 
 Create table per spec §6.3 plus indexes:
 
+- shared SQL target validator used by both `subscriptions` and
+  `observer_candidates`; 0025 must replace or mirror 0023's
+  `subs_target_check` through that helper
 - `observer_candidates_status_idx`
 - `observer_candidates_chat_open_idx`
 - `observer_candidates_expires_idx`
+- `observer_candidates_target_user_time_idx`
+- `observer_candidates_chat_topic_time_idx`
 - `observer_feedback_chat_kind_idx`
 - `observer_feedback_topic_idx`
 
@@ -946,6 +1175,9 @@ def mark_observer_candidate_notified(candidate_id: int, notification_id: int) ->
 def mark_observer_candidate_suppressed(candidate_id: int, reason: str) -> None: ...
 def record_observer_feedback(row: dict) -> int: ...
 def observer_feedback_for_chat(chat_id: str) -> list[dict]: ...
+def observer_notified_count_for_chat(chat_id: str, *, since: str) -> int: ...
+def observer_notified_count_for_target_user(open_id: str, *, since: str) -> int: ...
+def observer_recent_topic_notified(chat_id: str, topic_key: str, *, since: str) -> bool: ...
 ```
 
 - [ ] **Step 4: Run tests and commit**
@@ -958,9 +1190,9 @@ git commit -m "feat(db): add observer candidates and feedback"
 
 ---
 
-## 13. Task 11 — Phase 2 Observer Loop
+## 16. Task 12 — Phase 2 Observer Loop
 
-Do this only after Task 10 and a separate user review.
+Do this only after Task 11 and a separate user review.
 
 **Files:**
 - Create: `bot/agent/observer.py`
@@ -976,6 +1208,9 @@ Tests:
 - candidate output requires evidence message/event ids
 - low confidence mention candidates are suppressed
 - per-chat daily cap blocks second delivery
+- per-user daily observer DM/@ cap blocks second delivery
+- same topic within 24h is suppressed using DB query
+- budget survives loop restart because counts come from DB state
 - feedback table suppresses disabled candidate types/topics
 - observer never sends directly; it only opens candidates
 
@@ -988,7 +1223,7 @@ Prompt per spec §8.3. JSON output only.
 Input budget:
 
 - max 80 recent chat messages
-- max 10 people notes
+- max 10 topic-scoped people signals, not raw people notes
 - max 20 recent repo/turn events
 - max 10 recent notifications
 
@@ -1012,9 +1247,9 @@ git commit -m "feat(bot): add PMO observer candidates"
 
 ---
 
-## 14. Task 12 — Phase 2 Investigator and Delivery Integration
+## 17. Task 13 — Phase 2 Investigator and Delivery Integration
 
-Do this only after Task 11.
+Do this only after Task 12.
 
 **Files:**
 - Modify: `bot/agent/investigator_loop.py`
@@ -1064,22 +1299,28 @@ git commit -m "feat(bot): deliver observer-vetted PMO nudges"
 
 ---
 
-## 14. Deployment Gates
+## 18. Deployment Gates
 
 ### Phase 1 gate
 
 Required before production:
 
 - [ ] `python -m pytest bot/tests -q` passes
+- [ ] chat redaction pattern tests pass
 - [ ] migration 0024 applies to sandbox
 - [ ] sandbox SQL smoke passes
+- [ ] Feishu webhook ack path does not await Supabase writes
 - [ ] retention cleanup test passes
+- [ ] identity merge tests pass
 - [ ] `railway status` confirms the bot service/environment before deploy
 - [ ] Railway deploy succeeds
 - [ ] Feishu e2e:
   - enable memory
   - ordinary messages stored silently
   - passive TODO query works
+  - recalled messages are excluded
+  - bot-authored messages are excluded
+  - any member can disable memory
   - disabled chat stores nothing
 
 ### Phase 2 gate
@@ -1100,7 +1341,7 @@ Required before enabling observer:
 
 ---
 
-## 15. Rollback
+## 19. Rollback
 
 ### Phase 1
 

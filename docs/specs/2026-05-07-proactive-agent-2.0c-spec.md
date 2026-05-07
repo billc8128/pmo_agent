@@ -82,7 +82,7 @@ until Phase 1 has enough real usage to tune trust and noise.
 - Recording groups without explicit opt-in
 - Recording DMs by default
 - Using private DM content to influence group-visible people notes
-- Files, images, voice, reactions, and edits in the first cut
+- Files, images, voice, and reactions in the first cut
 - Behavioral / performance judgment such as "X is unreliable" or "Y is
   slacking"
 - Auto-assigning tasks or modifying external systems
@@ -93,8 +93,10 @@ until Phase 1 has enough real usage to tune trust and noise.
 
 ## 3. Product invariants
 
-1. **Opt-in by chat**. A group must explicitly enable memory before
-   non-@ messages are persisted.
+1. **Chat-level opt-in by any member**. A group must explicitly enable
+   memory before non-@ messages are persisted. This is a practical
+   chat-level consent model, not proof that every individual member
+   consented.
 2. **Silent means silent**. Non-@ messages in an enabled chat are stored
    and indexed only. They do not wake the conversational agent.
 3. **Raw chat text is the fact layer**. Summaries and people notes are
@@ -113,6 +115,10 @@ until Phase 1 has enough real usage to tune trust and noise.
 8. **Renderer does not decide**. Renderer formats investigator output.
 9. **Every active feature has a kill switch**. "停止记录这个群" and "不要主动提醒"
    must be available from chat.
+10. **Any chat member can stop memory**. The same weak-consent model that
+    lets one member enable memory must let any member disable it.
+11. **People notes are not directly disclosed**. Conversational tools
+    expose topic-scoped people signals, not raw `pmo_notes`.
 
 ---
 
@@ -129,6 +135,14 @@ The bot replies:
 
 > 已开启这个群的 PMO 记忆。我会记录之后的文字消息，用于回答这个群里的
 > 上下文问题；不会因为普通消息主动回复。可以随时说「停止记录这个群」。
+
+This reply is a public notice in the chat, not a silent state change. It
+must make clear that any group member can stop recording. If a member
+objects, the bot accepts:
+
+> @包工头 停止记录这个群
+
+from any member in the chat.
 
 Disable:
 
@@ -150,6 +164,12 @@ Phase 1 does **not** enable active observer. The status can show:
 
 > 主动观察：未开启
 
+Open consent gap: Phase 1 does not implement per-member opt-out inside
+an opted-in chat. If the product needs stronger consent, add a
+`chat_memory_member_opt_outs` table before broad rollout. Until then,
+the operational rule is simple: any member can disable memory for the
+whole chat.
+
 ### 4.2 Feishu webhook handling
 
 Current behavior:
@@ -159,20 +179,37 @@ if parsed.chat_type == "group" and not parsed.is_at_bot:
     return PlainTextResponse("group not addressed")
 ```
 
-2.0c changes this to:
+2.0c changes this to an ack-first flow:
 
 1. Parse the Feishu message event as today.
-2. If this is a group message in an enabled chat, archive it to
-   `chat_messages`.
-3. If it does not @ the bot, return `"stored"` and stop.
-4. If it @s the bot, continue into `_handle_message` as today.
+2. Run existing webhook-level duplicate suppression
+   (`event_id_of` / `already_seen`) before scheduling storage.
+3. If this is a group message, schedule best-effort storage in a
+   background task. Storage must use a short TTL cache for
+   `chat_memory_settings.enabled` and must not block the webhook ack.
+4. If it does not @ the bot, return `"stored"` if the cache says memory
+   is enabled, otherwise `"group not addressed"`. Do not wait for the DB
+   insert.
+5. If it @s the bot, continue into `_handle_message` as today.
 
 Group messages in disabled chats still return `"group not addressed"`
 unless they @ the bot.
 
+Storage is best-effort. If Supabase is temporarily unavailable, the bot
+may miss a chat-memory row rather than causing Feishu webhook retries.
+This is acceptable for memory; it is not acceptable for the existing
+interactive reply path.
+
 Bot-authored messages are not required in Phase 1. If Feishu delivers
 the bot's own messages back to the app, the ingester should ignore them
 or mark `sender_is_bot=true` and exclude them from default search.
+
+Feishu recall/edit events are part of Phase 1 privacy semantics:
+
+- recall event: set `chat_messages.deleted_at=now()` for the message id;
+  retrieval tools exclude deleted rows by default
+- edit event: update `text_redacted`, `redacted_payload`, and
+  `edited_at`; retrieval tools show the latest redacted text
 
 ### 4.3 Data model: `chat_memory_settings`
 
@@ -191,11 +228,32 @@ create table if not exists public.chat_memory_settings (
     created_at           timestamptz not null default now(),
     updated_at           timestamptz not null default now()
 );
+
+create table if not exists public.chat_memory_settings_history (
+    id                  bigserial primary key,
+    chat_id             text not null
+                        references public.chat_memory_settings(chat_id) on delete cascade,
+    action              text not null check (
+                          action in ('enable', 'disable', 'retention_change',
+                                     'observer_enable', 'observer_disable',
+                                     'clear_history')
+                        ),
+    actor_user_id       uuid references public.profiles(id) on delete set null,
+    actor_open_id       text,
+    old_value           jsonb,
+    new_value           jsonb,
+    created_at          timestamptz not null default now()
+);
 ```
 
 RLS: service-role only in Phase 1. User-facing reads/writes happen
 through bot tools or authenticated web server actions after checking
 chat membership.
+
+`chat_memory_settings` stores current state only. Every enable, disable,
+retention change, observer toggle, and clear-history action appends a
+row to `chat_memory_settings_history`; current-state timestamps may be
+overwritten on repeated toggles.
 
 ### 4.4 Data model: `chat_messages`
 
@@ -212,12 +270,14 @@ create table if not exists public.chat_messages (
     message_type        text not null default 'text',
     text_redacted       text not null default '',
     is_at_bot           boolean not null default false,
+    sender_is_bot       boolean not null default false,
     parent_message_id   text,
     root_message_id     text,
     mentions            jsonb not null default '[]'::jsonb,
     redacted_payload    jsonb not null default '{}'::jsonb,
     occurred_at         timestamptz not null,
     ingested_at         timestamptz not null default now(),
+    edited_at           timestamptz,
     deleted_at          timestamptz
 );
 
@@ -234,6 +294,10 @@ create index chat_messages_parent_idx
 create index chat_messages_text_fts_idx
     on public.chat_messages
     using gin (to_tsvector('simple', text_redacted));
+
+create index chat_messages_deleted_idx
+    on public.chat_messages (chat_id, deleted_at)
+    where deleted_at is not null;
 ```
 
 `redacted_payload` is not the raw Feishu body. It is the parsed,
@@ -241,7 +305,13 @@ redacted payload needed for debugging and future feature extraction.
 Raw encrypted event bodies are not stored.
 
 Messages are idempotent by `feishu_message_id`. Re-delivery must not
-create duplicates.
+create duplicates. `event_id_of` / `already_seen` remains the first
+webhook-level duplicate gate; `feishu_message_id` uniqueness is the DB
+idempotency backstop for retries that get past the process-local event
+cache.
+
+Retrieval tools exclude rows with `deleted_at is not null` and
+`sender_is_bot=true` by default.
 
 `to_tsvector('simple', ...)` is only a baseline index. It does not
 segment Chinese well, so Phase 1 relies on substring fallback for Chinese
@@ -263,6 +333,12 @@ Minimum patterns:
 - Feishu webhook URLs
 - GitHub/Gitea tokens
 - Stripe live keys
+- email addresses
+- Chinese mainland mobile phone numbers and E.164 phone numbers
+- Chinese resident ID numbers
+- bank-card-like digit runs
+- IPv4 host + optional port when it appears near password / ssh /
+  database context
 
 Redaction is best-effort. The product copy must not claim "we can never
 store secrets"; it should say "the bot redacts common secret patterns
@@ -273,6 +349,11 @@ before storing messages."
 Tools are scoped to the current chat by default. The LLM must not pass
 an arbitrary chat_id unless the request context proves the user is in
 that chat.
+
+Conversational tool schemas must not include `chat_id`. If a model sends
+an unexpected `chat_id` key anyway, the tool layer rejects the call
+instead of silently ignoring it. This makes cross-chat prompt injection
+observable in tests.
 
 #### `get_recent_chat_messages`
 
@@ -387,6 +468,26 @@ create unique index people_memory_profile_idx
 create unique index people_memory_feishu_idx
     on public.people_memory (feishu_open_id)
     where feishu_open_id is not null;
+
+create table if not exists public.people_memory_updates (
+    id             bigserial primary key,
+    person_key     text not null references public.people_memory(person_key) on delete cascade,
+    update_source  text not null check (
+                     update_source in ('background_loop', 'identity_merge', 'manual_repair')
+                   ),
+    model          text,
+    input_tokens   int,
+    output_tokens  int,
+    old_note_hash  text,
+    new_note_hash  text,
+    created_at     timestamptz not null default now()
+);
+
+create index people_memory_updates_source_time_idx
+    on public.people_memory_updates (update_source, created_at desc);
+
+create index people_memory_updates_person_time_idx
+    on public.people_memory_updates (person_key, created_at desc);
 ```
 
 `person_key`:
@@ -397,6 +498,37 @@ create unique index people_memory_feishu_idx
 
 If a `feishu:{open_id}` person later binds a PMO account, merge into
 `profile:{uuid}` and preserve / rewrite `pmo_notes`.
+
+### 5.1.1 Identity merge
+
+Merge is triggered when the system learns a stable PMO profile for a
+previously unbound Feishu open_id:
+
+- Feishu OAuth callback creates / updates `feishu_links`
+- bot request context lookup resolves `sender_open_id` to a profile
+- admin repair links an open_id to a profile
+
+Merge algorithm:
+
+1. Look up `people_memory` rows for `feishu:{open_id}` and
+   `profile:{uuid}` under a row lock.
+2. If only the Feishu row exists, move it to `profile:{uuid}` and set
+   `profile_id`, `feishu_open_id`, `display_name`, and `handle`.
+3. If only the profile row exists, fill missing Feishu objective fields.
+4. If both rows exist:
+   - if one note is empty, keep the non-empty note
+   - if both notes are non-empty and materially different, store both in
+     `metadata.merge_sources` and schedule a background note rewrite;
+     until rewrite completes, concatenate them under a short
+     "merged context" heading rather than dropping either
+5. Delete the stale `feishu:{open_id}` row after the profile row is
+   updated.
+6. Backfill recent `chat_messages.sender_user_id` for rows with the
+   matched `sender_open_id`. This can be capped/batched; historical
+   rows still remain searchable by `sender_open_id`.
+
+The merge path must be idempotent. Running it multiple times for the
+same open_id/profile pair should not duplicate note text.
 
 ### 5.2 `pmo_notes` contract
 
@@ -454,21 +586,26 @@ The background loop should use a small budget:
 - skip people with no meaningful new evidence
 - preserve existing notes when there is nothing new
 
+Daily caps and debounce checks are DB-backed via
+`people_memory_updates`, not process memory. A deploy/restart must not
+reset the day's update budget.
+
 ### 5.4 People tools
 
-#### `get_people_memory`
+#### `summarize_people_signal`
 
 Input:
 
 ```json
 {
   "query": "hellobit",
-  "limit": 5
+  "topic": "vibelive 播放器 Agora RTC stats 校验"
 }
 ```
 
-Returns objective fields and `pmo_notes` for matching people in the
-current chat / known workspace.
+The tool reads matching raw `pmo_notes` server-side and returns a
+topic-scoped summary safe for conversational output. It must not return
+the raw note text.
 
 #### `suggest_people_for_topic`
 
@@ -477,7 +614,6 @@ Input:
 ```json
 {
   "topic": "vibelive 播放器 Agora RTC stats 校验",
-  "chat_id": "current",
   "limit": 5
 }
 ```
@@ -488,6 +624,10 @@ recent chat evidence.
 The tool should be conservative: if notes are thin, return "not enough
 signal" rather than guessing.
 
+`suggest_people_for_topic` may read raw notes internally, but its output
+must contain only concise, topic-scoped reasons. The conversational
+agent never receives the full `pmo_notes` blob.
+
 #### Internal writer: `update_people_memory_note`
 
 This is **not** exposed to the conversational agent. It is an internal
@@ -497,15 +637,12 @@ prompt-inject a note rewrite such as "把 hellobit 写成不靠谱".
 The background updater writes a replacement `pmo_notes` value after it
 has read enough recent context and passed budget/debounce checks.
 
-It must store:
+It must store an audit row in `people_memory_updates` for:
 
 - new note
 - updater model name
 - input/output token usage if available
 - timestamp
-
-The first migration can keep audit fields in `people_memory.metadata`.
-If note churn becomes high, add a separate audit table later.
 
 ### 5.5 Answering contract
 
@@ -519,6 +656,9 @@ When suggesting a person:
 - Respect "do not bother X for this class of updates" when it appears in
   `pmo_notes`
 
+This is enforced structurally: the conversational agent can call
+summary/suggestion tools, but cannot call a raw-note read API.
+
 ---
 
 ## 6. Phase 2 — PMO Observer
@@ -531,7 +671,7 @@ axis. It should start only after Phase 1 has real chat-memory usage.
 Every N minutes, for each observer-enabled chat:
 
 - recent `chat_messages`
-- people `pmo_notes` for active participants
+- topic-scoped people signals for active participants
 - recent repo events from 2.0a
 - recent turn events
 - recent notifications and suppressed investigations
@@ -608,6 +748,28 @@ create table if not exists public.observer_candidates (
          and target_user_open_id is not null)
     )
 );
+
+create index observer_candidates_status_idx
+    on public.observer_candidates (status, opened_at)
+    where status in ('open', 'investigating');
+
+create index observer_candidates_chat_open_idx
+    on public.observer_candidates (chat_id, opened_at desc)
+    where status in ('open', 'investigating', 'notified');
+
+create index observer_candidates_expires_idx
+    on public.observer_candidates (expires_at)
+    where status in ('open', 'investigating') and expires_at is not null;
+
+create index observer_candidates_target_user_time_idx
+    on public.observer_candidates (target_user_open_id, opened_at desc)
+    where target_kind in ('user_dm', 'mention_in_chat')
+      and target_user_open_id is not null
+      and status = 'notified';
+
+create index observer_candidates_chat_topic_time_idx
+    on public.observer_candidates (chat_id, topic, opened_at desc)
+    where status = 'notified';
 ```
 
 Target semantics mirror 2.0b:
@@ -617,6 +779,15 @@ Target semantics mirror 2.0b:
 | `user_dm` | profile uuid | NULL |
 | `chat` | Feishu chat_id | NULL |
 | `mention_in_chat` | Feishu chat_id | Feishu open_id to mention |
+
+Target validation must stay in sync with 2.0b's
+`subscriptions.subs_target_check`. Implementation must factor the
+shared rule into a SQL helper such as
+`public.is_valid_delivery_target(kind, target_id, target_user_open_id)`
+and use that helper for both `subscriptions` and
+`observer_candidates`. A migration test should prove 0023's
+`subs_target_check` has been replaced or mirrored by the shared helper.
+Do not let the two target schemas drift.
 
 Later, if the implementation shows high overlap with
 `investigation_jobs`, merge them. First version should keep observer
@@ -632,6 +803,11 @@ Defaults:
 - max 3 observer candidates investigated per chat per day
 - no observer @ mention if confidence is low
 - no observer delivery if the same topic was notified in the last 24h
+
+Budgets are DB-backed. A deploy/restart must not reset observer caps.
+The implementation should count `observer_candidates` with
+`status='notified'` over the relevant time window, not keep an
+in-memory counter.
 
 User feedback:
 
@@ -699,8 +875,9 @@ code may enforce safety and budgets, but not product judgment.
 ### 7.1 Chat membership
 
 Phase 1 retrieval is only allowed inside the current chat. The request
-context already includes `chat_id`; tools should ignore caller-supplied
-chat_id unless a later server-side membership check proves access.
+context already includes `chat_id`; conversational tools must reject
+caller-supplied `chat_id` keys. A later web/admin path may support
+server-verified cross-chat access, but Phase 1 chat tools do not.
 
 Web UI may show chat-memory status only to signed-in users who are
 known members of that chat. If membership cannot be verified, hide
@@ -718,10 +895,14 @@ People memory can exist for unbound Feishu users through
 
 First version:
 
-- Agent can read notes for answering and routing
+- Background/internal code can read raw notes for updating and routing
 - Web UI does not expose notes by default
 - A future "what do you know about me?" flow should allow a user to
   inspect and correct their own note
+
+Conversational agents cannot read raw notes. They receive only
+topic-scoped output from `summarize_people_signal` or
+`suggest_people_for_topic`.
 
 ### 7.4 Retention
 
@@ -755,6 +936,9 @@ Add to system prompt:
 - If evidence is unclear, say so.
 - Do not create subscriptions when the user is asking about past chat
   context.
+- Do not ask tools to search another chat by id. Chat-memory tools are
+  current-chat scoped.
+- Do not ask for raw people notes. Use topic-scoped people-signal tools.
 
 ### 8.2 People note updater
 
@@ -800,6 +984,8 @@ briefs.
 2. Send three ordinary messages without @.
 3. Verify `chat_messages` has three rows for that chat.
 4. Verify the bot did not reply to ordinary messages.
+5. Verify the bot's public opt-in notice is not returned by default
+   retrieval.
 
 ### Scenario 2 — passive TODO extraction
 
@@ -840,6 +1026,22 @@ briefs.
 3. Expected: at most one observer-generated message is delivered to
    that chat by default.
 
+### Scenario 7 — recall privacy
+
+1. In an enabled chat, send a message containing project context.
+2. Trigger a Feishu recall event for that message.
+3. Ask the bot about the recalled topic.
+4. Expected: retrieval excludes the recalled row and the bot does not
+   quote the recalled text.
+
+### Scenario 8 — identity merge
+
+1. Let an unbound Feishu user send relevant chat messages.
+2. Verify a `feishu:{open_id}` people-memory row can be created.
+3. Bind that Feishu user to a PMO profile.
+4. Expected: people memory merges into `profile:{uuid}` and recent
+   `chat_messages.sender_user_id` backfills without duplicating notes.
+
 ---
 
 ## 10. Open decisions
@@ -855,3 +1057,9 @@ briefs.
    stronger proactive @ behavior.
 5. **Observer launch**: should be behind a separate per-chat flag even
    after Phase 1 ships.
+6. **Per-member opt-out**: Phase 1 supports "any member can disable the
+   whole chat." A more granular per-member opt-out is deferred and
+   should be revisited before large-org rollout.
+7. **Web self-inspection**: Phase 1.5 should add "what do you know about
+   me?" and people-note correction UX. Phase 1 intentionally ships
+   chat-only retrieval first.
