@@ -17,8 +17,9 @@ import json
 import logging
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from config import settings
 
@@ -60,6 +61,13 @@ class ParsedMessageEvent:
     parent_message_id: str
     text: str                 # whitespace-trimmed, @-mentions stripped
     is_at_bot: bool
+    occurred_at: Optional[str] = None
+    sender_display_name: Optional[str] = None
+    root_message_id: str = ""
+    mentions: list[dict[str, Any]] = field(default_factory=list)
+    message_type: str = "text"
+    content_metadata: dict[str, Any] = field(default_factory=dict)
+    bot_identity_ready: bool = True
 
 
 # ── URL verification handshake ───────────────────────────────────────
@@ -103,7 +111,7 @@ def already_seen(event_id: str) -> bool:
 
 
 def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
-    """Returns None if this event isn't a user-facing text message we care about."""
+    """Returns None if this event isn't a user-facing message we care about."""
     header = body.get("header") or {}
     event = body.get("event") or {}
 
@@ -119,17 +127,14 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
     if not chat_id:
         return None
 
-    msg_type = msg.get("message_type")
-    if msg_type != "text":
-        return None  # ignore image/file/audio/etc. for MVP
-
-    # Content is a JSON string with {"text": "..."}.
+    msg_type = msg.get("message_type") or "text"
     raw_content = msg.get("content") or "{}"
     try:
         content = json.loads(raw_content)
     except Exception:
         return None
-    text = (content.get("text") or "").strip()
+
+    text, content_metadata = _extract_message_text_and_metadata(msg_type, content)
     if not text:
         return None
 
@@ -143,23 +148,24 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
     # set_self_identity). Falling back to a name match isn't reliable —
     # admins can rename the app, and "name" in the mentions payload
     # may also include @-mentions of human users with similar names.
-    mentions = msg.get("mentions") or []
+    raw_mentions = msg.get("mentions") or []
+    mentions = _normalize_mentions(raw_mentions)
     self_oid = _self_open_id_cached()
-    self_name = _self_name_cached()
+    bot_identity_ready = chat_type != "group" or bool(self_oid)
     is_at_bot = False
-    for m in mentions:
-        m_oid = (m.get("id") or {}).get("open_id")
-        m_name = m.get("name")
-        if self_oid and m_oid == self_oid:
-            is_at_bot = True
-            break
-        # Fallback: name match — used in groups where the open_id field
-        # might be missing or before set_self_identity has run.
-        if self_name and m_name == self_name:
-            is_at_bot = True
-            break
-    # Strip mention placeholders from text
-    text = re.sub(r"@_user_\d+", "", text).strip()
+    if bot_identity_ready:
+        for m in mentions:
+            m_oid = m.get("open_id")
+            if self_oid and m_oid == self_oid:
+                is_at_bot = True
+                break
+    else:
+        logger.warning("group message parsed before bot self open_id was ready: chat=%s", chat_id)
+    # Strip mention placeholders from text. Do this even when identity is
+    # unavailable so any stored memory does not preserve Feishu placeholder
+    # tokens.
+    text = re.sub(r"@_user_\d+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
 
     sender_id_obj = sender.get("sender_id") or {}
     sender_open_id = sender_id_obj.get("open_id") or sender.get("sender_open_id") or ""
@@ -176,13 +182,124 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
         parent_message_id=msg.get("parent_id") or "",
         text=text,
         is_at_bot=is_at_bot,
+        occurred_at=_parse_feishu_time(msg.get("create_time") or event.get("create_time")),
+        sender_display_name=_sender_display_name(sender),
+        root_message_id=msg.get("root_id") or msg.get("parent_id") or "",
+        mentions=mentions,
+        message_type=msg_type,
+        content_metadata=content_metadata,
+        bot_identity_ready=bot_identity_ready,
     )
+
+
+def _parse_feishu_time(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    try:
+        raw = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    # Feishu message create_time is milliseconds since epoch. Be permissive
+    # for second-based fixtures.
+    if raw > 10_000_000_000:
+        seconds = raw / 1000
+    else:
+        seconds = raw
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _sender_display_name(sender: dict[str, Any]) -> Optional[str]:
+    for key in ("sender_name", "name", "display_name"):
+        value = sender.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _normalize_mentions(raw_mentions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for mention in raw_mentions:
+        mention_id = mention.get("id") or {}
+        item = {
+            "open_id": mention_id.get("open_id"),
+            "user_id": mention_id.get("user_id"),
+            "union_id": mention_id.get("union_id"),
+            "name": mention.get("name"),
+            "key": mention.get("key"),
+        }
+        out.append({k: v for k, v in item.items() if v})
+    return out
+
+
+def _extract_message_text_and_metadata(msg_type: str, content: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if msg_type == "text":
+        return (content.get("text") or "").strip(), {}
+    if msg_type == "post":
+        return _extract_post_text_and_metadata(content)
+    if msg_type == "file":
+        file_name = str(content.get("file_name") or content.get("name") or "").strip()
+        if not file_name:
+            return "", {}
+        metadata: dict[str, Any] = {"file_name": file_name}
+        if isinstance(content.get("size"), int):
+            metadata["size"] = content["size"]
+        return f"Shared file: {file_name}", metadata
+    if msg_type == "share_chat":
+        title = str(content.get("title") or content.get("chat_name") or "Shared chat").strip()
+        metadata = {
+            k: v
+            for k, v in {
+                "title": title,
+                "chat_id": content.get("chat_id"),
+            }.items()
+            if v
+        }
+        return f"Shared chat: {title}", metadata
+    if msg_type == "share_user":
+        name = str(content.get("name") or content.get("user_name") or "Shared user").strip()
+        return f"Shared user: {name}", {"name": name}
+    return "", {}
+
+
+def _extract_post_text_and_metadata(content: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    parts: list[str] = []
+    links: list[dict[str, str]] = []
+    title = content.get("title")
+    if isinstance(title, str) and title.strip():
+        parts.append(title.strip())
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        tag = node.get("tag")
+        text = node.get("text") or node.get("name")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+        if tag == "a" and isinstance(node.get("href"), str):
+            links.append({"text": str(text or node["href"]), "href": node["href"]})
+        for key in ("content", "elements"):
+            if key in node:
+                visit(node[key])
+
+    visit(content.get("content") or [])
+    metadata: dict[str, Any] = {}
+    if links:
+        metadata["links"] = links
+    return " ".join(parts).strip(), metadata
 
 
 # Cache the bot's own identity, populated at startup via the
 # /open-apis/bot/v3/info call (see app.py lifespan). Both fields
-# can be None if startup lookup failed; the @-mention check handles
-# that gracefully (it just won't match).
+# can be None if startup lookup failed; group webhook handling treats
+# missing open_id as "not ready" so we do not store or answer with a
+# biased @-mention decision.
 _self_open_id: Optional[str] = None
 _self_name: Optional[str] = None
 

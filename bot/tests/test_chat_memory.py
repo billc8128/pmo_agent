@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -291,3 +292,110 @@ def test_recent_chat_messages_excludes_deleted_and_bot_rows(monkeypatch):
 
     assert [row["message_id"] for row in rows] == ["om_1"]
     assert rows[0]["text"] == "kept"
+
+
+def _message_body(*, message_type="text", content=None, mentions=None, create_time="1778126400000"):
+    if content is None:
+        content = {"text": "hi @_user_1"}
+    return {
+        "header": {
+            "event_id": "evt_1",
+            "event_type": "im.message.receive_v1",
+        },
+        "event": {
+            "sender": {
+                "sender_id": {"open_id": "ou_sender"},
+                "sender_name": "bcc",
+            },
+            "message": {
+                "message_id": "om_1",
+                "root_id": "om_root",
+                "parent_id": "om_parent",
+                "chat_id": "oc_1",
+                "chat_type": "group",
+                "chat_member_id": "ocm_1",
+                "message_type": message_type,
+                "create_time": create_time,
+                "content": content if isinstance(content, str) else json.dumps(content),
+                "mentions": mentions
+                if mentions is not None
+                else [{"id": {"open_id": "ou_bot"}, "name": "包工头", "key": "@_user_1"}],
+            },
+        },
+    }
+
+
+def test_parse_message_event_exposes_chat_memory_fields_for_text():
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+
+    parsed = events.parse_message_event(_message_body(content={"text": "hi @_user_1 决策通过"}))
+
+    assert parsed is not None
+    assert parsed.text == "hi  决策通过" or parsed.text == "hi 决策通过"
+    assert parsed.message_type == "text"
+    assert parsed.root_message_id == "om_root"
+    assert parsed.parent_message_id == "om_parent"
+    assert parsed.occurred_at is not None
+    assert parsed.sender_display_name == "bcc"
+    assert parsed.mentions[0]["open_id"] == "ou_bot"
+    assert parsed.bot_identity_ready is True
+    assert parsed.is_at_bot is True
+
+
+def test_parse_message_event_preserves_post_text_and_metadata():
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    post_content = {
+        "title": "Spec decision",
+        "content": [
+            [
+                {"tag": "text", "text": "同意方案 A"},
+                {"tag": "a", "text": "文档", "href": "https://example.com/spec"},
+            ]
+        ],
+    }
+
+    parsed = events.parse_message_event(_message_body(message_type="post", content=post_content))
+
+    assert parsed is not None
+    assert parsed.message_type == "post"
+    assert "Spec decision" in parsed.text
+    assert "同意方案 A" in parsed.text
+    assert "文档" in parsed.text
+    assert parsed.content_metadata["links"] == [
+        {"text": "文档", "href": "https://example.com/spec"}
+    ]
+
+
+def test_parse_message_event_preserves_file_metadata_without_binary_handles():
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    file_content = {
+        "file_name": "方案.pdf",
+        "file_key": "file_v2_secret_handle",
+        "size": 1200,
+    }
+
+    parsed = events.parse_message_event(_message_body(message_type="file", content=file_content))
+
+    assert parsed is not None
+    assert parsed.message_type == "file"
+    assert "方案.pdf" in parsed.text
+    assert parsed.content_metadata == {"file_name": "方案.pdf", "size": 1200}
+    assert "file_key" not in parsed.content_metadata
+
+
+def test_group_message_without_self_open_id_is_not_identity_ready():
+    from feishu import events
+
+    events.set_self_identity(open_id=None, name="包工头")
+
+    parsed = events.parse_message_event(_message_body(content={"text": "hi @_user_1"}))
+
+    assert parsed is not None
+    assert parsed.bot_identity_ready is False
+    assert parsed.is_at_bot is False
