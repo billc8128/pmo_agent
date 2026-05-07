@@ -356,7 +356,7 @@ def unlink_external_identity(profile_id: str, provider: str) -> bool:
 def lookup_profile_by_external_login(provider: str, external_login: str, external_id: str | None = None) -> str | None:
     provider = provider.strip().lower()
     if external_id:
-        row = (
+        res = (
             sb_admin()
             .table("external_identities")
             .select("profile_id")
@@ -364,14 +364,14 @@ def lookup_profile_by_external_login(provider: str, external_login: str, externa
             .eq("external_id", str(external_id))
             .maybe_single()
             .execute()
-            .data
         )
+        row = getattr(res, "data", None)
         if row:
             return row.get("profile_id")
     login = (external_login or "").strip().lower()
     if not login:
         return None
-    row = (
+    res = (
         sb_admin()
         .table("external_identities")
         .select("profile_id")
@@ -379,8 +379,8 @@ def lookup_profile_by_external_login(provider: str, external_login: str, externa
         .eq("external_login", login)
         .maybe_single()
         .execute()
-        .data
     )
+    row = getattr(res, "data", None)
     return row.get("profile_id") if row else None
 
 

@@ -975,6 +975,47 @@ def test_link_external_identity_normalizes_login_before_write(monkeypatch):
     assert ("external_login", "hellobit") in tables[0].filters
 
 
+def test_lookup_profile_by_external_login_falls_back_when_external_id_query_returns_none(monkeypatch):
+    from db import queries
+
+    class FakeTable:
+        def __init__(self):
+            self.filters: list[tuple[str, object]] = []
+
+        def select(self, *_args):
+            return self
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def maybe_single(self):
+            return self
+
+        def execute(self):
+            if ("external_id", "12345") in self.filters:
+                return None
+            if ("external_login", "hellobit") in self.filters:
+                return SimpleNamespace(data={"profile_id": "profile-hellobit"})
+            return SimpleNamespace(data=None)
+
+    tables: list[FakeTable] = []
+
+    class FakeClient:
+        def table(self, name):
+            assert name == "external_identities"
+            table = FakeTable()
+            tables.append(table)
+            return table
+
+    monkeypatch.setattr(queries, "sb_admin", lambda: FakeClient())
+
+    assert queries.lookup_profile_by_external_login("Gitea", "HelloBit", external_id="12345") == "profile-hellobit"
+    assert ("provider", "gitea") in tables[0].filters
+    assert ("external_id", "12345") in tables[0].filters
+    assert ("external_login", "hellobit") in tables[1].filters
+
+
 def test_external_repo_helpers_normalize_repo_full_name(monkeypatch):
     from db import queries
 
