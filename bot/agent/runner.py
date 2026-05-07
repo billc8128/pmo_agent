@@ -159,6 +159,12 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 
 这些工具都依赖 host 注入的 asker 身份；如果用户未绑定飞书账号，工具会返回绑定提示，不要绕过。
 
+创建/修改/删除主动通知规则是写操作，不是资料查询：
+- 用户让你“以后/每次/有进展时通知/告诉/发到某处”这类管理规则时，直接调用 add_subscription / update_subscription / remove_subscription，不要先调用 list_connected_repos、query_repo、get_recent_turns 或 get_project_overview 来调查内容是否存在。
+- add_subscription 的 description 应保留用户的自然语言需求本身；不要为了“确认项目”而把它改写成你调查后的结论。
+- 在群聊里，默认 scope_kind=chat；如果用户表达通知要留在当前对话，就让工具使用默认群目标或显式 target_kind=chat。不要把群通知误解析成发给某个被提到的个人。
+- 工具返回成功后，简短确认规则已创建；不要继续查数据。
+
 当用户回复一条主动通知时，消息里可能会带 `[parent_notification]` block。它是被回复通知的冻结事件快照；遇到“这次”“这个改动”这类指代时，优先用它理解上下文。
 
 硬规则：

@@ -75,53 +75,6 @@ async def test_handle_message_times_out_hanging_streaming_agent(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_group_send_to_this_chat_subscription_uses_fast_path(monkeypatch):
-    fake_feishu = _FakeFeishuClient()
-    added: list[dict] = []
-    monkeypatch.setattr(bot_app, "feishu_client", fake_feishu)
-    monkeypatch.setattr(
-        bot_app.db_queries,
-        "lookup_by_feishu_open_id",
-        lambda open_id: {"user_id": "user-1", "handle": "bcc", "display_name": "bcc"},
-    )
-    monkeypatch.setattr(
-        bot_app.db_queries,
-        "add_subscription",
-        lambda **kwargs: added.append(kwargs) or {"id": "sub-1", **kwargs},
-    )
-
-    async def fail_answer_streaming(*args, **kwargs):
-        raise AssertionError("fast-path subscription commands must not enter the agent")
-        yield
-
-    monkeypatch.setattr(bot_app.agent_runner, "answer_streaming", fail_answer_streaming)
-
-    event = ParsedMessageEvent(
-        event_id="evt-group-sub",
-        chat_id="chat-group",
-        chat_type="group",
-        sender_open_id="ou-user",
-        sender_chat_member_id=None,
-        message_id="om-sub",
-        parent_message_id="",
-        text="vibelive的dev分支每次有新push的时候，都总结下该次push的改动和技术方案发到这个群里",
-        is_at_bot=True,
-    )
-
-    await bot_app._handle_message(event)
-
-    assert len(added) == 1
-    assert added[0]["scope_kind"] == "chat"
-    assert added[0]["scope_id"] == "chat-group"
-    assert added[0]["target_kind"] == "chat"
-    assert added[0]["target_id"] == "chat-group"
-    assert added[0]["created_by"] == "user-1"
-    assert "vibelive" in added[0]["description"]
-    assert [kind for kind, _payload in fake_feishu.replies] == ["text"]
-    assert "发到这个群" in fake_feishu.replies[0][1]
-
-
-@pytest.mark.anyio
 async def test_handle_message_consumes_target_consent_reply(monkeypatch):
     fake_feishu = _FakeFeishuClient()
     granted: list[tuple[str, str]] = []
