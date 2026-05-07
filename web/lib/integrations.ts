@@ -56,26 +56,17 @@ export type PublicExternalDelivery = {
 export function validateExternalRepoInput(
   providerValue: string,
   repoValue: string,
-  projectRootValue: string,
 ): {
   provider: ExternalProvider;
   repoFullName: string;
   projectRoot: string;
+  repoUrl: string;
 } {
   const provider = normalizeProvider(providerValue);
-  const repoFullName = repoValue.trim().toLowerCase();
-  const projectRoot = projectRootValue.trim().replace(/\/+$/, '');
+  const { repoFullName, repoUrl } = parseRepoUrl(provider, repoValue);
+  const projectRoot = `${provider}:${repoFullName}`;
 
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFullName)) {
-    throw new Error('repo must look like owner/name');
-  }
-  if (!projectRoot.startsWith('/')) {
-    throw new Error('project root must be an absolute path');
-  }
-  if (projectRoot.includes('\n') || projectRoot.includes('\0')) {
-    throw new Error('project root contains invalid characters');
-  }
-  return { provider, repoFullName, projectRoot };
+  return { provider, repoFullName, projectRoot, repoUrl };
 }
 
 export function normalizeProvider(value: string): ExternalProvider {
@@ -130,6 +121,47 @@ export function buildWebhookUrl(baseUrl: string, provider: ExternalProvider): st
   const base = baseUrl.trim().replace(/\/+$/, '');
   if (!base) return `/webhooks/${provider}`;
   return `${base}/webhooks/${provider}`;
+}
+
+function parseRepoUrl(
+  provider: ExternalProvider,
+  rawValue: string,
+): { repoFullName: string; repoUrl: string } {
+  const value = rawValue.trim();
+  if (!value) {
+    throw new Error('repository URL is required');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('repository must be a GitHub or Gitea URL');
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('repository URL must start with https:// or http://');
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (provider === 'github' && host !== 'github.com' && host !== 'www.github.com') {
+    throw new Error('GitHub URL must use github.com');
+  }
+
+  const [owner, repoRaw] = parsed.pathname
+    .split('/')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const repo = (repoRaw ?? '').replace(/\.git$/i, '');
+  const repoFullName = `${owner ?? ''}/${repo}`.toLowerCase();
+
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repoFullName)) {
+    throw new Error('repository URL must include owner/name');
+  }
+
+  return {
+    repoFullName,
+    repoUrl: `${parsed.protocol}//${host}/${repoFullName}`,
+  };
 }
 
 function shortenDeliveryId(value: string): string {

@@ -34,11 +34,16 @@ export default async function IntegrationsPage() {
     process.env.BOT_WEBHOOK_BASE_URL ??
     process.env.NEXT_PUBLIC_BOT_WEBHOOK_BASE_URL ??
     '';
+  const githubAppInstallUrl =
+    process.env.GITHUB_APP_INSTALL_URL ??
+    process.env.NEXT_PUBLIC_GITHUB_APP_INSTALL_URL ??
+    null;
 
   if (!user) {
     const providers = EXTERNAL_PROVIDERS.map((provider) => ({
       provider,
       webhookUrl: buildWebhookUrl(botBaseUrl, provider),
+      installUrl: provider === 'github' ? githubAppInstallUrl : null,
       repoCount: 0,
       latestDeliveryAt: null,
     }));
@@ -110,6 +115,7 @@ export default async function IntegrationsPage() {
     return {
       provider,
       webhookUrl: buildWebhookUrl(botBaseUrl, provider),
+      installUrl: provider === 'github' ? githubAppInstallUrl : null,
       repoCount: repos.filter((repo) => repo.provider === provider).length,
       latestDeliveryAt: providerDeliveries[0]?.receivedAt ?? null,
     };

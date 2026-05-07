@@ -12,8 +12,7 @@ export async function createExternalRepoMapping(formData: FormData) {
   const user = await requireIntegrationManager();
   const { provider, repoFullName, projectRoot } = validateExternalRepoInput(
     String(formData.get('provider') ?? ''),
-    String(formData.get('repoFullName') ?? ''),
-    String(formData.get('projectRoot') ?? ''),
+    String(formData.get('repoUrl') ?? ''),
   );
 
   const { error } = await adminClient()

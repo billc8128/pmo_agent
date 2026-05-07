@@ -12,26 +12,32 @@ const {
 } = await import('./integrations.ts');
 const { canManageIntegrations } = await import('./integration-permissions.ts');
 
-test('validates external repo mappings for supported providers', () => {
+test('validates external repo URLs for supported providers', () => {
   assert.deepEqual(
-    validateExternalRepoInput(' GitHub ', ' BillC8128/VibeLive ', '/Users/a/Desktop/vibelive/'),
+    validateExternalRepoInput(' GitHub ', ' https://github.com/BillC8128/VibeLive '),
     {
       provider: 'github',
       repoFullName: 'billc8128/vibelive',
-      projectRoot: '/Users/a/Desktop/vibelive',
+      projectRoot: 'github:billc8128/vibelive',
+      repoUrl: 'https://github.com/billc8128/vibelive',
+    },
+  );
+  assert.deepEqual(
+    validateExternalRepoInput('gitea', 'https://git.example.com/Team/Internal/src/branch/main'),
+    {
+      provider: 'gitea',
+      repoFullName: 'team/internal',
+      projectRoot: 'gitea:team/internal',
+      repoUrl: 'https://git.example.com/team/internal',
     },
   );
   assert.throws(
-    () => validateExternalRepoInput('gitlab', 'billc8128/vibelive', '/repo/vibelive'),
+    () => validateExternalRepoInput('gitlab', 'https://github.com/billc8128/vibelive'),
     /provider/,
   );
   assert.throws(
-    () => validateExternalRepoInput('github', 'not-a-repo', '/repo/vibelive'),
-    /owner\/name/,
-  );
-  assert.throws(
-    () => validateExternalRepoInput('github', 'billc8128/vibelive', 'relative/path'),
-    /absolute path/,
+    () => validateExternalRepoInput('github', 'https://notgithub.example.com/billc8128/vibelive'),
+    /GitHub URL/,
   );
 });
 
