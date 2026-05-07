@@ -1519,6 +1519,180 @@ def test_list_pull_requests_remote_normalizes_gitea_response(monkeypatch):
     }
 
 
+def test_query_repo_reads_and_redacts_file_content(monkeypatch):
+    from external import fetch
+
+    secret = "ghp_1234567890abcdefghijklmnopqrstuvwxyz1234"
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            assert url.endswith("/repos/ailab/vibelive/contents/src/config.ts")
+            return FakeResponse(
+                {
+                    "name": "config.ts",
+                    "path": "src/config.ts",
+                    "type": "file",
+                    "encoding": "base64",
+                    "content": "ZXhwb3J0IGNvbnN0IHRva2VuID0gIg==" + "\n",
+                }
+            )
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(fetch, "_decode_content_blob", lambda _row: f"export const token = \"{secret}\"")
+
+    result = asyncio.run(
+        fetch.query_repo("gitea", "ailab/vibelive", kind="file", path="src/config.ts", max_chars=2000)
+    )
+
+    assert result["kind"] == "file"
+    assert result["path"] == "src/config.ts"
+    assert secret not in result["content"]
+    assert result["content"] == 'export const token = "[REDACTED]"'
+
+
+def test_query_repo_lists_tree_from_recursive_git_tree(monkeypatch):
+    from external import fetch
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "tree": [
+                    {"path": "src", "type": "tree", "size": None},
+                    {"path": "src/app.ts", "type": "blob", "size": 120},
+                    {"path": "README.md", "type": "blob", "size": 80},
+                ]
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            assert url.endswith("/repos/ailab/vibelive/git/trees/main")
+            assert kwargs["params"] == {"recursive": 1}
+            return FakeResponse()
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(fetch.query_repo("gitea", "ailab/vibelive", kind="tree", ref="main", limit=2))
+
+    assert result["kind"] == "tree"
+    assert result["entries"] == [
+        {"path": "src", "type": "tree", "size": None},
+        {"path": "src/app.ts", "type": "blob", "size": 120},
+    ]
+    assert result["truncated"] is True
+
+
+def test_query_repo_search_reads_limited_text_files(monkeypatch):
+    from external import fetch
+
+    calls: list[str] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append(url)
+            if "/git/trees/" in url:
+                return FakeResponse(
+                    {
+                        "tree": [
+                            {"path": "src/player.ts", "type": "blob", "size": 120},
+                            {"path": "src/other.ts", "type": "blob", "size": 120},
+                        ]
+                    }
+                )
+            if url.endswith("/contents/src/player.ts"):
+                return FakeResponse(
+                    {
+                        "path": "src/player.ts",
+                        "type": "file",
+                        "encoding": "base64",
+                        "content": "Y29uc3QgZm9vID0gImJhciI=",
+                    }
+                )
+            return FakeResponse(
+                {
+                    "path": "src/other.ts",
+                    "type": "file",
+                    "encoding": "base64",
+                    "content": "bm8gbWF0Y2g=",
+                }
+            )
+
+    monkeypatch.setattr(fetch.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(
+        fetch,
+        "_decode_content_blob",
+        lambda row: "function getRemoteVideoStats() {}" if row["path"] == "src/player.ts" else "no match",
+    )
+
+    result = asyncio.run(fetch.query_repo("gitea", "ailab/vibelive", kind="search", query="getRemoteVideoStats", limit=5))
+
+    assert result["kind"] == "search"
+    assert result["matches"] == [
+        {
+            "path": "src/player.ts",
+            "line": 1,
+            "excerpt": "function getRemoteVideoStats() {}",
+            "match_type": "content",
+        }
+    ]
+    assert len(calls) == 3
+
+
 def test_investigator_fetch_pr_files_passes_head_sha_from_event(monkeypatch):
     source = Path("bot/agent/investigator.py").read_text()
 

@@ -17,6 +17,7 @@ def test_external_tools_include_repo_pull_request_tools():
     names = [tool_def.name for tool_def in build_external_tools(RequestContext())]
 
     assert "list_connected_repos" in names
+    assert "query_repo" in names
     assert "list_pull_requests" in names
 
 
@@ -193,3 +194,47 @@ def test_list_pull_requests_uses_external_provider_fetch(monkeypatch):
     assert payload["repo_full_name"] == "ailab/vibelive"
     assert payload["pull_requests"][0]["number"] == 88
     fetcher.assert_awaited_once_with(provider="gitea", repo_full_name="ailab/vibelive", state="all", limit=1)
+
+
+def test_query_repo_tool_uses_generic_external_fetch(monkeypatch):
+    from agent import tools_external
+
+    fetcher = AsyncMock(
+        return_value={
+            "kind": "commits",
+            "provider": "gitea",
+            "repo_full_name": "ailab/vibelive",
+            "commits": [{"sha": "abc123", "message": "fix player"}],
+        }
+    )
+    monkeypatch.setattr(tools_external, "external_fetch", SimpleNamespace(query_repo=fetcher), raising=False)
+
+    out = asyncio.run(
+        _tool(RequestContext(), "query_repo")(
+            {
+                "provider": "Gitea",
+                "repo_full_name": "AILAB/VibeLive",
+                "kind": "commits",
+                "ref": "main",
+                "path": "",
+                "query": "",
+                "state": "",
+                "limit": 3,
+                "max_chars": 1000,
+            }
+        )
+    )
+
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["commits"][0]["message"] == "fix player"
+    fetcher.assert_awaited_once_with(
+        provider="gitea",
+        repo_full_name="ailab/vibelive",
+        kind="commits",
+        ref="main",
+        path="",
+        query="",
+        state="",
+        limit=3,
+        max_chars=1000,
+    )

@@ -138,7 +138,45 @@ def build_external_tools(ctx: RequestContext):
         except Exception as e:
             return err(str(e))
 
-    return [resolve_feishu_link, read_doc, read_external_table, list_connected_repos, list_pull_requests]
+    @tool(
+        "query_repo",
+        (
+            "Read connected GitHub/Gitea repository context. kind can be overview, prs, commits, "
+            "branches, releases, tree, file, or search. Use provider/repo_full_name from list_connected_repos."
+        ),
+        {
+            "provider": str,
+            "repo_full_name": str,
+            "kind": str,
+            "ref": str,
+            "path": str,
+            "query": str,
+            "state": str,
+            "limit": int,
+            "max_chars": int,
+        },
+    )
+    async def query_repo(args: dict) -> dict[str, Any]:
+        try:
+            provider = (args.get("provider") or "").strip().lower()
+            repo_full_name = (args.get("repo_full_name") or "").strip().lower()
+            return ok(
+                await external_fetch.query_repo(
+                    provider=provider,
+                    repo_full_name=repo_full_name,
+                    kind=(args.get("kind") or "").strip().lower(),
+                    ref=(args.get("ref") or "").strip() or None,
+                    path=(args.get("path") or "").strip(),
+                    query=(args.get("query") or "").strip(),
+                    state=(args.get("state") or "").strip().lower(),
+                    limit=min(max(int(args.get("limit") or 10), 1), 100),
+                    max_chars=min(max(int(args.get("max_chars") or 12000), 200), 20000),
+                )
+            )
+        except Exception as e:
+            return err(str(e))
+
+    return [resolve_feishu_link, read_doc, read_external_table, list_connected_repos, query_repo, list_pull_requests]
 
 
 def _prune_external_table_calls(now: float) -> None:

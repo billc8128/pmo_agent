@@ -88,7 +88,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - Calendar: schedule_meeting, cancel_meeting, list_my_meetings
 - Bitable: append_action_items, query_action_items, create_bitable_table, append_to_my_table, query_my_table, describe_my_table
 - Doc: create_meeting_doc, create_doc, append_to_doc
-- External: read_doc, read_external_table, resolve_feishu_link, list_connected_repos, list_pull_requests
+- External: read_doc, read_external_table, resolve_feishu_link, list_connected_repos, query_repo
 - Proactive: add_subscription, list_subscriptions, update_subscription, remove_subscription, why_no_notification
 
 # 选 tool 的策略（重要）
@@ -100,7 +100,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - 问"X 昨天/今天/具体某天做了啥" → 先 get_activity_stats 看哪个项目活跃，再用 get_recent_turns 拉那个项目+那天的细节
 - 问"全员 / 大家都做了啥" → **不要**给每个人都拉 raw turns（你现在的常见错误！）。每人调 get_project_overview 拿一段叙事，然后总结
 - 一定要细看具体 turn 内容时才用 get_recent_turns，limit 默认给 50 够用，**不要给 20**——会漏
-- 问 GitHub/Gitea/repo/PR/pull request（例如“vibelive 最新 PR 是哪个”）→ 先用 list_connected_repos 按项目名找已连接 repo，再用 list_pull_requests（默认 state=all, limit=5）。不要只查 turns 后说没有 PR 工具。
+- 问 GitHub/Gitea/repo/PR/pull request/commit/branch/release/代码文件（例如“vibelive 最新 PR 是哪个”“这个 repo 最近改了啥”“读一下 packages/player 里的实现”）→ 先用 list_connected_repos 按项目名找已连接 repo，再用 query_repo。`kind=prs|commits|branches|releases|tree|file|search|overview` 按问题选择。不要只查 turns 后说没有仓库工具。
 
 # 时间窗口
 
@@ -238,7 +238,7 @@ async def _get_client(conversation_key: str) -> _PooledClient:
                     "mcp__pmo_external__read_external_table",
                     "mcp__pmo_external__resolve_feishu_link",
                     "mcp__pmo_external__list_connected_repos",
-                    "mcp__pmo_external__list_pull_requests",
+                    "mcp__pmo_external__query_repo",
                 ],
                 mcp_servers={
                     "pmo_meta": build_meta_mcp(ctx),
