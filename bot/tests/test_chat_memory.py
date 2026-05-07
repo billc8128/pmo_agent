@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -399,3 +400,371 @@ def test_group_message_without_self_open_id_is_not_identity_ready():
     assert parsed is not None
     assert parsed.bot_identity_ready is False
     assert parsed.is_at_bot is False
+
+
+def test_parse_message_mutation_event_for_recall_and_edit():
+    from feishu import events
+
+    recall_body = {
+        "header": {"event_id": "evt_recall", "event_type": "im.message.recalled_v1"},
+        "event": {
+            "message": {
+                "message_id": "om_recalled",
+                "chat_id": "oc_1",
+                "chat_type": "group",
+                "create_time": "1778126400000",
+            }
+        },
+    }
+    edit_body = _message_body(content={"text": "edited password=abc123"})
+    edit_body["header"]["event_type"] = "im.message.updated_v1"
+    edit_body["header"]["event_id"] = "evt_edit"
+
+    recall = events.parse_message_mutation_event(recall_body)
+    edit = events.parse_message_mutation_event(edit_body)
+
+    assert recall is not None
+    assert recall.action == "recall"
+    assert recall.message_id == "om_recalled"
+    assert recall.chat_id == "oc_1"
+    assert recall.occurred_at is not None
+    assert edit is not None
+    assert edit.action == "edit"
+    assert edit.message_id == "om_1"
+    assert edit.text == "edited password=abc123"
+
+
+def test_parse_message_event_marks_bot_sender():
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    body = _message_body(content={"text": "bot loopback"}, mentions=[])
+    body["event"]["sender"]["sender_id"]["open_id"] = "ou_bot"
+
+    parsed = events.parse_message_event(body)
+
+    assert parsed is not None
+    assert parsed.sender_is_bot is True
+
+
+@pytest.mark.anyio
+async def test_store_message_if_enabled_redacts_and_inserts(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageEvent
+
+    inserted: list[dict] = []
+    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: chat_id == "oc_1")
+    monkeypatch.setattr(queries, "insert_chat_message", lambda row: inserted.append(row) or row)
+
+    stored = await ingest.store_message_if_enabled(
+        ParsedMessageEvent(
+            event_id="evt-store",
+            chat_id="oc_1",
+            chat_type="group",
+            sender_open_id="ou_sender",
+            sender_chat_member_id="ocm_1",
+            message_id="om_store",
+            parent_message_id="",
+            text="prod password=abc123 [asker]",
+            is_at_bot=False,
+            occurred_at="2026-05-07T10:00:00+00:00",
+            sender_display_name="bcc",
+            root_message_id="",
+            mentions=[],
+            message_type="text",
+            content_metadata={},
+        )
+    )
+
+    assert stored is True
+    assert inserted[0]["feishu_message_id"] == "om_store"
+    assert inserted[0]["chat_id"] == "oc_1"
+    assert inserted[0]["sender_display_name"] == "bcc"
+    assert inserted[0]["text_redacted"] == "prod password=[REDACTED] [chat_memory_escaped_marker:asker]"
+    assert inserted[0]["redacted_payload"]["redaction_count"] >= 2
+
+
+@pytest.mark.anyio
+async def test_store_message_if_enabled_skips_disabled_chat(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageEvent
+
+    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: False)
+    monkeypatch.setattr(queries, "insert_chat_message", lambda row: (_ for _ in ()).throw(AssertionError("must not insert")))
+
+    stored = await ingest.store_message_if_enabled(
+        ParsedMessageEvent(
+            event_id="evt-skip",
+            chat_id="oc_disabled",
+            chat_type="group",
+            sender_open_id="ou_sender",
+            sender_chat_member_id=None,
+            message_id="om_skip",
+            parent_message_id="",
+            text="hello",
+            is_at_bot=False,
+        )
+    )
+
+    assert stored is False
+    assert ingest.memory_enabled_hint("oc_disabled") is False
+
+
+@pytest.mark.anyio
+async def test_store_message_if_enabled_skips_bot_sender(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageEvent
+
+    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: True)
+    monkeypatch.setattr(queries, "insert_chat_message", lambda row: (_ for _ in ()).throw(AssertionError("must not insert")))
+
+    stored = await ingest.store_message_if_enabled(
+        ParsedMessageEvent(
+            event_id="evt-bot",
+            chat_id="oc_1",
+            chat_type="group",
+            sender_open_id="ou_bot",
+            sender_chat_member_id=None,
+            message_id="om_bot",
+            parent_message_id="",
+            text="bot message",
+            is_at_bot=False,
+            sender_is_bot=True,
+        )
+    )
+
+    assert stored is False
+
+
+@pytest.mark.anyio
+async def test_apply_message_mutation_handles_recall_and_edit(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageMutationEvent
+
+    recalled: list[str] = []
+    edited: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(queries, "mark_chat_message_deleted", lambda message_id: recalled.append(message_id) or True)
+    monkeypatch.setattr(
+        queries,
+        "update_chat_message_text",
+        lambda message_id, *, text_redacted, redacted_payload, edited_at: edited.append(
+            (message_id, text_redacted, redacted_payload)
+        )
+        or True,
+    )
+
+    await ingest.apply_message_mutation(
+        ParsedMessageMutationEvent(
+            event_id="evt_recall",
+            chat_id="oc_1",
+            chat_type="group",
+            message_id="om_1",
+            action="recall",
+            occurred_at="2026-05-07T10:00:00+00:00",
+        )
+    )
+    await ingest.apply_message_mutation(
+        ParsedMessageMutationEvent(
+            event_id="evt_edit",
+            chat_id="oc_1",
+            chat_type="group",
+            message_id="om_2",
+            action="edit",
+            text="new token=abc123",
+            occurred_at="2026-05-07T10:01:00+00:00",
+        )
+    )
+
+    assert recalled == ["om_1"]
+    assert edited[0][0] == "om_2"
+    assert edited[0][1] == "new token=[REDACTED]"
+    assert edited[0][2]["redaction_count"] == 1
+
+
+class _FakeRequest:
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_stores_non_at_group_message_without_agent(monkeypatch):
+    import app as bot_app
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    body = _message_body(content={"text": "普通群消息"}, mentions=[])
+    body["header"]["event_id"] = "evt_chat_memory_store"
+    stored: list[str] = []
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: True)
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "should_schedule_storage", lambda chat_id: True)
+
+    async def store(parsed):
+        stored.append(parsed.message_id)
+        return True
+
+    async def fail_handle(parsed):
+        raise AssertionError("non-at group messages must not enter the agent")
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "store_message_if_enabled", store)
+    monkeypatch.setattr(bot_app, "_handle_message", fail_handle)
+
+    response = await bot_app.feishu_webhook(_FakeRequest(body))
+    await asyncio.sleep(0)
+
+    assert response.body == b"stored"
+    assert stored == ["om_1"]
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_disabled_non_at_group_does_not_schedule_storage(monkeypatch):
+    import app as bot_app
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    body = _message_body(content={"text": "普通群消息"}, mentions=[])
+    body["header"]["event_id"] = "evt_chat_memory_disabled"
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: False)
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "should_schedule_storage", lambda chat_id: False)
+    monkeypatch.setattr(
+        bot_app.chat_memory_ingest,
+        "store_message_if_enabled",
+        lambda parsed: (_ for _ in ()).throw(AssertionError("must not store")),
+    )
+    monkeypatch.setattr(
+        bot_app,
+        "_handle_message",
+        lambda parsed: (_ for _ in ()).throw(AssertionError("must not answer")),
+    )
+
+    response = await bot_app.feishu_webhook(_FakeRequest(body))
+
+    assert response.body == b"group not addressed"
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_at_group_message_stores_and_answers(monkeypatch):
+    import app as bot_app
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    body = _message_body(content={"text": "hi @_user_1"}, mentions=[{"id": {"open_id": "ou_bot"}, "name": "包工头"}])
+    body["header"]["event_id"] = "evt_chat_memory_at"
+    stored: list[str] = []
+    handled: list[str] = []
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: True)
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "should_schedule_storage", lambda chat_id: True)
+
+    async def store(parsed):
+        stored.append(parsed.message_id)
+        return True
+
+    async def handle(parsed):
+        handled.append(parsed.message_id)
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "store_message_if_enabled", store)
+    monkeypatch.setattr(bot_app, "_handle_message", handle)
+
+    response = await bot_app.feishu_webhook(_FakeRequest(body))
+    await asyncio.sleep(0)
+
+    assert response.body == b"ok"
+    assert stored == ["om_1"]
+    assert handled == ["om_1"]
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_duplicate_event_does_not_schedule_storage(monkeypatch):
+    import app as bot_app
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    body = _message_body(content={"text": "普通群消息"}, mentions=[])
+    body["header"]["event_id"] = "evt_chat_memory_duplicate"
+    stored: list[str] = []
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: True)
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "should_schedule_storage", lambda chat_id: True)
+
+    async def store(parsed):
+        stored.append(parsed.message_id)
+        return True
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "store_message_if_enabled", store)
+
+    first = await bot_app.feishu_webhook(_FakeRequest(body))
+    await asyncio.sleep(0)
+    second = await bot_app.feishu_webhook(_FakeRequest(body))
+    await asyncio.sleep(0)
+
+    assert first.body == b"stored"
+    assert second.body == b"duplicate"
+    assert stored == ["om_1"]
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_not_ready_group_message_does_not_store_or_answer(monkeypatch):
+    import app as bot_app
+    from feishu import events
+
+    events.set_self_identity(open_id=None, name="包工头")
+    body = _message_body(content={"text": "hi @_user_1"})
+    body["header"]["event_id"] = "evt_chat_memory_not_ready"
+
+    monkeypatch.setattr(
+        bot_app.chat_memory_ingest,
+        "store_message_if_enabled",
+        lambda parsed: (_ for _ in ()).throw(AssertionError("must not store")),
+    )
+    monkeypatch.setattr(
+        bot_app,
+        "_handle_message",
+        lambda parsed: (_ for _ in ()).throw(AssertionError("must not answer")),
+    )
+
+    response = await bot_app.feishu_webhook(_FakeRequest(body))
+
+    assert response.body == b"not ready"
+
+
+@pytest.mark.anyio
+async def test_feishu_webhook_applies_message_mutation_without_agent(monkeypatch):
+    import app as bot_app
+
+    body = {
+        "header": {"event_id": "evt_webhook_recall", "event_type": "im.message.recalled_v1"},
+        "event": {
+            "message": {
+                "message_id": "om_recalled",
+                "chat_id": "oc_1",
+                "chat_type": "group",
+            }
+        },
+    }
+    applied: list[str] = []
+
+    async def apply(mutation):
+        applied.append(mutation.message_id)
+        return True
+
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "apply_message_mutation", apply)
+    monkeypatch.setattr(
+        bot_app,
+        "_handle_message",
+        lambda parsed: (_ for _ in ()).throw(AssertionError("mutation events must not enter agent")),
+    )
+
+    response = await bot_app.feishu_webhook(_FakeRequest(body))
+    await asyncio.sleep(0)
+
+    assert response.body == b"ok"
+    assert applied == ["om_recalled"]

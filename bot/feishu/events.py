@@ -68,6 +68,20 @@ class ParsedMessageEvent:
     message_type: str = "text"
     content_metadata: dict[str, Any] = field(default_factory=dict)
     bot_identity_ready: bool = True
+    sender_is_bot: bool = False
+
+
+@dataclass
+class ParsedMessageMutationEvent:
+    event_id: str
+    chat_id: str
+    chat_type: str
+    message_id: str
+    action: str  # "recall" | "edit"
+    text: str = ""
+    occurred_at: Optional[str] = None
+    message_type: str = "text"
+    content_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ── URL verification handshake ───────────────────────────────────────
@@ -189,7 +203,60 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
         message_type=msg_type,
         content_metadata=content_metadata,
         bot_identity_ready=bot_identity_ready,
+        sender_is_bot=bool(self_oid and sender_open_id == self_oid),
     )
+
+
+def parse_message_mutation_event(body: dict) -> Optional[ParsedMessageMutationEvent]:
+    header = body.get("header") or {}
+    event = body.get("event") or {}
+    event_type = header.get("event_type")
+    action = _mutation_action(event_type)
+    if action is None:
+        return None
+
+    msg = event.get("message") or {}
+    chat_id = msg.get("chat_id", "")
+    message_id = msg.get("message_id") or msg.get("old_message_id") or ""
+    if not chat_id or not message_id:
+        return None
+    msg_type = msg.get("message_type") or "text"
+    text = ""
+    content_metadata: dict[str, Any] = {}
+    if action == "edit":
+        raw_content = msg.get("content") or "{}"
+        try:
+            content = json.loads(raw_content)
+        except Exception:
+            return None
+        text, content_metadata = _extract_message_text_and_metadata(msg_type, content)
+        text = re.sub(r"@_user_\d+", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return None
+    return ParsedMessageMutationEvent(
+        event_id=header.get("event_id") or "",
+        chat_id=chat_id,
+        chat_type="p2p" if msg.get("chat_type") == "p2p" else "group",
+        message_id=message_id,
+        action=action,
+        text=text,
+        occurred_at=_parse_feishu_time(msg.get("create_time") or event.get("create_time")),
+        message_type=msg_type,
+        content_metadata=content_metadata,
+    )
+
+
+def _mutation_action(event_type: Any) -> Optional[str]:
+    if event_type in {"im.message.recalled_v1", "im.message.recall_v1"}:
+        return "recall"
+    if event_type in {
+        "im.message.updated_v1",
+        "im.message.message_updated_v1",
+        "im.message.edited_v1",
+    }:
+        return "edit"
+    return None
 
 
 def _parse_feishu_time(value: Any) -> Optional[str]:

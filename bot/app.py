@@ -34,6 +34,7 @@ from feishu import cards
 from feishu import events as feishu_events
 from feishu import post_format
 from feishu.client import feishu_client
+from chat_memory import ingest as chat_memory_ingest
 from external.webhooks import router as external_webhook_router
 
 logging.basicConfig(
@@ -111,15 +112,51 @@ async def feishu_webhook(request: Request):
     if eid and feishu_events.already_seen(eid):
         return PlainTextResponse("duplicate")
 
+    mutation = feishu_events.parse_message_mutation_event(body)
+    if mutation is not None:
+        asyncio.create_task(_apply_chat_memory_mutation(mutation))
+        return PlainTextResponse("ok")
+
     parsed = feishu_events.parse_message_event(body)
     if parsed is None:
         return PlainTextResponse("ignored")
 
+    if parsed.chat_type == "group" and not parsed.bot_identity_ready:
+        return PlainTextResponse("not ready")
+
+    if parsed.chat_type == "group" and chat_memory_ingest.should_schedule_storage(parsed.chat_id):
+        asyncio.create_task(_store_chat_memory_message(parsed))
+
     if parsed.chat_type == "group" and not parsed.is_at_bot:
+        if chat_memory_ingest.memory_enabled_hint(parsed.chat_id):
+            return PlainTextResponse("stored")
         return PlainTextResponse("group not addressed")
 
     asyncio.create_task(_handle_message(parsed))
     return PlainTextResponse("ok")
+
+
+async def _store_chat_memory_message(parsed: feishu_events.ParsedMessageEvent) -> None:
+    try:
+        await chat_memory_ingest.store_message_if_enabled(parsed)
+    except Exception:
+        logger.exception(
+            "chat memory background ingest failed: chat=%s message=%s",
+            parsed.chat_id,
+            parsed.message_id,
+        )
+
+
+async def _apply_chat_memory_mutation(mutation: feishu_events.ParsedMessageMutationEvent) -> None:
+    try:
+        await chat_memory_ingest.apply_message_mutation(mutation)
+    except Exception:
+        logger.exception(
+            "chat memory mutation failed: chat=%s message=%s action=%s",
+            mutation.chat_id,
+            mutation.message_id,
+            mutation.action,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
