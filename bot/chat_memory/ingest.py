@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from db import queries
-from external.redaction import redact_text_with_categories
+from external.redaction import redact_payload, redact_text_with_categories
 from feishu.events import ParsedMessageEvent, ParsedMessageMutationEvent
 
 logger = logging.getLogger(__name__)
@@ -72,12 +72,15 @@ def _redacted_payload(
     text_redacted: str,
     categories: dict[str, int],
     content_metadata: dict[str, Any],
+    metadata_redaction_count: int = 0,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "text": text_redacted,
-        "redaction_count": sum(categories.values()),
+        "redaction_count": sum(categories.values()) + metadata_redaction_count,
         "redaction_categories": categories,
     }
+    if metadata_redaction_count:
+        payload["metadata_redaction_count"] = metadata_redaction_count
     if content_metadata:
         payload["content_metadata"] = content_metadata
     return payload
@@ -115,10 +118,12 @@ async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
         return False
 
     text_redacted, categories = _redact_for_message_type(ev.text, ev.message_type)
+    content_metadata, metadata_redaction_count = redact_payload(ev.content_metadata)
     redacted_payload = _redacted_payload(
         text_redacted=text_redacted,
         categories=categories,
-        content_metadata=ev.content_metadata,
+        content_metadata=content_metadata,
+        metadata_redaction_count=metadata_redaction_count,
     )
 
     row = {
@@ -131,7 +136,7 @@ async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
         "message_type": ev.message_type,
         "text_redacted": text_redacted,
         "redacted_payload": redacted_payload,
-        "content_metadata": ev.content_metadata,
+        "content_metadata": content_metadata,
         "parent_message_id": ev.parent_message_id or None,
         "root_message_id": ev.root_message_id or None,
         "mentions": ev.mentions,
@@ -145,7 +150,7 @@ async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
         ev.chat_id,
         ev.message_id,
         ev.message_type,
-        sum(categories.values()),
+        sum(categories.values()) + metadata_redaction_count,
         sorted(categories.keys()),
     )
     return True
@@ -163,10 +168,12 @@ async def apply_message_mutation(ev: ParsedMessageMutationEvent) -> bool:
         return bool(ok)
     if ev.action == "edit":
         text_redacted, categories = _redact_for_message_type(ev.text, ev.message_type)
+        content_metadata, metadata_redaction_count = redact_payload(ev.content_metadata)
         payload = _redacted_payload(
             text_redacted=text_redacted,
             categories=categories,
-            content_metadata=ev.content_metadata,
+            content_metadata=content_metadata,
+            metadata_redaction_count=metadata_redaction_count,
         )
         ok = queries.update_chat_message_text(
             ev.message_id,
@@ -179,7 +186,7 @@ async def apply_message_mutation(ev: ParsedMessageMutationEvent) -> bool:
             ev.chat_id,
             ev.message_id,
             bool(ok),
-            sum(categories.values()),
+            sum(categories.values()) + metadata_redaction_count,
             sorted(categories.keys()),
         )
         return bool(ok)

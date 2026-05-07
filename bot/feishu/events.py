@@ -25,6 +25,9 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+_CONVERSATIONAL_MESSAGE_TYPES = frozenset({"text", "post"})
+_INGESTABLE_MESSAGE_TYPES = frozenset({"text", "post", "file", "share_chat", "share_user", "link"})
+
 
 # ── LRU dedup for event_id (Feishu retries on 5xx within ~5min) ───────
 
@@ -149,6 +152,9 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
     except Exception:
         return None
 
+    if msg_type not in _INGESTABLE_MESSAGE_TYPES:
+        return None
+
     text, content_metadata = _extract_message_text_and_metadata(msg_type, content)
     if not text:
         return None
@@ -203,7 +209,7 @@ def parse_message_event(body: dict) -> Optional[ParsedMessageEvent]:
         mentions=mentions,
         message_type=msg_type,
         content_metadata=content_metadata,
-        is_conversational=msg_type in {"text", "post"},
+        is_conversational=msg_type in _CONVERSATIONAL_MESSAGE_TYPES,
         bot_identity_ready=bot_identity_ready,
         sender_is_bot=bool(self_oid and sender_open_id == self_oid),
     )
@@ -331,10 +337,11 @@ def _extract_message_text_and_metadata(msg_type: str, content: dict[str, Any]) -
         name = str(content.get("name") or content.get("user_name") or "Shared user").strip()
         return f"Shared user: {name}", {"name": name}
     if msg_type == "link":
-        title = str(content.get("title") or content.get("name") or "Shared link").strip()
+        title = str(content.get("title") or content.get("name") or "").strip()
         url = str(content.get("url") or content.get("href") or content.get("link") or "").strip()
+        display = title or url or "Shared link"
         metadata = {k: v for k, v in {"title": title, "url": url}.items() if v}
-        return f"Shared link: {title}", metadata
+        return f"Shared link: {display}", metadata
     return "", {}
 
 

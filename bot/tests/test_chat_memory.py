@@ -502,6 +502,20 @@ def test_parse_message_event_preserves_link_metadata_for_ingest_without_conversa
     assert parsed.is_conversational is False
 
 
+def test_parse_message_event_link_without_title_uses_url_without_metadata_placeholder():
+    from feishu import events
+
+    events.set_self_identity(open_id="ou_bot", name="包工头")
+    link_content = {"url": "https://docs.example.com/vibelive"}
+
+    parsed = events.parse_message_event(_message_body(message_type="link", content=link_content))
+
+    assert parsed is not None
+    assert parsed.text == "Shared link: https://docs.example.com/vibelive"
+    assert parsed.content_metadata == {"url": "https://docs.example.com/vibelive"}
+    assert parsed.is_conversational is False
+
+
 def test_group_message_without_self_open_id_is_not_identity_ready():
     from feishu import events
 
@@ -630,6 +644,42 @@ async def test_store_message_if_enabled_keeps_file_text_empty_and_uses_metadata(
     assert inserted[0]["text_redacted"] == ""
     assert inserted[0]["redacted_payload"]["redaction_count"] == 0
     assert inserted[0]["redacted_payload"]["content_metadata"] == {"file_name": "方案.pdf"}
+
+
+@pytest.mark.anyio
+async def test_store_message_if_enabled_redacts_content_metadata(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageEvent
+
+    inserted: list[dict] = []
+    monkeypatch.setattr(queries, "chat_memory_enabled_state", lambda chat_id: True)
+    monkeypatch.setattr(queries, "insert_chat_message", lambda row: inserted.append(row) or row)
+
+    stored = await ingest.store_message_if_enabled(
+        ParsedMessageEvent(
+            event_id="evt-link-secret",
+            chat_id="oc_1",
+            chat_type="group",
+            sender_open_id="ou_sender",
+            sender_chat_member_id=None,
+            message_id="om_link_secret",
+            parent_message_id="",
+            text="Shared link",
+            is_at_bot=False,
+            message_type="link",
+            content_metadata={
+                "title": "deploy hook",
+                "url": "https://open.feishu.cn/open-apis/bot/v2/hook/secret-token",
+            },
+            occurred_at="2026-05-07T10:00:00+00:00",
+        )
+    )
+
+    assert stored is True
+    assert inserted[0]["content_metadata"]["url"] == "[REDACTED]"
+    assert inserted[0]["redacted_payload"]["content_metadata"]["url"] == "[REDACTED]"
+    assert inserted[0]["redacted_payload"]["metadata_redaction_count"] == 1
 
 
 @pytest.mark.anyio
@@ -1042,7 +1092,6 @@ async def test_feishu_webhook_at_group_non_conversational_message_only_stores(mo
     body["header"]["event_id"] = "evt_chat_memory_at_file"
     stored: list[str] = []
 
-    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: True)
     monkeypatch.setattr(bot_app.chat_memory_ingest, "should_schedule_storage", lambda chat_id: True)
 
     async def store(parsed):
