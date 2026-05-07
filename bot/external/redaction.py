@@ -21,12 +21,10 @@ _TOKEN_RES = [
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 ]
-_CHAT_PRIVACY_RES = [
-    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-    re.compile(r"(?:\+86[\s-]*)?1[3-9]\d[\s-]*\d{4}[\s-]*\d{4}\b"),
-    re.compile(r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b"),
-    re.compile(r"\b(?:\d[ -]?){13,19}\b"),
-]
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_PHONE_RE = re.compile(r"(?:\+86[\s-]*)?1[3-9]\d[\s-]*\d{4}[\s-]*\d{4}\b")
+_ID_CARD_RE = re.compile(r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b")
+_PAYMENT_CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 _SENSITIVE_HOST_RE = re.compile(
     r"(?i)\b((?:ssh|password|passwd|secret|token|database|db|redis|postgres)[^\n]{0,80}?)"
     r"((?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?)"
@@ -41,33 +39,73 @@ _ASSIGNMENT_RE = re.compile(
 )
 
 
-def redact_text(value: str) -> tuple[str, int]:
+def _bump(categories: dict[str, int], category: str, count: int) -> None:
+    if count:
+        categories[category] = categories.get(category, 0) + count
+
+
+def _luhn_valid(digits: str) -> bool:
+    if len(digits) < 13 or len(digits) > 19 or not digits.isdigit():
+        return False
+    if len(set(digits)) == 1:
+        return False
+    total = 0
+    parity = len(digits) % 2
+    for i, ch in enumerate(digits):
+        value = ord(ch) - ord("0")
+        if i % 2 == parity:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def redact_text_with_categories(value: str) -> tuple[str, dict[str, int]]:
     redacted = value
-    count = 0
+    categories: dict[str, int] = {}
 
     redacted, n = _PRIVATE_KEY_RE.subn(_REDACTED, redacted)
-    count += n
+    _bump(categories, "private_key", n)
     for pattern in _TOKEN_RES:
         redacted, n = pattern.subn(_REDACTED, redacted)
-        count += n
-    for pattern in _CHAT_PRIVACY_RES:
-        redacted, n = pattern.subn(_REDACTED, redacted)
-        count += n
+        _bump(categories, "token", n)
+    redacted, n = _EMAIL_RE.subn(_REDACTED, redacted)
+    _bump(categories, "email", n)
+    redacted, n = _PHONE_RE.subn(_REDACTED, redacted)
+    _bump(categories, "phone", n)
+    redacted, n = _ID_CARD_RE.subn(_REDACTED, redacted)
+    _bump(categories, "id_card", n)
+
+    def replace_payment_card(match: re.Match[str]) -> str:
+        digits = re.sub(r"\D", "", match.group(0))
+        if not _luhn_valid(digits):
+            return match.group(0)
+        categories["payment_card"] = categories.get("payment_card", 0) + 1
+        return _REDACTED
+
+    redacted = _PAYMENT_CARD_CANDIDATE_RE.sub(replace_payment_card, redacted)
 
     def replace_sensitive_host(match: re.Match[str]) -> str:
         return f"{match.group(1)}{_REDACTED}"
 
     redacted, n = _SENSITIVE_HOST_RE.subn(replace_sensitive_host, redacted)
-    count += n
+    _bump(categories, "sensitive_host", n)
     for pattern, replacement in _HOST_MARKER_RES:
         redacted, n = pattern.subn(replacement, redacted)
-        count += n
+        _bump(categories, "host_marker", n)
 
     def replace_assignment(match: re.Match[str]) -> str:
         return f"{match.group(1)}={_REDACTED}"
 
     redacted, n = _ASSIGNMENT_RE.subn(replace_assignment, redacted)
-    count += n
+    _bump(categories, "assignment", n)
+    return redacted, categories
+
+
+def redact_text(value: str) -> tuple[str, int]:
+    redacted, categories = redact_text_with_categories(value)
+    count = sum(categories.values())
     return redacted, count
 
 

@@ -6,13 +6,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from db import queries
-from external.redaction import redact_text
+from external.redaction import redact_text_with_categories
 from feishu.events import ParsedMessageEvent, ParsedMessageMutationEvent
 
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL_SECONDS = 30.0
 _enabled_cache: dict[str, tuple[bool, float]] = {}
+_METADATA_ONLY_MESSAGE_TYPES = {"file", "share_chat", "link", "unknown"}
 
 
 def _now_iso() -> str:
@@ -57,6 +58,31 @@ def should_schedule_storage(chat_id: str) -> bool:
     return cached is not False
 
 
+def _redact_for_message_type(text: str, message_type: str) -> tuple[str, dict[str, int]]:
+    if message_type in _METADATA_ONLY_MESSAGE_TYPES:
+        return "", {}
+    text_redacted, categories = redact_text_with_categories(text)
+    if not text_redacted.strip():
+        text_redacted = "[REDACTED]"
+    return text_redacted, categories
+
+
+def _redacted_payload(
+    *,
+    text_redacted: str,
+    categories: dict[str, int],
+    content_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "text": text_redacted,
+        "redaction_count": sum(categories.values()),
+        "redaction_categories": categories,
+    }
+    if content_metadata:
+        payload["content_metadata"] = content_metadata
+    return payload
+
+
 async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
     if ev.chat_type != "group":
         return False
@@ -78,16 +104,12 @@ async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
         )
         return False
 
-    text_redacted, redaction_count = redact_text(ev.text)
-    if not text_redacted.strip():
-        text_redacted = "[REDACTED]"
-
-    redacted_payload: dict[str, Any] = {
-        "text": text_redacted,
-        "redaction_count": redaction_count,
-    }
-    if ev.content_metadata:
-        redacted_payload["content_metadata"] = ev.content_metadata
+    text_redacted, categories = _redact_for_message_type(ev.text, ev.message_type)
+    redacted_payload = _redacted_payload(
+        text_redacted=text_redacted,
+        categories=categories,
+        content_metadata=ev.content_metadata,
+    )
 
     row = {
         "feishu_message_id": ev.message_id,
@@ -104,16 +126,17 @@ async def store_message_if_enabled(ev: ParsedMessageEvent) -> bool:
         "root_message_id": ev.root_message_id or None,
         "mentions": ev.mentions,
         "is_at_bot": ev.is_at_bot,
-        "sender_is_bot": False,
+        "sender_is_bot": ev.sender_is_bot,
         "occurred_at": ev.occurred_at or _now_iso(),
     }
     queries.insert_chat_message(row)
     logger.info(
-        "chat_memory_ingested chat=%s message=%s type=%s redactions=%d",
+        "chat_memory_ingested chat=%s message=%s type=%s redactions=%d categories=%s",
         ev.chat_id,
         ev.message_id,
         ev.message_type,
-        redaction_count,
+        sum(categories.values()),
+        sorted(categories.keys()),
     )
     return True
 
@@ -129,15 +152,12 @@ async def apply_message_mutation(ev: ParsedMessageMutationEvent) -> bool:
         )
         return bool(ok)
     if ev.action == "edit":
-        text_redacted, redaction_count = redact_text(ev.text)
-        if not text_redacted.strip():
-            text_redacted = "[REDACTED]"
-        payload: dict[str, Any] = {
-            "text": text_redacted,
-            "redaction_count": redaction_count,
-        }
-        if ev.content_metadata:
-            payload["content_metadata"] = ev.content_metadata
+        text_redacted, categories = _redact_for_message_type(ev.text, ev.message_type)
+        payload = _redacted_payload(
+            text_redacted=text_redacted,
+            categories=categories,
+            content_metadata=ev.content_metadata,
+        )
         ok = queries.update_chat_message_text(
             ev.message_id,
             text_redacted=text_redacted,
@@ -145,11 +165,12 @@ async def apply_message_mutation(ev: ParsedMessageMutationEvent) -> bool:
             edited_at=ev.occurred_at or _now_iso(),
         )
         logger.info(
-            "chat_memory_message_edited chat=%s message=%s applied=%s redactions=%d",
+            "chat_memory_message_edited chat=%s message=%s applied=%s redactions=%d categories=%s",
             ev.chat_id,
             ev.message_id,
             bool(ok),
-            redaction_count,
+            sum(categories.values()),
+            sorted(categories.keys()),
         )
         return bool(ok)
     logger.info(

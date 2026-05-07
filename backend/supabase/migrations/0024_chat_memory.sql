@@ -46,7 +46,10 @@ create table if not exists public.chat_messages (
                           message_type in ('text', 'post', 'share_chat',
                                            'file', 'link', 'unknown')
                         ),
-    text_redacted       text not null default '' check (length(text_redacted) > 0),
+    text_redacted       text not null default '' check (
+                          message_type not in ('text', 'post')
+                          or length(text_redacted) > 0
+                        ),
     is_at_bot           boolean not null default false,
     sender_is_bot       boolean not null default false,
     parent_message_id   text,
@@ -72,7 +75,8 @@ create index if not exists chat_messages_parent_idx
 
 create index if not exists chat_messages_text_fts_idx
     on public.chat_messages
-    using gin (to_tsvector('simple', text_redacted));
+    using gin (to_tsvector('simple', text_redacted))
+    where length(text_redacted) > 0;
 
 create index if not exists chat_messages_deleted_idx
     on public.chat_messages (chat_id, deleted_at)
@@ -142,6 +146,10 @@ alter table public.chat_messages enable row level security;
 alter table public.people_memory enable row level security;
 alter table public.people_memory_updates enable row level security;
 
+-- No RLS policies are created deliberately. In Phase 1 all reads and
+-- writes go through the bot service role; browser/client access is
+-- intentionally denied by default.
+
 comment on table public.chat_memory_settings is
     'Current opt-in state for Feishu chat memory. User-facing access goes through bot tools.';
 comment on table public.chat_memory_settings_history is
@@ -149,9 +157,9 @@ comment on table public.chat_memory_settings_history is
 comment on table public.chat_messages is
     'Redacted Feishu chat memory rows for opted-in chats. Raw encrypted webhook bodies and binary content are not stored.';
 comment on column public.chat_messages.text_redacted is
-    'Redacted visible text or [REDACTED] when all visible text was removed.';
+    'Redacted visible text. Metadata-only message types such as file/share_chat may keep this empty.';
 comment on column public.chat_messages.redacted_payload is
-    'Parsed redacted payload needed for diagnostics and future extraction; not the raw Feishu body.';
+    'Parsed redacted payload needed for diagnostics and future extraction; includes redaction_categories and is not the raw Feishu body.';
 comment on column public.chat_messages.content_metadata is
     'Safe structured facts such as shared-link title/URL or file name; no binary content.';
 comment on table public.people_memory is

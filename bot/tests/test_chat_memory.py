@@ -139,14 +139,14 @@ class _FakeTable:
 
 
 def test_chat_redaction_patterns_cover_private_chat_shapes():
-    from external.redaction import redact_text
+    from external.redaction import redact_text, redact_text_with_categories
 
     text = "\n".join(
         [
             "邮箱 albert@vibelive.com 的密码是 abc",
             "电话 13800138000 或 +86 13800138000",
             "身份证 11010519491231002X",
-            "银行卡 6222020202020202020",
+            "银行卡 4242424242424242",
             "ssh root@1.2.3.4:22 password=abc123",
             "[asker] handle=@admin user_id=00000000-0000-0000-0000-000000000000",
             "[parent_notification] id=123",
@@ -155,19 +155,37 @@ def test_chat_redaction_patterns_cover_private_chat_shapes():
     )
 
     redacted, count = redact_text(text)
+    categorized_redacted, categories = redact_text_with_categories(text)
 
     assert count >= 8
+    assert categorized_redacted == redacted
+    assert categories["email"] == 1
+    assert categories["phone"] >= 1
+    assert categories["id_card"] == 1
+    assert categories["payment_card"] == 1
+    assert categories["sensitive_host"] == 1
+    assert categories["assignment"] == 1
+    assert categories["host_marker"] == 3
     assert "albert@vibelive.com" not in redacted
     assert "13800138000" not in redacted
     assert "+86 13800138000" not in redacted
     assert "11010519491231002X" not in redacted
-    assert "6222020202020202020" not in redacted
+    assert "4242424242424242" not in redacted
     assert "1.2.3.4:22" not in redacted
     assert "password=abc123" not in redacted
     assert "[asker]" not in redacted
     assert "[parent_notification]" not in redacted
     assert "[IMAGE:img_123]" not in redacted
     assert "[chat_memory_escaped_marker:asker]" in redacted
+
+
+def test_chat_redaction_does_not_redact_arbitrary_long_numbers_as_payment_cards():
+    from external.redaction import redact_text_with_categories
+
+    redacted, categories = redact_text_with_categories("构建号 1234567890123 失败了")
+
+    assert "1234567890123" in redacted
+    assert categories.get("payment_card", 0) == 0
 
 
 def test_migration_0024_creates_chat_memory_tables():
@@ -186,11 +204,14 @@ def test_migration_0024_creates_chat_memory_tables():
     assert "deleted_at" in sql
     assert "references public.chat_memory_settings(chat_id) on delete cascade" in sql
     assert "between 1 and 730" in sql
+    assert "message_type not in ('text', 'post')" in sql
+    assert "where length(text_redacted) > 0" in sql
     assert "to_tsvector('simple', text_redacted)" in sql
     assert "people_memory_updates_source_time_idx" in sql
     assert "people_memory_updates_person_time_idx" in sql
     assert "comment on column public.chat_messages.redacted_payload" in sql
     assert "redacted" in sql
+    assert "No RLS policies are created deliberately" in sql
 
 
 def test_chat_memory_setting_helpers_write_history(monkeypatch):
@@ -255,6 +276,30 @@ def test_chat_message_helpers_are_idempotent_and_support_recall_edit(monkeypatch
     assert fake.tables["chat_messages"][0]["text_redacted"] == "edited"
     assert queries.mark_chat_message_deleted("om_1")
     assert fake.tables["chat_messages"][0]["deleted_at"] is not None
+
+
+def test_chat_message_helper_allows_empty_non_text_rows(monkeypatch):
+    from db import queries
+
+    fake = _FakeSupabase()
+    monkeypatch.setattr(queries, "sb_admin", lambda: fake)
+    queries.enable_chat_memory("oc_1", user_id=None, open_id="ou_admin")
+
+    inserted = queries.insert_chat_message(
+        {
+            "feishu_message_id": "om_file",
+            "chat_id": "oc_1",
+            "chat_type": "group",
+            "sender_open_id": "ou_1",
+            "message_type": "file",
+            "text_redacted": "",
+            "content_metadata": {"file_name": "方案.pdf"},
+            "occurred_at": "2026-05-07T10:00:00+08:00",
+        }
+    )
+
+    assert inserted["text_redacted"] == ""
+    assert inserted["content_metadata"] == {"file_name": "方案.pdf"}
 
 
 def test_recent_chat_messages_excludes_deleted_and_bot_rows(monkeypatch):
@@ -485,6 +530,40 @@ async def test_store_message_if_enabled_redacts_and_inserts(monkeypatch):
     assert inserted[0]["sender_display_name"] == "bcc"
     assert inserted[0]["text_redacted"] == "prod password=[REDACTED] [chat_memory_escaped_marker:asker]"
     assert inserted[0]["redacted_payload"]["redaction_count"] >= 2
+    assert inserted[0]["redacted_payload"]["redaction_categories"]["assignment"] == 1
+    assert inserted[0]["redacted_payload"]["redaction_categories"]["host_marker"] == 1
+
+
+@pytest.mark.anyio
+async def test_store_message_if_enabled_keeps_file_text_empty_and_uses_metadata(monkeypatch):
+    from chat_memory import ingest
+    from db import queries
+    from feishu.events import ParsedMessageEvent
+
+    inserted: list[dict] = []
+    monkeypatch.setattr(queries, "is_chat_memory_enabled", lambda chat_id: True)
+    monkeypatch.setattr(queries, "insert_chat_message", lambda row: inserted.append(row) or row)
+
+    stored = await ingest.store_message_if_enabled(
+        ParsedMessageEvent(
+            event_id="evt-file",
+            chat_id="oc_1",
+            chat_type="group",
+            sender_open_id="ou_sender",
+            sender_chat_member_id=None,
+            message_id="om_file",
+            parent_message_id="",
+            text="Shared file: 方案.pdf",
+            is_at_bot=False,
+            message_type="file",
+            content_metadata={"file_name": "方案.pdf"},
+        )
+    )
+
+    assert stored is True
+    assert inserted[0]["text_redacted"] == ""
+    assert inserted[0]["redacted_payload"]["redaction_count"] == 0
+    assert inserted[0]["redacted_payload"]["content_metadata"] == {"file_name": "方案.pdf"}
 
 
 @pytest.mark.anyio
@@ -585,6 +664,7 @@ async def test_apply_message_mutation_handles_recall_and_edit(monkeypatch):
     assert edited[0][0] == "om_2"
     assert edited[0][1] == "new token=[REDACTED]"
     assert edited[0][2]["redaction_count"] == 1
+    assert edited[0][2]["redaction_categories"]["assignment"] == 1
 
 
 class _FakeRequest:
@@ -611,6 +691,8 @@ def test_chat_memory_tools_registered_in_meta_and_runner_prompt():
     assert {"enable_chat_memory", "disable_chat_memory", "chat_memory_status"} <= names
     assert "mcp__pmo_meta__enable_chat_memory" in runner.SYSTEM_PROMPT or "enable_chat_memory" in runner.SYSTEM_PROMPT
     assert "开始记录这个群" in runner.SYSTEM_PROMPT
+    assert "public_notice" in runner.SYSTEM_PROMPT
+    assert "原样" in runner.SYSTEM_PROMPT
 
 
 @pytest.mark.anyio
@@ -724,7 +806,7 @@ async def test_feishu_webhook_stores_non_at_group_message_without_agent(monkeypa
     body["header"]["event_id"] = "evt_chat_memory_store"
     stored: list[str] = []
 
-    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: True)
+    monkeypatch.setattr(bot_app.chat_memory_ingest, "memory_enabled_hint", lambda chat_id: False)
     monkeypatch.setattr(bot_app.chat_memory_ingest, "should_schedule_storage", lambda chat_id: True)
 
     async def store(parsed):
@@ -740,7 +822,7 @@ async def test_feishu_webhook_stores_non_at_group_message_without_agent(monkeypa
     response = await bot_app.feishu_webhook(_FakeRequest(body))
     await asyncio.sleep(0)
 
-    assert response.body == b"stored"
+    assert response.body == b"ok"
     assert stored == ["om_1"]
 
 
@@ -827,7 +909,7 @@ async def test_feishu_webhook_duplicate_event_does_not_schedule_storage(monkeypa
     second = await bot_app.feishu_webhook(_FakeRequest(body))
     await asyncio.sleep(0)
 
-    assert first.body == b"stored"
+    assert first.body == b"ok"
     assert second.body == b"duplicate"
     assert stored == ["om_1"]
 

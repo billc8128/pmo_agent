@@ -596,8 +596,11 @@ def chat_memory_status(chat_id: str) -> dict[str, Any] | None:
 
 def insert_chat_message(row: dict[str, Any]) -> dict[str, Any] | None:
     payload = dict(row)
-    if not payload.get("text_redacted"):
+    message_type = payload.get("message_type") or "text"
+    if not payload.get("text_redacted") and message_type in {"text", "post"}:
         payload["text_redacted"] = "[REDACTED]"
+    elif payload.get("text_redacted") is None:
+        payload["text_redacted"] = ""
     res = (
         sb_admin()
         .table("chat_messages")

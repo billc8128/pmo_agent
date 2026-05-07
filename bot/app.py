@@ -112,6 +112,8 @@ async def feishu_webhook(request: Request):
     if eid and feishu_events.already_seen(eid):
         return PlainTextResponse("duplicate")
 
+    # Mutation events update existing memory rows by message id. They do not
+    # depend on the bot's own open_id because no @-mention decision is involved.
     mutation = feishu_events.parse_message_mutation_event(body)
     if mutation is not None:
         asyncio.create_task(_apply_chat_memory_mutation(mutation))
@@ -124,12 +126,14 @@ async def feishu_webhook(request: Request):
     if parsed.chat_type == "group" and not parsed.bot_identity_ready:
         return PlainTextResponse("not ready")
 
+    scheduled_storage = False
     if parsed.chat_type == "group" and chat_memory_ingest.should_schedule_storage(parsed.chat_id):
+        scheduled_storage = True
         asyncio.create_task(_store_chat_memory_message(parsed))
 
     if parsed.chat_type == "group" and not parsed.is_at_bot:
-        if chat_memory_ingest.memory_enabled_hint(parsed.chat_id):
-            return PlainTextResponse("stored")
+        if scheduled_storage:
+            return PlainTextResponse("ok")
         return PlainTextResponse("group not addressed")
 
     asyncio.create_task(_handle_message(parsed))

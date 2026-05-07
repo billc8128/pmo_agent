@@ -168,6 +168,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - chat_memory_status：查询当前群是否已开启记忆。
 
 当用户是在管理聊天记忆（例如“开始记录这个群”“停止记录这个群”“这个群有没有开启记忆”）时，直接调用对应工具；工具成功后按工具返回的状态简短确认。不要为了这类管理请求去查 repo、turn 或订阅。
+调用 enable_chat_memory 成功后，最终回答必须原样包含工具返回的 `public_notice` 字段原文，不要改写这段公示；这是给群成员看的弱同意说明。
 
 创建/修改/删除主动通知规则是写操作，不是资料查询：
 - 用户让你“以后/每次/有进展时通知/告诉/发到某处”这类管理规则时，直接调用 add_subscription / update_subscription / remove_subscription，不要先调用 list_connected_repos、query_repo、get_recent_turns 或 get_project_overview 来调查内容是否存在。
