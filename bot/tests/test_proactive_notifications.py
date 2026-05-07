@@ -111,6 +111,97 @@ def test_subscription_scope_defaults_to_chat_in_group():
     assert _infer_subscription_scope(ctx, None) == ("chat", "oc_group")
 
 
+@pytest.mark.anyio
+async def test_resolve_subscription_target_defaults_to_owner_dm():
+    from agent.permissions import resolve_subscription_target
+    from agent.request_context import RequestContext
+
+    ctx = RequestContext(
+        chat_type="p2p",
+        asker_user_id="22222222-2222-2222-2222-222222222222",
+    )
+
+    target = await resolve_subscription_target(
+        ctx,
+        scope_kind="user",
+        scope_id="22222222-2222-2222-2222-222222222222",
+        args={},
+    )
+
+    assert target.target_kind == "user_dm"
+    assert target.target_id == "22222222-2222-2222-2222-222222222222"
+    assert target.consent_anchor is None
+
+
+@pytest.mark.anyio
+async def test_chat_owned_cross_user_dm_uses_chat_anchor(monkeypatch):
+    from agent import permissions
+    from agent.request_context import RequestContext
+
+    ctx = RequestContext(
+        chat_type="group",
+        chat_id="oc_group",
+        asker_user_id="11111111-1111-1111-1111-111111111111",
+    )
+    monkeypatch.setattr(
+        permissions.queries,
+        "lookup_profile_by_handle_or_display",
+        lambda value: {"id": "22222222-2222-2222-2222-222222222222", "handle": "bcc", "display_name": "bcc"},
+    )
+
+    async def both_members(chat_id: str, user_a: str, user_b: str, use_cache: bool = True):
+        return (chat_id, user_a, user_b) == (
+            "oc_group",
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+
+    monkeypatch.setattr(permissions, "_both_chat_members", both_members)
+
+    target = await permissions.resolve_subscription_target(
+        ctx,
+        scope_kind="chat",
+        scope_id="oc_group",
+        args={"target_kind": "user_dm", "target_handle": "bcc"},
+    )
+
+    assert target.target_kind == "user_dm"
+    assert target.target_id == "22222222-2222-2222-2222-222222222222"
+    assert target.consent_anchor == "chat:oc_group"
+
+
+@pytest.mark.anyio
+async def test_delivery_route_denies_revoked_explicit_consent(monkeypatch):
+    from agent import permissions
+    from db.queries import Subscription
+
+    sub = Subscription(
+        id="sub",
+        scope_kind="user",
+        scope_id="11111111-1111-1111-1111-111111111111",
+        description="send to bcc",
+        enabled=True,
+        target_kind="user_dm",
+        target_id="22222222-2222-2222-2222-222222222222",
+        consent_anchor="explicit:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    )
+    monkeypatch.setattr(
+        permissions.queries,
+        "get_target_consent",
+        lambda consent_id: {
+            "id": consent_id,
+            "target_user_id": "22222222-2222-2222-2222-222222222222",
+            "source_user_id": "11111111-1111-1111-1111-111111111111",
+            "revoked_at": "2026-05-07T00:00:00Z",
+        },
+    )
+
+    route = await permissions.route_for_subscription_delivery(sub)
+
+    assert not route.allowed
+    assert route.suppressed_by == "permission_revoked"
+
+
 def test_fetch_subscriptions_for_scope_only_lists_enabled(monkeypatch):
     from db import queries
 
@@ -257,8 +348,32 @@ def test_claim_pending_notifications_excludes_archived_subscriptions():
     claim_sql = sql[sql.index("create or replace function public.claim_pending_notifications"):sql.index("create or replace function public.mark_sent_if_claimed")]
 
     assert "join public.subscriptions s2 on s2.id = n2.subscription_id" in claim_sql
-    assert "s2.archived_at is null" in claim_sql
     assert "s2.enabled is true" in claim_sql
+    assert "s2.archived_at is null" in claim_sql
+
+
+def test_subscription_routing_migration_adds_targets_and_consent_rpcs():
+    from pathlib import Path
+
+    sql = Path("backend/supabase/migrations/0023_subscription_routing.sql").read_text()
+
+    assert "add column if not exists target_kind text" in sql
+    assert "add column if not exists target_id text" in sql
+    assert "create table if not exists public.target_consents" in sql
+    assert "create table if not exists public.pending_target_consents" in sql
+    assert "create or replace function public.mark_suppressed_if_claimed" in sql
+    assert "p_mention_open_id text default null" in sql
+    assert "set_subscription_default_target" in sql
+
+
+def test_post_format_can_prepend_feishu_at_mention():
+    from feishu import post_format
+
+    post = post_format.markdown_to_post("hello")
+    with_mention = post_format.prepend_at_mention(post, "ou_123")
+
+    assert with_mention["zh_cn"]["content"][0] == [{"tag": "at", "user_id": "ou_123"}]
+    assert with_mention["zh_cn"]["content"][1] == [{"tag": "text", "text": "hello"}]
 
 
 def test_judge_prompt_states_self_events_send_by_default():

@@ -67,3 +67,52 @@ async def test_handle_message_times_out_hanging_streaming_agent(monkeypatch):
     assert fake_feishu.patched_cards
     assert "超时" in str(fake_feishu.patched_cards[-1])
     assert not any(kind == "post" for kind, _payload in fake_feishu.replies)
+
+
+@pytest.mark.anyio
+async def test_handle_message_consumes_target_consent_reply(monkeypatch):
+    fake_feishu = _FakeFeishuClient()
+    granted: list[tuple[str, str]] = []
+    resolved: list[tuple[str, str]] = []
+    monkeypatch.setattr(bot_app, "feishu_client", fake_feishu)
+    monkeypatch.setattr(
+        bot_app.db_queries,
+        "lookup_by_feishu_open_id",
+        lambda open_id: {"user_id": "target-user", "handle": "bcc", "display_name": "bcc"},
+    )
+    monkeypatch.setattr(
+        bot_app.db_queries,
+        "pending_target_consent_by_message",
+        lambda message_id: {
+            "id": "pending-1",
+            "source_user_id": "source-user",
+            "target_user_id": "target-user",
+            "source": {"handle": "alice", "display_name": "Alice"},
+        },
+    )
+    monkeypatch.setattr(bot_app.db_queries, "add_target_consent", lambda target, source: granted.append((target, source)) or {})
+    monkeypatch.setattr(bot_app.db_queries, "resolve_pending_target_consent", lambda pending_id, status: resolved.append((pending_id, status)) or {})
+
+    async def fail_answer(*args, **kwargs):
+        raise AssertionError("consent replies must not enter the agent")
+
+    monkeypatch.setattr(bot_app.agent_runner, "answer_streaming", fail_answer)
+
+    event = ParsedMessageEvent(
+        event_id="evt-2",
+        chat_id="chat-1",
+        chat_type="p2p",
+        sender_open_id="ou-target",
+        sender_chat_member_id=None,
+        message_id="om-reply",
+        parent_message_id="om-consent",
+        text="同意",
+        is_at_bot=False,
+    )
+
+    await bot_app._handle_message(event)
+
+    assert granted == [("target-user", "source-user")]
+    assert resolved == [("pending-1", "granted")]
+    assert fake_feishu.replies[-1][0] == "text"
+    assert "已同意" in fake_feishu.replies[-1][1]

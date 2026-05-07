@@ -52,3 +52,41 @@ def test_search_users_uses_get_with_query_params(monkeypatch):
             {"query": "张伟", "page_size": 20},
         )
     ]
+
+
+def test_list_chat_member_open_ids_paginates(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, *, headers=None, params=None):
+            calls.append((url, headers, params))
+            page_token = (params or {}).get("page_token")
+            if not page_token:
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("GET", url),
+                    json={"code": 0, "data": {"items": [{"member_id": "ou_1"}], "has_more": True, "page_token": "p2"}},
+                )
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", url),
+                json={"code": 0, "data": {"items": [{"member_id": "ou_2"}, {"member_id": "ou_1"}], "has_more": False}},
+            )
+
+    monkeypatch.setattr("feishu.contact._tenant_access_token", lambda: asyncio.sleep(0, result="tenant-token"))
+    monkeypatch.setattr("feishu.contact.httpx.AsyncClient", FakeAsyncClient)
+
+    members = asyncio.run(contact.list_chat_member_open_ids("oc_1"))
+
+    assert members == ["ou_1", "ou_2"]
+    assert calls[0][2] == {"member_id_type": "open_id", "page_size": 100}
+    assert calls[1][2] == {"member_id_type": "open_id", "page_size": 100, "page_token": "p2"}

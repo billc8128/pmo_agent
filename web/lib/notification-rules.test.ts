@@ -22,6 +22,10 @@ function row(overrides = {}) {
     created_at: '2026-05-05T00:00:00.000Z',
     updated_at: '2026-05-05T00:01:00.000Z',
     archived_at: null,
+    target_kind: 'user_dm',
+    target_id: VIEWER_ID,
+    target_user_open_id: null,
+    consent_anchor: null,
     profiles: {
       handle: 'chenchen',
       display_name: '晨晨',
@@ -43,11 +47,14 @@ test('maps raw subscription rows to safe public rule objects', () => {
     ownerHandle: 'chenchen',
     ownerDisplayName: '晨晨',
     ownedByViewer: true,
+    targetKind: 'user_dm',
+    targetLabel: 'Your DM',
   });
   assert.equal(Object.hasOwn(rule, 'id'), false);
   assert.equal(Object.hasOwn(rule, 'scope_id'), false);
   assert.equal(Object.hasOwn(rule, 'created_by'), false);
   assert.equal(Object.hasOwn(rule, 'chat_id'), false);
+  assert.equal(Object.hasOwn(rule, 'target_id'), false);
 });
 
 test('does not expose subscription ids for rules owned by other users', () => {

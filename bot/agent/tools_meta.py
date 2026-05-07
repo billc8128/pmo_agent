@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from agent import imaging
+from agent import imaging, permissions
 from agent.request_context import RequestContext
 from agent.tool_utils import err, ok
 from db import queries
@@ -32,6 +32,14 @@ def _require_bound_asker(ctx: RequestContext) -> str:
     if not ctx.asker_user_id:
         raise ValueError("你还没在 web 上绑定飞书账号，先去 https://pmo-agent-sigma.vercel.app/me 绑一下")
     return ctx.asker_user_id
+
+
+def _profile_label(profile: dict[str, Any]) -> str:
+    if profile.get("display_name") and profile.get("handle"):
+        return f"{profile['display_name']} / @{profile['handle']}"
+    if profile.get("handle"):
+        return f"@{profile['handle']}"
+    return profile.get("display_name") or "这个用户"
 
 
 def build_meta_tools(ctx: RequestContext):
@@ -267,8 +275,8 @@ def build_meta_tools(ctx: RequestContext):
 
     @tool(
         "add_subscription",
-        "Subscribe the current user or current group to a natural-language proactive notification preference.",
-        {"description": str, "scope_kind": str},
+        "Subscribe the current user or current group to a natural-language proactive notification preference. Optional target fields route the notification to a user DM, a chat, or an @mention in a chat.",
+        {"description": str, "scope_kind": str, "target_kind": str, "target_handle": str, "target_chat_id": str},
     )
     async def add_subscription(args: dict) -> dict[str, Any]:
         try:
@@ -277,14 +285,24 @@ def build_meta_tools(ctx: RequestContext):
             if not description:
                 return err("description is required")
             scope_kind, scope_id = _infer_subscription_scope(ctx, args.get("scope_kind") or None)
+            target = await permissions.resolve_subscription_target(
+                ctx,
+                scope_kind=scope_kind,
+                scope_id=scope_id,
+                args=args,
+            )
             row = queries.add_subscription(
                 scope_kind=scope_kind,
                 scope_id=scope_id,
                 description=description,
                 created_by=asker_user_id,
                 chat_id=ctx.chat_id or None,
+                target_kind=target.target_kind,
+                target_id=target.target_id,
+                target_user_open_id=target.target_user_open_id,
+                consent_anchor=target.consent_anchor,
             )
-            return ok({"subscription": row, "scope_kind": scope_kind})
+            return ok({"subscription": row, "scope_kind": scope_kind, "target_kind": target.target_kind})
         except Exception as e:
             return err(str(e))
 
@@ -305,7 +323,7 @@ def build_meta_tools(ctx: RequestContext):
     @tool(
         "update_subscription",
         "Update a proactive notification subscription in the current conversation scope.",
-        {"subscription_id": str, "description": str, "enabled": bool, "scope_kind": str},
+        {"subscription_id": str, "description": str, "enabled": bool, "scope_kind": str, "target_kind": str, "target_handle": str, "target_chat_id": str},
     )
     async def update_subscription(args: dict) -> dict[str, Any]:
         try:
@@ -321,6 +339,21 @@ def build_meta_tools(ctx: RequestContext):
                     fields["description"] = desc
             if "enabled" in args and args.get("enabled") is not None:
                 fields["enabled"] = bool(args.get("enabled"))
+            if any(args.get(k) for k in ("target_kind", "target_handle", "target_chat_id")):
+                target = await permissions.resolve_subscription_target(
+                    ctx,
+                    scope_kind=scope_kind,
+                    scope_id=scope_id,
+                    args=args,
+                )
+                fields.update(
+                    {
+                        "target_kind": target.target_kind,
+                        "target_id": target.target_id,
+                        "target_user_open_id": target.target_user_open_id,
+                        "consent_anchor": target.consent_anchor,
+                    }
+                )
             row = queries.update_subscription(subscription_id, scope_kind, scope_id, **fields)
             if not row:
                 return err("没找到当前会话 scope 下的这个订阅，不能跨私聊/群聊修改")
@@ -344,6 +377,90 @@ def build_meta_tools(ctx: RequestContext):
             if not row:
                 return err("没找到当前会话 scope 下的这个订阅，不能跨私聊/群聊删除")
             return ok({"subscription": row, "removed": True})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "grant_target_consent",
+        "Allow another pmo_agent user to route bot notifications to your Feishu DM through rules they create.",
+        {"source_handle": str},
+    )
+    async def grant_target_consent(args: dict) -> dict[str, Any]:
+        try:
+            target_user_id = _require_bound_asker(ctx)
+            source = queries.lookup_profile_by_handle_or_display(str(args.get("source_handle") or ""))
+            if not source:
+                return err("找不到 source_handle 对应的用户")
+            row = queries.add_target_consent(target_user_id, source["id"])
+            return ok({"consent": row, "source": source})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "revoke_target_consent",
+        "Revoke permission you previously gave another pmo_agent user to route bot notifications to your DM.",
+        {"source_handle": str},
+    )
+    async def revoke_target_consent(args: dict) -> dict[str, Any]:
+        try:
+            target_user_id = _require_bound_asker(ctx)
+            source = queries.lookup_profile_by_handle_or_display(str(args.get("source_handle") or ""))
+            if not source:
+                return err("找不到 source_handle 对应的用户")
+            row = queries.revoke_target_consent(target_user_id, source["id"])
+            return ok({"revoked": bool(row), "consent": row, "source": source})
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "list_target_consents",
+        "List notification routing consents involving the asker.",
+        {},
+    )
+    async def list_target_consents(args: dict) -> dict[str, Any]:
+        try:
+            user_id = _require_bound_asker(ctx)
+            return ok(queries.list_target_consents_for_user(user_id))
+        except Exception as e:
+            return err(str(e))
+
+    @tool(
+        "request_target_consent",
+        "Ask another pmo_agent user for permission to route proactive notifications to their Feishu DM.",
+        {"target_handle": str, "rule_description": str},
+    )
+    async def request_target_consent(args: dict) -> dict[str, Any]:
+        try:
+            source_user_id = _require_bound_asker(ctx)
+            target = queries.lookup_profile_by_handle_or_display(str(args.get("target_handle") or ""))
+            if not target:
+                return err("找不到 target_handle 对应的用户")
+            if target["id"] == source_user_id:
+                return ok({"message": "你不需要向自己申请通知路由权限"})
+            linked = queries.feishu_link_for_user_id(target["id"])
+            open_id = (linked or {}).get("open_id")
+            if not open_id:
+                return err("目标用户还没有绑定飞书，无法发送 consent 请求")
+            description = (args.get("rule_description") or "proactive notification rule").strip()
+            pending = queries.open_pending_target_consent(
+                source_user_id=source_user_id,
+                target_user_id=target["id"],
+                rule_description=description,
+            )
+            source_profile = queries.lookup_profile_by_user_id(source_user_id) or {}
+            from feishu import post_format
+            from feishu.client import feishu_client
+
+            text = (
+                f"{_profile_label(source_profile)} 想让 PMO bot 可以把 ta 创建的主动通知发到你的私聊。\n\n"
+                f"规则：{description}\n\n"
+                "如果同意，请直接回复这条消息：同意\n"
+                "如果不同意，请回复：拒绝"
+            )
+            msg_id = await feishu_client.send_to_user(open_id, post_format.markdown_to_post(text))
+            if msg_id and pending.get("id"):
+                pending = queries.set_pending_target_consent_message(pending["id"], msg_id) or pending
+            return ok({"pending_consent": pending, "target": target, "sent": bool(msg_id)})
         except Exception as e:
             return err(str(e))
 
@@ -445,6 +562,10 @@ def build_meta_tools(ctx: RequestContext):
         list_subscriptions,
         update_subscription,
         remove_subscription,
+        grant_target_consent,
+        revoke_target_consent,
+        list_target_consents,
+        request_target_consent,
         why_no_notification,
         resolve_subject_mention,
     ]

@@ -185,7 +185,7 @@ begin
         select unnest(array[
             'public.append_to_or_open_investigation_job(uuid,bigint,text,text,int)',
             'public.claim_investigatable_jobs(uuid,int,int)',
-            'public.create_notification_for_investigation_job(bigint,uuid,bigint,uuid,int,jsonb,text,text,int,int)',
+            'public.create_notification_for_investigation_job(bigint,uuid,bigint,uuid,int,jsonb,text,text,text,int,int)',
             'public.mark_job_suppressed_if_claimed(bigint,uuid,jsonb,int,int)',
             'public.mark_job_failed_if_claimed(bigint,uuid,text)',
             'public.release_job_claim(bigint,uuid)',

@@ -24,6 +24,10 @@ export async function createNotificationRule(formData: FormData) {
       created_by: user.id,
       chat_id: null,
       archived_at: null,
+      target_kind: 'user_dm',
+      target_id: user.id,
+      target_user_open_id: null,
+      consent_anchor: null,
     })
     .select('id')
     .single();

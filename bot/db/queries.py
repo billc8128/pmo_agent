@@ -34,6 +34,7 @@ class Notification:
     error: str | None = None
     payload_snapshot: dict[str, Any] | None = None
     investigation_job_id: int | None = None
+    mention_open_id: str | None = None
 
 
 @dataclass
@@ -48,6 +49,10 @@ class Subscription:
     created_at: str | None = None
     updated_at: str | None = None
     archived_at: str | None = None
+    target_kind: str | None = None
+    target_id: str | None = None
+    target_user_open_id: str | None = None
+    consent_anchor: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1599,6 +1604,7 @@ def create_notification_for_investigation_job(
     payload_snapshot: dict[str, Any],
     delivery_kind: str | None,
     delivery_target: str | None,
+    mention_open_id: str | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
 ) -> int | None:
@@ -1615,6 +1621,7 @@ def create_notification_for_investigation_job(
                 "p_payload_snapshot": payload_snapshot,
                 "p_delivery_kind": delivery_kind,
                 "p_delivery_target": delivery_target,
+                "p_mention_open_id": mention_open_id,
                 "p_input_tokens": input_tokens,
                 "p_output_tokens": output_tokens,
             },
@@ -1738,6 +1745,30 @@ def mark_failed_if_claimed(notification_id: int, claim_id: str, error: str) -> b
         .rpc(
             "mark_failed_if_claimed",
             {"p_id": notification_id, "p_claim_id": claim_id, "p_error": error[:2000]},
+        )
+        .execute()
+        .data
+    )
+    return _rpc_returned_id(data)
+
+
+def mark_suppressed_if_claimed(
+    notification_id: int,
+    claim_id: str,
+    suppressed_by: str,
+    *,
+    error: str | None = None,
+) -> bool:
+    data = (
+        sb_admin()
+        .rpc(
+            "mark_suppressed_if_claimed",
+            {
+                "p_id": notification_id,
+                "p_claim_id": claim_id,
+                "p_suppressed_by": suppressed_by,
+                "p_error": (error or "")[:2000] if error else None,
+            },
         )
         .execute()
         .data
@@ -1902,19 +1933,30 @@ def add_subscription(
     description: str,
     created_by: str,
     chat_id: str | None = None,
+    target_kind: str | None = None,
+    target_id: str | None = None,
+    target_user_open_id: str | None = None,
+    consent_anchor: str | None = None,
 ) -> dict[str, Any]:
+    payload = {
+        "scope_kind": scope_kind,
+        "scope_id": scope_id,
+        "description": description,
+        "created_by": created_by,
+        "chat_id": chat_id,
+    }
+    if target_kind:
+        payload["target_kind"] = target_kind
+    if target_id:
+        payload["target_id"] = target_id
+    if target_user_open_id:
+        payload["target_user_open_id"] = target_user_open_id
+    if consent_anchor:
+        payload["consent_anchor"] = consent_anchor
     res = (
         sb_admin()
         .table("subscriptions")
-        .insert(
-            {
-                "scope_kind": scope_kind,
-                "scope_id": scope_id,
-                "description": description,
-                "created_by": created_by,
-                "chat_id": chat_id,
-            }
-        )
+        .insert(payload)
         .execute()
     )
     row = res.data[0] if res and res.data else {}
@@ -1933,10 +1975,20 @@ def update_subscription(
     scope_id: str,
     **fields_to_update: Any,
 ) -> Optional[dict[str, Any]]:
+    nullable_fields = {"target_user_open_id", "consent_anchor"}
+    allowed_fields = {
+        "description",
+        "enabled",
+        "archived_at",
+        "target_kind",
+        "target_id",
+        "target_user_open_id",
+        "consent_anchor",
+    }
     payload = {
         k: v
         for k, v in fields_to_update.items()
-        if k in {"description", "enabled", "archived_at"} and v is not None
+        if k in allowed_fields and (v is not None or k in nullable_fields)
     }
     if not payload:
         return get_subscription_in_scope(subscription_id, scope_kind, scope_id)
@@ -1981,6 +2033,212 @@ def remove_subscription(subscription_id: str, scope_kind: str, scope_id: str) ->
         enabled=False,
         archived_at=_utc_now_iso(),
     )
+
+
+def disable_subscription(subscription_id: str, reason: str | None = None) -> Optional[dict[str, Any]]:
+    metadata_patch = {"disabled_reason": reason, "disabled_at": _utc_now_iso()} if reason else None
+    payload: dict[str, Any] = {
+        "enabled": False,
+        "updated_at": _utc_now_iso(),
+    }
+    if metadata_patch:
+        current = get_subscription(subscription_id)
+        existing = current.metadata if current and isinstance(current.metadata, dict) else {}
+        payload["metadata"] = {**existing, **metadata_patch}
+    res = (
+        sb_admin()
+        .table("subscriptions")
+        .update(payload)
+        .eq("id", subscription_id)
+        .execute()
+    )
+    return res.data[0] if res and res.data else None
+
+
+def get_active_target_consent(target_user_id: str, source_user_id: str) -> Optional[dict[str, Any]]:
+    if not target_user_id or not source_user_id:
+        return None
+    row = _execute_data(
+        sb_admin()
+        .table("target_consents")
+        .select("*")
+        .eq("target_user_id", target_user_id)
+        .eq("source_user_id", source_user_id)
+        .is_("revoked_at", "null")
+        .maybe_single()
+    )
+    return row or None
+
+
+def get_target_consent(consent_id: str) -> Optional[dict[str, Any]]:
+    if not consent_id:
+        return None
+    row = _execute_data(
+        sb_admin()
+        .table("target_consents")
+        .select("*")
+        .eq("id", consent_id)
+        .maybe_single()
+    )
+    return row or None
+
+
+def add_target_consent(target_user_id: str, source_user_id: str) -> Optional[dict[str, Any]]:
+    data = (
+        sb_admin()
+        .rpc(
+            "add_target_consent",
+            {
+                "p_target_user_id": target_user_id,
+                "p_source_user_id": source_user_id,
+            },
+        )
+        .execute()
+        .data
+    )
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data or None
+
+
+def revoke_target_consent(target_user_id: str, source_user_id: str) -> Optional[dict[str, Any]]:
+    data = (
+        sb_admin()
+        .rpc(
+            "revoke_target_consent",
+            {
+                "p_target_user_id": target_user_id,
+                "p_source_user_id": source_user_id,
+            },
+        )
+        .execute()
+        .data
+    )
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data or None
+
+
+def list_target_consents_for_user(user_id: str) -> dict[str, list[dict[str, Any]]]:
+    if not user_id:
+        return {"granted_by_me": [], "granted_to_me": []}
+    granted_by_me = (
+        sb_admin()
+        .table("target_consents")
+        .select("*, source:source_user_id(handle, display_name)")
+        .eq("target_user_id", user_id)
+        .is_("revoked_at", "null")
+        .order("granted_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    granted_to_me = (
+        sb_admin()
+        .table("target_consents")
+        .select("*, target:target_user_id(handle, display_name)")
+        .eq("source_user_id", user_id)
+        .is_("revoked_at", "null")
+        .order("granted_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    return {"granted_by_me": granted_by_me, "granted_to_me": granted_to_me}
+
+
+def open_pending_target_consent(
+    *,
+    source_user_id: str,
+    target_user_id: str,
+    rule_description: str,
+    request_message_id: str | None = None,
+) -> dict[str, Any]:
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    existing = _execute_data(
+        sb_admin()
+        .table("pending_target_consents")
+        .select("*")
+        .eq("source_user_id", source_user_id)
+        .eq("target_user_id", target_user_id)
+        .eq("status", "pending")
+        .maybe_single()
+    )
+    if existing:
+        res = (
+            sb_admin()
+            .table("pending_target_consents")
+            .update(
+                {
+                    "rule_description": rule_description,
+                    "request_message_id": request_message_id,
+                    "expires_at": expires_at,
+                }
+            )
+            .eq("id", existing["id"])
+            .select("*")
+            .single()
+            .execute()
+        )
+        return res.data if res and res.data else existing
+    res = (
+        sb_admin()
+        .table("pending_target_consents")
+        .insert(
+            {
+                "source_user_id": source_user_id,
+                "target_user_id": target_user_id,
+                "rule_description": rule_description,
+                "request_message_id": request_message_id,
+                "expires_at": expires_at,
+            }
+        )
+        .select("*")
+        .single()
+        .execute()
+    )
+    return res.data if res and res.data else {}
+
+
+def set_pending_target_consent_message(pending_id: str, request_message_id: str) -> Optional[dict[str, Any]]:
+    res = (
+        sb_admin()
+        .table("pending_target_consents")
+        .update({"request_message_id": request_message_id})
+        .eq("id", pending_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    return res.data[0] if res and res.data else None
+
+
+def pending_target_consent_by_message(message_id: str) -> Optional[dict[str, Any]]:
+    if not message_id:
+        return None
+    row = _execute_data(
+        sb_admin()
+        .table("pending_target_consents")
+        .select("*, source:source_user_id(handle, display_name), target:target_user_id(handle, display_name)")
+        .eq("request_message_id", message_id)
+        .eq("status", "pending")
+        .gte("expires_at", _utc_now_iso())
+        .maybe_single()
+    )
+    return row or None
+
+
+def resolve_pending_target_consent(pending_id: str, status: str) -> Optional[dict[str, Any]]:
+    if status not in {"granted", "declined", "expired"}:
+        raise ValueError("invalid pending target consent status")
+    res = (
+        sb_admin()
+        .table("pending_target_consents")
+        .update({"status": status, "resolved_at": _utc_now_iso()})
+        .eq("id", pending_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    return res.data[0] if res and res.data else None
 
 
 def feishu_link_for_user_id(user_id: str) -> Optional[dict[str, Any]]:

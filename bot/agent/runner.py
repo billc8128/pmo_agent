@@ -89,7 +89,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 - Bitable: append_action_items, query_action_items, create_bitable_table, append_to_my_table, query_my_table, describe_my_table
 - Doc: create_meeting_doc, create_doc, append_to_doc
 - External: read_doc, read_external_table, resolve_feishu_link, list_connected_repos, query_repo
-- Proactive: add_subscription, list_subscriptions, update_subscription, remove_subscription, why_no_notification
+- Proactive: add_subscription, list_subscriptions, update_subscription, remove_subscription, grant_target_consent, revoke_target_consent, list_target_consents, request_target_consent, why_no_notification
 
 # 选 tool 的策略（重要）
 
@@ -149,9 +149,11 @@ _SYSTEM_PROMPT_TEMPLATE = """你是 pmo_agent 的 PMO 助手。pmo_agent 是一�
 
 用户可以用自然语言管理主动通知：
 - add_subscription：新增订阅。私聊默认订阅“我自己”；群聊默认订阅“当前群”。
+- add_subscription 支持 target_kind=user_dm|chat|mention_in_chat；不传 target 时沿用默认目标。要把规则发给别人时，先确认目标已授权或同群锚点可验证。
 - list_subscriptions：列出当前私聊/群聊 scope 的订阅。
 - update_subscription：修改当前 scope 下的订阅描述或启停状态。
 - remove_subscription：停用当前 scope 下的订阅。
+- grant_target_consent / revoke_target_consent / list_target_consents / request_target_consent：管理“别人能否把 ta 创建的通知发到我私聊”的授权。
 - why_no_notification：当用户问“为什么没通知我 X”时读取最近决策日志，解释是没匹配、去重、静音、限额，还是还在 pending/claimed。
 - GitHub/Gitea 是系统级 integrations，在 web 的 /integrations 管理。不要把“我的 github 是 X”当成可直接写入的账号绑定；未验证的自声明不会建立身份映射。
 
@@ -220,6 +222,10 @@ async def _get_client(conversation_key: str) -> _PooledClient:
                     "mcp__pmo_meta__list_subscriptions",
                     "mcp__pmo_meta__update_subscription",
                     "mcp__pmo_meta__remove_subscription",
+                    "mcp__pmo_meta__grant_target_consent",
+                    "mcp__pmo_meta__revoke_target_consent",
+                    "mcp__pmo_meta__list_target_consents",
+                    "mcp__pmo_meta__request_target_consent",
                     "mcp__pmo_meta__why_no_notification",
                     "mcp__pmo_meta__resolve_subject_mention",
                     "mcp__pmo_calendar__schedule_meeting",

@@ -151,6 +151,9 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         # — just log and proceed without identity context.
         logger.warning("feishu_links lookup failed for %s: %s", ev.sender_open_id, e)
 
+    if await _maybe_handle_target_consent_reply(ev, sender_identity):
+        return
+
     parent_notification = None
     if ev.parent_message_id:
         try:
@@ -276,6 +279,38 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
     #    naturally.
     final_text = answer_text or "(空回答 — 试试换个问法?)"
     await _send_answer_with_images(parent_message_id=ev.message_id, text=final_text)
+
+
+async def _maybe_handle_target_consent_reply(
+    ev: feishu_events.ParsedMessageEvent,
+    sender_identity: dict | None,
+) -> bool:
+    if not ev.parent_message_id:
+        return False
+    try:
+        pending = db_queries.pending_target_consent_by_message(ev.parent_message_id)
+    except Exception as e:
+        logger.warning("pending target consent lookup failed for %s: %s", ev.parent_message_id, e)
+        return False
+    if not pending:
+        return False
+    if not sender_identity or sender_identity.get("user_id") != pending.get("target_user_id"):
+        await feishu_client.reply_text(ev.message_id, "这条授权请求只能由目标用户本人回复。")
+        return True
+    normalized = re.sub(r"\s+", "", ev.text.lower())
+    source = pending.get("source") or {}
+    source_label = source.get("display_name") or (f"@{source.get('handle')}" if source.get("handle") else "对方")
+    if normalized in {"同意", "允许", "可以", "yes", "y", "ok", "approve", "approved"}:
+        db_queries.add_target_consent(pending["target_user_id"], pending["source_user_id"])
+        db_queries.resolve_pending_target_consent(pending["id"], "granted")
+        await feishu_client.reply_text(ev.message_id, f"已同意。{source_label} 之后可以把 ta 创建的主动通知发到你的私聊。")
+        return True
+    if normalized in {"拒绝", "不同意", "不可以", "否", "no", "n", "decline", "declined"}:
+        db_queries.resolve_pending_target_consent(pending["id"], "declined")
+        await feishu_client.reply_text(ev.message_id, "已拒绝，这个授权不会生效。")
+        return True
+    await feishu_client.reply_text(ev.message_id, "请直接回复“同意”或“拒绝”来处理这条通知路由授权。")
+    return True
 
 
 def _frame_question(

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 
-from agent import renderer
+from agent import permissions, renderer
 from config import settings
 from db import queries
 from feishu import post_format
@@ -28,6 +28,8 @@ async def _send_notification(
     idempotency_uuid: str,
 ) -> str:
     post_content = post_format.markdown_to_post(text)
+    if notif.mention_open_id:
+        post_content = post_format.prepend_at_mention(post_content, notif.mention_open_id)
     if notif.delivery_kind == "feishu_user":
         msg_id = await feishu_client.send_to_user(
             notif.delivery_target or "",
@@ -64,6 +66,21 @@ async def process_once(limit: int = 20) -> int:
     for bundle in bundles:
         notif = bundle.notification
         try:
+            if getattr(bundle.subscription, "target_kind", None) and getattr(bundle.subscription, "target_id", None):
+                route = await permissions.route_for_subscription_delivery(bundle.subscription)
+                if not route.allowed:
+                    ok = queries.mark_suppressed_if_claimed(
+                        notif.id,
+                        claim_id,
+                        route.suppressed_by or "permission_revoked",
+                        error=route.reason,
+                    )
+                    if ok and route.suppressed_by == "permission_revoked":
+                        queries.disable_subscription(notif.subscription_id, reason=route.reason or "permission revoked")
+                    continue
+                notif.delivery_kind = route.delivery_kind
+                notif.delivery_target = route.delivery_target
+                notif.mention_open_id = route.mention_open_id
             text = await renderer.render_notification(
                 notif_row=notif,
                 event_payload=bundle.notif_payload_snapshot,

@@ -9,6 +9,10 @@ export type SubscriptionRuleRow = {
   created_at: string;
   updated_at: string | null;
   archived_at?: string | null;
+  target_kind?: string | null;
+  target_id?: string | null;
+  target_user_open_id?: string | null;
+  consent_anchor?: string | null;
   profiles?: RuleOwnerProfile | RuleOwnerProfile[] | null;
 };
 
@@ -27,6 +31,8 @@ export type PublicNotificationRule = {
   ownerHandle: string | null;
   ownerDisplayName: string | null;
   ownedByViewer: boolean;
+  targetKind: string;
+  targetLabel: string;
 };
 
 export function validateRuleDescription(value: string): string {
@@ -62,7 +68,19 @@ export function toPublicNotificationRule(
     ownerHandle: owner?.handle ?? null,
     ownerDisplayName: owner?.display_name ?? null,
     ownedByViewer,
+    targetKind: row.target_kind ?? 'user_dm',
+    targetLabel: targetLabel(row, ownedByViewer),
   };
+}
+
+function targetLabel(row: SubscriptionRuleRow, ownedByViewer: boolean): string {
+  if (row.target_kind === 'chat') return 'Feishu chat';
+  if (row.target_kind === 'mention_in_chat') return 'Feishu chat @mention';
+  if (row.target_kind === 'user_dm' && ownedByViewer) return 'Your DM';
+  if (row.target_kind === 'user_dm' && row.scope_kind === 'user' && row.target_id === row.scope_id) {
+    return 'Owner DM';
+  }
+  return 'User DM';
 }
 
 function normalizeProfile(

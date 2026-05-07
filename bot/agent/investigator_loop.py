@@ -5,23 +5,28 @@ import logging
 import uuid
 from typing import Any
 
-from agent import decider, investigator
+from agent import decider, investigator, permissions
 from config import settings
 from db import queries
 
 logger = logging.getLogger(__name__)
 
 
-def _delivery_for_subscription(sub: Any) -> tuple[str | None, str | None]:
+async def _delivery_for_subscription(sub: Any) -> tuple[str | None, str | None, str | None]:
+    if getattr(sub, "target_kind", None) and getattr(sub, "target_id", None):
+        route = await permissions.route_for_subscription_delivery(sub)
+        if route.allowed:
+            return route.delivery_kind, route.delivery_target, route.mention_open_id
+        return None, None, None
     scope_kind = getattr(sub, "scope_kind", None)
     scope_id = getattr(sub, "scope_id", None)
     if scope_kind == "chat":
-        return "feishu_chat", scope_id
+        return "feishu_chat", scope_id, None
     if scope_kind == "user":
         linked = queries.feishu_link_for_user_id(str(scope_id or ""))
         if linked and linked.get("open_id"):
-            return "feishu_user", linked["open_id"]
-    return None, None
+            return "feishu_user", linked["open_id"], None
+    return None, None, None
 
 
 def _latest_event(bundle: Any) -> dict[str, Any]:
@@ -96,7 +101,7 @@ async def process_once(limit: int = 5) -> int:
             brief = _sanitize_brief_subjects(brief, bundle)
             if brief.get("notify"):
                 latest = _latest_event(bundle)
-                delivery_kind, delivery_target = _delivery_for_subscription(bundle.subscription)
+                delivery_kind, delivery_target, mention_open_id = await _delivery_for_subscription(bundle.subscription)
                 queries.create_notification_for_investigation_job(
                     job_id=job_id,
                     claim_id=claim_id,
@@ -106,6 +111,7 @@ async def process_once(limit: int = 5) -> int:
                     payload_snapshot=brief,
                     delivery_kind=delivery_kind,
                     delivery_target=delivery_target,
+                    mention_open_id=mention_open_id,
                     input_tokens=_usage_value(usage, "input_tokens"),
                     output_tokens=_usage_value(usage, "output_tokens"),
                 )

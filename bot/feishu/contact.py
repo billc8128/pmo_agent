@@ -70,6 +70,52 @@ async def search_users(query: str) -> list[dict]:
     return [_user_obj_to_dict(u) for u in users][:10]
 
 
+async def list_chat_member_open_ids(chat_id: str) -> list[str]:
+    """Return current member open_ids for a Feishu chat.
+
+    The lark-oapi package does not expose this endpoint consistently
+    across versions, so use the documented HTTP endpoint directly.
+    """
+    if not chat_id:
+        return []
+    token = await _tenant_access_token()
+    out: list[str] = []
+    page_token = ""
+    async with httpx.AsyncClient(timeout=10.0) as ac:
+        while True:
+            params = {"member_id_type": "open_id", "page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            resp = await ac.get(
+                f"https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                await asyncio.sleep(0.5)
+                resp = await ac.get(
+                    f"https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params=params,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"contact.list_chat_member_open_ids failed: {data.get('code')} {data.get('msg')}")
+            body = data.get("data") or {}
+            items = body.get("items") or body.get("members") or []
+            for item in items:
+                member_id = item.get("member_id") or item.get("open_id") or item.get("user_id")
+                if member_id:
+                    out.append(str(member_id))
+            if not body.get("has_more"):
+                break
+            page_token = body.get("page_token") or ""
+            if not page_token:
+                break
+    return list(dict.fromkeys(out))
+
+
 def _user_to_dict(user: Any) -> dict[str, Any]:
     return {
         "open_id": getattr(user, "open_id", None),

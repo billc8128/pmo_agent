@@ -92,6 +92,9 @@ export function RulesPanel({
             >
               {pending ? 'Saving...' : 'Add rule'}
             </button>
+            <p className="mt-2 text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-500">
+              Web rules notify your DM by default. Use the bot in Feishu to route a rule to a chat or teammate.
+            </p>
           </form>
         ) : (
           <div className="rounded-md border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-900">
@@ -255,6 +258,8 @@ function RuleRow({
         </p>
         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-zinc-500 dark:text-zinc-500">
           <span>{ownerLabel(rule)}</span>
+          <span aria-hidden="true">·</span>
+          <span>{rule.targetLabel}</span>
           <span aria-hidden="true">·</span>
           <span>{new Date(rule.createdAt).toLocaleString()}</span>
           {rule.ownedByViewer && (

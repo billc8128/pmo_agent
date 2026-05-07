@@ -137,6 +137,16 @@ def markdown_to_post(md: str) -> dict[str, Any]:
     return {"zh_cn": {"title": "", "content": paragraphs}}
 
 
+def prepend_at_mention(post_content: dict[str, Any], open_id: str) -> dict[str, Any]:
+    """Prepend a Feishu @ mention paragraph to a post message."""
+    if not open_id:
+        return post_content
+    zh_cn = dict(post_content.get("zh_cn") or {})
+    content = list(zh_cn.get("content") or [])
+    zh_cn["content"] = [[{"tag": "at", "user_id": open_id}]] + content
+    return {**post_content, "zh_cn": zh_cn}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Inline parsing — bold / italic / inline code / link
 # ──────────────────────────────────────────────────────────────────────

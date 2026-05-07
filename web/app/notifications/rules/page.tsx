@@ -17,7 +17,7 @@ export default async function NotificationRulesPage() {
   const { data, error } = await adminClient()
     .from('subscriptions')
     .select(
-      'id, scope_kind, scope_id, description, enabled, created_at, updated_at, archived_at, profiles:created_by(handle, display_name)',
+      'id, scope_kind, scope_id, description, enabled, created_at, updated_at, archived_at, target_kind, target_id, target_user_open_id, consent_anchor, profiles:created_by(handle, display_name)',
     )
     .eq('scope_kind', 'user')
     .is('archived_at', null)
