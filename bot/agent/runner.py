@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Awaitable, Callable, TypeVar
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -28,6 +28,7 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
 )
+from claude_agent_sdk.types import StreamEvent
 
 from agent.request_context import RequestContext
 from agent.tools_bitable import build_bitable_mcp
@@ -38,6 +39,7 @@ from agent.tools_meta import build_meta_mcp
 from config import settings
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 # ── ENV setup for the underlying CLI ────────────────────────────────────
@@ -237,6 +239,131 @@ _pool: dict[str, _PooledClient] = {}
 _pool_lock = asyncio.Lock()
 _CLIENT_IDLE_TIMEOUT = 30 * 60  # 30 minutes
 
+_DISALLOWED_TOOLS = [
+    "Bash",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "TodoWrite",
+]
+
+_MAIN_ALLOWED_TOOLS = [
+    "mcp__pmo_meta__list_users",
+    "mcp__pmo_meta__lookup_user",
+    "mcp__pmo_meta__get_recent_turns",
+    "mcp__pmo_meta__get_project_overview",
+    "mcp__pmo_meta__get_activity_stats",
+    "mcp__pmo_meta__generate_image",
+    "mcp__pmo_meta__today_iso",
+    "mcp__pmo_meta__resolve_people",
+    "mcp__pmo_meta__undo_last_action",
+    "mcp__pmo_meta__add_subscription",
+    "mcp__pmo_meta__list_subscriptions",
+    "mcp__pmo_meta__update_subscription",
+    "mcp__pmo_meta__remove_subscription",
+    "mcp__pmo_meta__grant_target_consent",
+    "mcp__pmo_meta__revoke_target_consent",
+    "mcp__pmo_meta__list_target_consents",
+    "mcp__pmo_meta__request_target_consent",
+    "mcp__pmo_meta__why_no_notification",
+    "mcp__pmo_meta__resolve_subject_mention",
+    "mcp__pmo_meta__enable_chat_memory",
+    "mcp__pmo_meta__disable_chat_memory",
+    "mcp__pmo_meta__chat_memory_status",
+    "mcp__pmo_meta__get_recent_chat_messages",
+    "mcp__pmo_meta__search_chat_messages_with_context",
+    "mcp__pmo_meta__get_people_context",
+    "mcp__pmo_meta__suggest_people_for_topic",
+    "mcp__pmo_calendar__schedule_meeting",
+    "mcp__pmo_calendar__cancel_meeting",
+    "mcp__pmo_calendar__list_my_meetings",
+    "mcp__pmo_bitable__append_action_items",
+    "mcp__pmo_bitable__query_action_items",
+    "mcp__pmo_bitable__create_bitable_table",
+    "mcp__pmo_bitable__append_to_my_table",
+    "mcp__pmo_bitable__query_my_table",
+    "mcp__pmo_bitable__describe_my_table",
+    "mcp__pmo_doc__create_meeting_doc",
+    "mcp__pmo_doc__create_doc",
+    "mcp__pmo_doc__append_to_doc",
+    "mcp__pmo_external__read_doc",
+    "mcp__pmo_external__read_external_table",
+    "mcp__pmo_external__resolve_feishu_link",
+    "mcp__pmo_external__list_connected_repos",
+    "mcp__pmo_external__query_repo",
+]
+
+
+def _build_main_agent_options(ctx: RequestContext) -> ClaudeAgentOptions:
+    return ClaudeAgentOptions(
+        system_prompt=SYSTEM_PROMPT,
+        tools=[],
+        allowed_tools=_MAIN_ALLOWED_TOOLS,
+        mcp_servers={
+            "pmo_meta": build_meta_mcp(ctx),
+            "pmo_calendar": build_calendar_mcp(ctx),
+            "pmo_bitable": build_bitable_mcp(ctx),
+            "pmo_doc": build_doc_mcp(ctx),
+            "pmo_external": build_external_mcp(ctx),
+        },
+        disallowed_tools=_DISALLOWED_TOOLS,
+        max_turns=settings.agent_max_turns,
+        include_partial_messages=True,
+    )
+
+
+async def _retry_async_boundary(
+    label: str,
+    conversation_key: str,
+    operation: Callable[[], Awaitable[_T]],
+) -> _T:
+    attempts = max(1, int(settings.agent_api_retry_attempts))
+    delay = max(0.0, float(settings.agent_api_retry_initial_delay_seconds))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        try:
+            result = await operation()
+            if attempt > 1:
+                logger.info(
+                    "agent: boundary_retry_success label=%s conversation=%s attempt=%s elapsed_ms=%d",
+                    label,
+                    conversation_key,
+                    attempt,
+                    int((time.monotonic() - started) * 1000),
+                )
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt >= attempts:
+                break
+            sleep_for = delay * (2 ** (attempt - 1))
+            logger.warning(
+                "agent: boundary_retry label=%s conversation=%s attempt=%s/%s error=%s next_delay=%.2fs",
+                label,
+                conversation_key,
+                attempt,
+                attempts,
+                type(e).__name__,
+                sleep_for,
+            )
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+    assert last_error is not None
+    logger.warning(
+        "agent: boundary_failed label=%s conversation=%s attempts=%s error=%s",
+        label,
+        conversation_key,
+        attempts,
+        type(last_error).__name__,
+    )
+    raise last_error
+
 
 async def _get_client(conversation_key: str) -> _PooledClient:
     """Get or build the SDK client for this conversation."""
@@ -244,72 +371,25 @@ async def _get_client(conversation_key: str) -> _PooledClient:
         slot = _pool.get(conversation_key)
         if slot is None:
             ctx = RequestContext()
-            options = ClaudeAgentOptions(
-                system_prompt=SYSTEM_PROMPT,
-                allowed_tools=[
-                    "mcp__pmo_meta__list_users",
-                    "mcp__pmo_meta__lookup_user",
-                    "mcp__pmo_meta__get_recent_turns",
-                    "mcp__pmo_meta__get_project_overview",
-                    "mcp__pmo_meta__get_activity_stats",
-                    "mcp__pmo_meta__generate_image",
-                    "mcp__pmo_meta__today_iso",
-                    "mcp__pmo_meta__resolve_people",
-                    "mcp__pmo_meta__undo_last_action",
-                    "mcp__pmo_meta__add_subscription",
-                    "mcp__pmo_meta__list_subscriptions",
-                    "mcp__pmo_meta__update_subscription",
-                    "mcp__pmo_meta__remove_subscription",
-                    "mcp__pmo_meta__grant_target_consent",
-                    "mcp__pmo_meta__revoke_target_consent",
-                    "mcp__pmo_meta__list_target_consents",
-                    "mcp__pmo_meta__request_target_consent",
-                    "mcp__pmo_meta__why_no_notification",
-                    "mcp__pmo_meta__resolve_subject_mention",
-                    "mcp__pmo_meta__enable_chat_memory",
-                    "mcp__pmo_meta__disable_chat_memory",
-                    "mcp__pmo_meta__chat_memory_status",
-                    "mcp__pmo_meta__get_recent_chat_messages",
-                    "mcp__pmo_meta__search_chat_messages_with_context",
-                    "mcp__pmo_meta__get_people_context",
-                    "mcp__pmo_meta__suggest_people_for_topic",
-                    "mcp__pmo_calendar__schedule_meeting",
-                    "mcp__pmo_calendar__cancel_meeting",
-                    "mcp__pmo_calendar__list_my_meetings",
-                    "mcp__pmo_bitable__append_action_items",
-                    "mcp__pmo_bitable__query_action_items",
-                    "mcp__pmo_bitable__create_bitable_table",
-                    "mcp__pmo_bitable__append_to_my_table",
-                    "mcp__pmo_bitable__query_my_table",
-                    "mcp__pmo_bitable__describe_my_table",
-                    "mcp__pmo_doc__create_meeting_doc",
-                    "mcp__pmo_doc__create_doc",
-                    "mcp__pmo_doc__append_to_doc",
-                    "mcp__pmo_external__read_doc",
-                    "mcp__pmo_external__read_external_table",
-                    "mcp__pmo_external__resolve_feishu_link",
-                    "mcp__pmo_external__list_connected_repos",
-                    "mcp__pmo_external__query_repo",
-                ],
-                mcp_servers={
-                    "pmo_meta": build_meta_mcp(ctx),
-                    "pmo_calendar": build_calendar_mcp(ctx),
-                    "pmo_bitable": build_bitable_mcp(ctx),
-                    "pmo_doc": build_doc_mcp(ctx),
-                    "pmo_external": build_external_mcp(ctx),
-                },
-                # No write/exec tools — explicitly empty.
-                disallowed_tools=[
-                    "Bash", "Write", "Edit", "NotebookEdit",
-                    "WebFetch", "WebSearch", "Task", "TodoWrite",
-                ],
-                max_turns=settings.agent_max_duration_seconds,
-            )
+            options = _build_main_agent_options(ctx)
             client = ClaudeSDKClient(options=options)
-            await client.connect()
+            try:
+                await _retry_async_boundary("sdk_connect", conversation_key, client.connect)
+            except Exception:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                raise
             slot = _PooledClient(client=client, ctx=ctx)
             _pool[conversation_key] = slot
-            logger.info("agent: created client for %s", conversation_key)
+            logger.info(
+                "agent: created client for %s max_turns=%s idle_timeout=%ss hard_timeout=%ss",
+                conversation_key,
+                settings.agent_max_turns,
+                settings.agent_idle_timeout_seconds,
+                settings.agent_max_wall_seconds,
+            )
         slot.last_used = time.monotonic()
         return slot
 
@@ -364,6 +444,7 @@ async def answer_streaming(
 
     Yields dicts of one of these shapes:
       {"kind": "tool",  "name": str, "args_hint": str}   — about to call a tool
+      {"kind": "status", "phase": str, "event_type": str} — stream heartbeat
       {"kind": "final", "text": str}                      — final answer text
       {"kind": "error", "message": str}                   — exception
 
@@ -379,6 +460,8 @@ async def answer_streaming(
     # FIFO serialization. Note we await BEFORE setting busy so we
     # also queue behind other in-flight calls on the same slot.
     async with slot.lock:
+        turn_started = time.monotonic()
+        tool_count = 0
         slot.busy = True
         slot.ctx.message_id = message_id
         slot.ctx.chat_id = chat_id
@@ -388,7 +471,13 @@ async def answer_streaming(
         slot.ctx.asker_user_id = asker_user_id
         slot.ctx.asker_handle = asker_handle
         try:
-            await slot.client.query(question)
+            logger.info(
+                "agent: turn_start conversation=%s message=%s chars=%d",
+                conversation_key,
+                message_id,
+                len(question),
+            )
+            await _retry_async_boundary("sdk_query", conversation_key, lambda: slot.client.query(question))
             final_text_chunks: list[str] = []
             async for msg in slot.client.receive_response():
                 if isinstance(msg, AssistantMessage):
@@ -399,20 +488,47 @@ async def answer_streaming(
                             name = block.name
                             display = _strip_pmo_prefix(name)
                             args_hint = _format_args_hint(block.input or {})
+                            tool_count += 1
                             logger.info(
-                                "agent: tool=%s input_keys=%s",
+                                "agent: tool conversation=%s name=%s input_keys=%s elapsed_ms=%d",
+                                conversation_key,
                                 name,
                                 list((block.input or {}).keys()),
+                                int((time.monotonic() - turn_started) * 1000),
                             )
                             yield {
                                 "kind": "tool",
                                 "name": display,
                                 "args_hint": args_hint,
                             }
+                elif isinstance(msg, StreamEvent):
+                    event_type = str((msg.event or {}).get("type") or "")
+                    yield {
+                        "kind": "status",
+                        "phase": "stream",
+                        "event_type": event_type,
+                    }
                 elif isinstance(msg, ResultMessage):
+                    logger.info(
+                        "agent: result conversation=%s subtype=%s turns=%s duration_ms=%s api_ms=%s is_error=%s cost=%s",
+                        conversation_key,
+                        msg.subtype,
+                        msg.num_turns,
+                        msg.duration_ms,
+                        msg.duration_api_ms,
+                        msg.is_error,
+                        msg.total_cost_usd,
+                    )
                     # The SDK's terminating message; stop reading.
                     break
             final_text = "\n".join(final_text_chunks).strip()
+            logger.info(
+                "agent: turn_done conversation=%s tools=%d answer_chars=%d elapsed_ms=%d",
+                conversation_key,
+                tool_count,
+                len(final_text),
+                int((time.monotonic() - turn_started) * 1000),
+            )
             yield {"kind": "final", "text": final_text}
         except Exception as e:
             logger.exception("agent failed: %s", conversation_key)

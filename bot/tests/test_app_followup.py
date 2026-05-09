@@ -43,7 +43,7 @@ async def _hanging_answer_streaming(*args, **kwargs):
 
 
 @pytest.mark.anyio
-async def test_handle_message_times_out_hanging_streaming_agent(monkeypatch):
+async def test_handle_message_idle_times_out_hanging_streaming_agent(monkeypatch):
     fake_feishu = _FakeFeishuClient()
     shutdown_keys: list[str] = []
     async def shutdown_conversation(key: str) -> None:
@@ -52,7 +52,8 @@ async def test_handle_message_times_out_hanging_streaming_agent(monkeypatch):
     monkeypatch.setattr(bot_app.agent_runner, "answer_streaming", _hanging_answer_streaming)
     monkeypatch.setattr(bot_app.agent_runner, "shutdown_conversation", shutdown_conversation, raising=False)
     monkeypatch.setattr(bot_app.db_queries, "lookup_by_feishu_open_id", lambda open_id: None)
-    monkeypatch.setattr(bot_app.settings, "agent_max_duration_seconds", 0.01)
+    monkeypatch.setattr(bot_app.settings, "agent_idle_timeout_seconds", 0.01)
+    monkeypatch.setattr(bot_app.settings, "agent_max_wall_seconds", 10)
 
     event = ParsedMessageEvent(
         event_id="evt-1",
@@ -69,9 +70,51 @@ async def test_handle_message_times_out_hanging_streaming_agent(monkeypatch):
     await asyncio.wait_for(bot_app._handle_message(event), timeout=1.0)
 
     assert fake_feishu.patched_cards
-    assert "超时" in str(fake_feishu.patched_cards[-1])
+    assert "没有进展" in str(fake_feishu.patched_cards[-1])
     assert shutdown_keys == ["chat-1:ou-user"]
     assert not any(kind == "post" for kind, _payload in fake_feishu.replies)
+
+
+async def _slow_but_progressing_answer_streaming(*args, **kwargs):
+    yield {"kind": "tool", "name": "get_project_overview", "args_hint": "handle=bcc"}
+    await asyncio.sleep(0.01)
+    yield {"kind": "status", "phase": "stream", "event_type": "content_block_delta"}
+    await asyncio.sleep(0.01)
+    yield {"kind": "final", "text": "持续有进展，所以不应被 idle watchdog 中断。"}
+
+
+@pytest.mark.anyio
+async def test_handle_message_allows_slow_agent_when_events_keep_arriving(monkeypatch):
+    fake_feishu = _FakeFeishuClient()
+    shutdown_keys: list[str] = []
+
+    async def shutdown_conversation(key: str) -> None:
+        shutdown_keys.append(key)
+
+    monkeypatch.setattr(bot_app, "feishu_client", fake_feishu)
+    monkeypatch.setattr(bot_app.agent_runner, "answer_streaming", _slow_but_progressing_answer_streaming)
+    monkeypatch.setattr(bot_app.agent_runner, "shutdown_conversation", shutdown_conversation, raising=False)
+    monkeypatch.setattr(bot_app.db_queries, "lookup_by_feishu_open_id", lambda open_id: None)
+    monkeypatch.setattr(bot_app.settings, "agent_idle_timeout_seconds", 0.05)
+    monkeypatch.setattr(bot_app.settings, "agent_max_wall_seconds", 1)
+
+    event = ParsedMessageEvent(
+        event_id="evt-3",
+        chat_id="chat-1",
+        chat_type="p2p",
+        sender_open_id="ou-user",
+        sender_chat_member_id=None,
+        message_id="om-user",
+        parent_message_id="",
+        text="分析一下 bcc 的 coding agent 技巧",
+        is_at_bot=False,
+    )
+
+    await asyncio.wait_for(bot_app._handle_message(event), timeout=1.0)
+
+    assert shutdown_keys == []
+    assert any(kind == "post" for kind, _payload in fake_feishu.replies)
+    assert "没有进展" not in str(fake_feishu.patched_cards)
 
 
 @pytest.mark.anyio

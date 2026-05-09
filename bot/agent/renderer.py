@@ -179,6 +179,7 @@ async def _render_inner(
     ctx = RequestContext(conversation_key=f"notification:{getattr(notif_row, 'id', '')}")
     options = ClaudeAgentOptions(
         system_prompt=_prompt_for_payload(event_payload),
+        tools=[],
         allowed_tools=[
             "mcp__pmo_renderer__list_users",
             "mcp__pmo_renderer__lookup_user",
@@ -192,7 +193,7 @@ async def _render_inner(
         disallowed_tools=[
             "Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Task", "TodoWrite",
         ],
-        max_turns=4,
+        max_turns=settings.renderer_max_turns,
     )
     message = {
         "notification": _plain(notif_row),

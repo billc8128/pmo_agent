@@ -199,6 +199,7 @@ async def investigate(bundle: Any) -> tuple[dict[str, Any], Usage]:
     ctx = RequestContext(conversation_key=f"investigation:{getattr(bundle.job, 'id', '')}")
     options = ClaudeAgentOptions(
         system_prompt=_INVESTIGATOR_PROMPT,
+        tools=[],
         allowed_tools=[
             "mcp__pmo_investigator__list_users",
             "mcp__pmo_investigator__lookup_user",

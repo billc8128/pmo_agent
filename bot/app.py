@@ -184,6 +184,57 @@ async def _store_chat_memory_message(parsed: feishu_events.ParsedMessageEvent) -
 CARD_PATCH_INTERVAL = 1.0
 
 
+class _AgentIdleTimeout(TimeoutError):
+    pass
+
+
+class _AgentHardTimeout(TimeoutError):
+    pass
+
+
+def _format_seconds(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.1f}"
+
+
+async def _watch_agent_events(events, *, conversation_key: str):
+    started_at = time.monotonic()
+    last_event_at = started_at
+    iterator = events.__aiter__()
+    while True:
+        now = time.monotonic()
+        hard_remaining = float(settings.agent_max_wall_seconds) - (now - started_at)
+        idle_remaining = float(settings.agent_idle_timeout_seconds) - (now - last_event_at)
+        if hard_remaining <= 0:
+            raise _AgentHardTimeout()
+        if idle_remaining <= 0:
+            raise _AgentIdleTimeout()
+        timeout = min(hard_remaining, idle_remaining)
+        try:
+            event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+        except StopAsyncIteration:
+            return
+        except TimeoutError as e:
+            elapsed = time.monotonic() - started_at
+            if elapsed >= float(settings.agent_max_wall_seconds):
+                logger.warning(
+                    "agent watchdog hard timeout conversation=%s elapsed=%.1fs hard=%.1fs",
+                    conversation_key,
+                    elapsed,
+                    float(settings.agent_max_wall_seconds),
+                )
+                raise _AgentHardTimeout() from e
+            logger.warning(
+                "agent watchdog idle timeout conversation=%s idle=%.1fs threshold=%.1fs elapsed=%.1fs",
+                conversation_key,
+                time.monotonic() - last_event_at,
+                float(settings.agent_idle_timeout_seconds),
+                elapsed,
+            )
+            raise _AgentIdleTimeout() from e
+        last_event_at = time.monotonic()
+        yield event
+
+
 async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
     conversation_key = f"{ev.chat_id}:{ev.sender_open_id}"
     logger.info(
@@ -247,7 +298,7 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
                     asker_user_id=(sender_identity or {}).get("user_id"),
                     asker_handle=(sender_identity or {}).get("handle"),
                 ),
-                timeout=settings.agent_max_duration_seconds,
+                timeout=settings.agent_max_wall_seconds,
             )
         except Exception as e:
             answer = f"(出错了: {type(e).__name__})"
@@ -271,53 +322,70 @@ async def _handle_message(ev: feishu_events.ParsedMessageEvent) -> None:
         )
 
     try:
-        async with asyncio.timeout(settings.agent_max_duration_seconds):
-            async for event in agent_runner.answer_streaming(
-                conversation_key,
-                framed_question,
-                message_id=ev.message_id,
-                chat_id=ev.chat_id,
-                chat_type=ev.chat_type,
-                sender_open_id=ev.sender_open_id,
-                asker_user_id=(sender_identity or {}).get("user_id"),
-                asker_handle=(sender_identity or {}).get("handle"),
-            ):
-                if event["kind"] == "tool":
-                    # Mark previous tool as done — the LLM has moved on.
-                    if steps and not steps[-1].get("done"):
-                        steps[-1]["done"] = True
-                    steps.append({
-                        "tool": event["name"],
-                        "args_hint": event.get("args_hint", ""),
-                        "done": False,
-                    })
-                    await maybe_patch()
-                elif event["kind"] == "final":
-                    # Mark the trailing tool as done now that the agent is
-                    # writing its answer.
-                    if steps and not steps[-1].get("done"):
-                        steps[-1]["done"] = True
-                    answer_text = event["text"]
-                elif event["kind"] == "error":
-                    await feishu_client.patch_card(
-                        card_message_id,
-                        cards.error_card(question=ev.text, error=event["message"]),
-                    )
-                    return
+        events = agent_runner.answer_streaming(
+            conversation_key,
+            framed_question,
+            message_id=ev.message_id,
+            chat_id=ev.chat_id,
+            chat_type=ev.chat_type,
+            sender_open_id=ev.sender_open_id,
+            asker_user_id=(sender_identity or {}).get("user_id"),
+            asker_handle=(sender_identity or {}).get("handle"),
+        )
+        async for event in _watch_agent_events(events, conversation_key=conversation_key):
+            if event["kind"] == "tool":
+                # Mark previous tool as done — the LLM has moved on.
+                if steps and not steps[-1].get("done"):
+                    steps[-1]["done"] = True
+                steps.append({
+                    "tool": event["name"],
+                    "args_hint": event.get("args_hint", ""),
+                    "done": False,
+                })
+                await maybe_patch()
+            elif event["kind"] == "status":
+                continue
+            elif event["kind"] == "final":
+                # Mark the trailing tool as done now that the agent is
+                # writing its answer.
+                if steps and not steps[-1].get("done"):
+                    steps[-1]["done"] = True
+                answer_text = event["text"]
+            elif event["kind"] == "error":
+                await feishu_client.patch_card(
+                    card_message_id,
+                    cards.error_card(question=ev.text, error=event["message"]),
+                )
+                return
     except asyncio.CancelledError:
         raise
-    except TimeoutError:
+    except _AgentIdleTimeout:
         logger.warning(
-            "agent loop timed out for %s after %ss",
+            "agent loop idle timed out for %s after %ss without progress",
             conversation_key,
-            settings.agent_max_duration_seconds,
+            settings.agent_idle_timeout_seconds,
         )
         await agent_runner.shutdown_conversation(conversation_key)
         await feishu_client.patch_card(
             card_message_id,
             cards.error_card(
                 question=ev.text,
-                error=f"查询超时（超过 {settings.agent_max_duration_seconds} 秒）",
+                error=f"查询超时（超过 {_format_seconds(settings.agent_idle_timeout_seconds)} 秒没有进展）",
+            ),
+        )
+        return
+    except _AgentHardTimeout:
+        logger.warning(
+            "agent loop hard timed out for %s after %ss",
+            conversation_key,
+            settings.agent_max_wall_seconds,
+        )
+        await agent_runner.shutdown_conversation(conversation_key)
+        await feishu_client.patch_card(
+            card_message_id,
+            cards.error_card(
+                question=ev.text,
+                error=f"查询超时（超过 {_format_seconds(settings.agent_max_wall_seconds)} 秒最大执行时长）",
             ),
         )
         return

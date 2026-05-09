@@ -53,13 +53,18 @@ class Settings(BaseSettings):
 
     # ── Misc ──
     log_level: str = "INFO"
-    agent_max_duration_seconds: int = 120
+    agent_idle_timeout_seconds: float = 120
+    agent_max_wall_seconds: float = 1800
+    agent_max_turns: int = 120
+    agent_api_retry_attempts: int = 3
+    agent_api_retry_initial_delay_seconds: float = 0.5
     decider_loop_interval_seconds: int = 30
     delivery_loop_interval_seconds: int = 15
     notification_render_max_seconds: int = 60
+    renderer_max_turns: int = 12
     investigator_loop_interval_seconds: int = 20
     investigator_max_duration_seconds: int = 90
-    investigator_max_turns: int = 6
+    investigator_max_turns: int = 20
     investigator_max_turns_context: int = 30
     aggregation_window_minutes: int = 30
     people_memory_loop_enabled: bool = False

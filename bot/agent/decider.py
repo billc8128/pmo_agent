@@ -343,6 +343,7 @@ async def decide(
     raw_input = _build_raw_input(event, candidate, siblings, scope_ctx)
     options = ClaudeAgentOptions(
         system_prompt=_GATEKEEPER_PROMPT,
+        tools=[],
         allowed_tools=[],
         mcp_servers={},
         disallowed_tools=[

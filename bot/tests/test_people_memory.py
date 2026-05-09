@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -179,9 +178,8 @@ def test_people_memory_tools_registered_without_raw_writer():
     assert "get_people_memory" not in names
     assert "chat_id" not in schemas["get_people_context"]
     assert "chat_id" not in schemas["suggest_people_for_topic"]
-    runner_source = inspect.getsource(runner._get_client)
-    assert "mcp__pmo_meta__get_people_context" in runner_source
-    assert "mcp__pmo_meta__suggest_people_for_topic" in runner_source
+    assert "mcp__pmo_meta__get_people_context" in runner._MAIN_ALLOWED_TOOLS
+    assert "mcp__pmo_meta__suggest_people_for_topic" in runner._MAIN_ALLOWED_TOOLS
     assert "不要逐字暴露 people memory" in runner.SYSTEM_PROMPT
 
 
